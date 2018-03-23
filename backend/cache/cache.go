@@ -337,6 +337,9 @@ func NewFs(name, rootPath string) (fs.Fs, error) {
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, syscall.SIGHUP)
 	atexit.Register(func() {
+		if plexURL != "" {
+			f.plexConnector.closeWebsocket()
+		}
 		f.StopBackgroundRunners()
 	})
 	go func() {
@@ -431,7 +434,27 @@ Params:
 `,
 	})
 
+	rc.Add(rc.Call{
+		Path:  "cache/stats",
+		Fn:    f.httpStats,
+		Title: "Get cache stats",
+		Help: `
+Show statistics for the cache remote.
+`,
+	})
+
 	return f, fsErr
+}
+
+func (f *Fs) httpStats(in rc.Params) (out rc.Params, err error) {
+	out = make(rc.Params)
+	m, err := f.Stats()
+	if err != nil {
+		return out, errors.Errorf("error while getting cache stats")
+	}
+	out["status"] = "ok"
+	out["stats"] = m
+	return out, nil
 }
 
 func (f *Fs) httpExpireRemote(in rc.Params) (out rc.Params, err error) {
