@@ -10,10 +10,12 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path"
 	"regexp"
 	"runtime"
 	"runtime/pprof"
+	"strconv"
 	"time"
 
 	"github.com/pkg/errors"
@@ -141,10 +143,10 @@ func ShowVersion() {
 	fmt.Printf("- go version: %s\n", runtime.Version())
 }
 
-// newFsFile creates a dst Fs from a name but may point to a file.
+// NewFsFile creates a dst Fs from a name but may point to a file.
 //
 // It returns a string with the file name if points to a file
-func newFsFile(remote string) (fs.Fs, string) {
+func NewFsFile(remote string) (fs.Fs, string) {
 	fsInfo, configName, fsPath, err := fs.ParseRemote(remote)
 	if err != nil {
 		fs.CountError(err)
@@ -169,7 +171,7 @@ func newFsFile(remote string) (fs.Fs, string) {
 //
 // This can point to a file
 func newFsSrc(remote string) (fs.Fs, string) {
-	f, fileName := newFsFile(remote)
+	f, fileName := NewFsFile(remote)
 	if fileName != "" {
 		if !filter.Active.InActive() {
 			err := errors.Errorf("Can't limit to single files when using filters: %v", remote)
@@ -322,6 +324,26 @@ func Run(Retry bool, showStats bool, cmd *cobra.Command, f func() error) {
 		accounting.Stats.Log()
 	}
 	fs.Debugf(nil, "%d go routines active\n", runtime.NumGoroutine())
+
+	// dump all running go-routines
+	if fs.Config.Dump&fs.DumpGoRoutines != 0 {
+		err = pprof.Lookup("goroutine").WriteTo(os.Stdout, 1)
+		if err != nil {
+			fs.Errorf(nil, "Failed to dump goroutines: %v", err)
+		}
+	}
+
+	// dump open files
+	if fs.Config.Dump&fs.DumpOpenFiles != 0 {
+		c := exec.Command("lsof", "-p", strconv.Itoa(os.Getpid()))
+		c.Stdout = os.Stdout
+		c.Stderr = os.Stderr
+		err = c.Run()
+		if err != nil {
+			fs.Errorf(nil, "Failed to list open files: %v", err)
+		}
+	}
+
 	if accounting.Stats.Errored() {
 		resolveExitCode(accounting.Stats.GetLastError())
 	}

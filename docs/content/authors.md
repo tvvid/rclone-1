@@ -143,3 +143,12 @@ Contributors
   * wolfv <wolfv6@users.noreply.github.com>
   * Dave Pedu <dave@davepedu.com>
   * Stefan Lindblom <lindblom@spotify.com>
+  * seuffert <oliver@seuffert.biz>
+  * gbadanahatti <37121690+gbadanahatti@users.noreply.github.com>
+  * Keith Goldfarb <barkofdelight@gmail.com>
+  * Steve Kriss <steve@heptio.com>
+  * Chih-Hsuan Yen <yan12125@gmail.com>
+  * Alexander Neumann <fd0@users.noreply.github.com>
+  * Matt Holt <mholt@users.noreply.github.com>
+  * Eri Bastos <bastos.eri@gmail.com>
+  * Michael P. Dubner <pywebmail@list.ru>
