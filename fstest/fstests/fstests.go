@@ -35,22 +35,11 @@ type InternalTester interface {
 	InternalTest(*testing.T)
 }
 
-// winPath converts a path into a windows safe path
-func winPath(s string) string {
-	return strings.Map(func(r rune) rune {
-		switch r {
-		case '<', '>', '"', '|', '?', '*', ':':
-			return '_'
-		}
-		return r
-	}, s)
-}
-
 // dirsToNames returns a sorted list of names
 func dirsToNames(dirs []fs.Directory) []string {
 	names := []string{}
 	for _, dir := range dirs {
-		names = append(names, winPath(fstest.Normalize(dir.Remote())))
+		names = append(names, fstest.WinPath(fstest.Normalize(dir.Remote())))
 	}
 	sort.Strings(names)
 	return names
@@ -60,7 +49,7 @@ func dirsToNames(dirs []fs.Directory) []string {
 func objsToNames(objs []fs.Object) []string {
 	names := []string{}
 	for _, obj := range objs {
-		names = append(names, winPath(fstest.Normalize(obj.Remote())))
+		names = append(names, fstest.WinPath(fstest.Normalize(obj.Remote())))
 	}
 	sort.Strings(names)
 	return names
@@ -217,7 +206,7 @@ func Run(t *testing.T, opt *Opt) {
 		// Remove bad characters from Windows file name if set
 		if opt.SkipBadWindowsCharacters {
 			t.Logf("Removing bad windows characters from test file")
-			file2.Path = winPath(file2.Path)
+			file2.Path = fstest.WinPath(file2.Path)
 		}
 
 		fstest.Initialise()
@@ -290,7 +279,7 @@ func Run(t *testing.T, opt *Opt) {
 		assert.Error(t, err, "Expecting error on Rmdir non existent")
 	})
 
-	// TestFsMkdir tests tests making a directory
+	// TestFsMkdir tests making a directory
 	t.Run("TestFsMkdir", func(t *testing.T) {
 		skipIfNotOk(t)
 
@@ -344,6 +333,27 @@ func Run(t *testing.T, opt *Opt) {
 	t.Run("TestFsListRDirEmpty", func(t *testing.T) {
 		defer skipIfNotListR(t)()
 		TestFsListDirEmpty(t)
+	})
+
+	// TestFsListDirNotFound tests listing the directories from an empty directory
+	TestFsListDirNotFound := func(t *testing.T) {
+		skipIfNotOk(t)
+		objs, dirs, err := walk.GetAll(remote, "does not exist", true, 1)
+		if !remote.Features().CanHaveEmptyDirectories {
+			if err != fs.ErrorDirNotFound {
+				assert.NoError(t, err)
+				assert.Equal(t, 0, len(objs)+len(dirs))
+			}
+		} else {
+			assert.Equal(t, fs.ErrorDirNotFound, err)
+		}
+	}
+	t.Run("TestFsListDirNotFound", TestFsListDirNotFound)
+
+	// TestFsListRDirNotFound tests listing the directories from an empty directory using ListR
+	t.Run("TestFsListRDirNotFound", func(t *testing.T) {
+		defer skipIfNotListR(t)()
+		TestFsListDirNotFound(t)
 	})
 
 	// TestFsNewObjectNotFound tests not finding a object
@@ -410,7 +420,7 @@ func Run(t *testing.T, opt *Opt) {
 			for i := 1; i <= *fstest.ListRetries; i++ {
 				objs, dirs, err := walk.GetAll(remote, dir, true, 1)
 				if errors.Cause(err) == fs.ErrorDirNotFound {
-					objs, dirs, err = walk.GetAll(remote, winPath(dir), true, 1)
+					objs, dirs, err = walk.GetAll(remote, fstest.WinPath(dir), true, 1)
 				}
 				require.NoError(t, err)
 				objNames = objsToNames(objs)
@@ -433,13 +443,13 @@ func Run(t *testing.T, opt *Opt) {
 			dir = path.Dir(dir)
 			if dir == "." {
 				dir = ""
-				expectedObjNames = append(expectedObjNames, winPath(file1.Path))
+				expectedObjNames = append(expectedObjNames, fstest.WinPath(file1.Path))
 			}
 			if deepest {
-				expectedObjNames = append(expectedObjNames, winPath(file2.Path))
+				expectedObjNames = append(expectedObjNames, fstest.WinPath(file2.Path))
 				deepest = false
 			} else {
-				expectedDirNames = append(expectedDirNames, winPath(child))
+				expectedDirNames = append(expectedDirNames, fstest.WinPath(child))
 			}
 			list(dir, expectedDirNames, expectedObjNames)
 		}
@@ -637,6 +647,9 @@ func Run(t *testing.T, opt *Opt) {
 		fstest.CheckListing(t, remote, []fstest.Item{file1, file2})
 		// 1: file name.txt
 		// 2: hello sausage?/../z.txt
+
+		// Tidy up moveTest directory
+		require.NoError(t, remote.Rmdir("moveTest"))
 	})
 
 	// Move src to this remote using server side move operations.
@@ -674,22 +687,38 @@ func Run(t *testing.T, opt *Opt) {
 		require.NoError(t, err)
 
 		// check remotes
-		// FIXME: Prints errors.
-		fstest.CheckListing(t, remote, []fstest.Item{})
+		// remote should not exist here
+		_, err = remote.List("")
+		assert.Equal(t, fs.ErrorDirNotFound, errors.Cause(err))
+		//fstest.CheckListingWithPrecision(t, remote, []fstest.Item{}, []string{}, remote.Precision())
 		file1Copy := file1
 		file1Copy.Path = path.Join(newName, file1.Path)
 		file2Copy := file2
 		file2Copy.Path = path.Join(newName, file2.Path)
 		file2Copy.WinPath = path.Join(newName, file2.WinPath)
-		fstest.CheckListing(t, newRemote, []fstest.Item{file2Copy, file1Copy})
+		fstest.CheckListingWithPrecision(t, newRemote, []fstest.Item{file2Copy, file1Copy}, []string{
+			"new_name",
+			"new_name/sub_new_name",
+			"new_name/sub_new_name/hello? sausage",
+			"new_name/sub_new_name/hello? sausage/êé",
+			"new_name/sub_new_name/hello? sausage/êé/Hello, 世界",
+			"new_name/sub_new_name/hello? sausage/êé/Hello, 世界/ \" ' @ < > & ? + ≠",
+		}, newRemote.Precision())
 
 		// move it back
 		err = doDirMove(newRemote, newName, "")
 		require.NoError(t, err)
 
 		// check remotes
-		fstest.CheckListing(t, remote, []fstest.Item{file2, file1})
-		fstest.CheckListing(t, newRemote, []fstest.Item{})
+		fstest.CheckListingWithPrecision(t, remote, []fstest.Item{file2, file1}, []string{
+			"hello? sausage",
+			"hello? sausage/êé",
+			"hello? sausage/êé/Hello, 世界",
+			"hello? sausage/êé/Hello, 世界/ \" ' @ < > & ? + ≠",
+		}, remote.Precision())
+		fstest.CheckListingWithPrecision(t, newRemote, []fstest.Item{}, []string{
+			"new_name",
+		}, newRemote.Precision())
 	})
 
 	// TestFsRmdirFull tests removing a non empty directory
@@ -1068,6 +1097,23 @@ func Run(t *testing.T, opt *Opt) {
 		// Re-read the object and check again
 		obj = findObject(t, remote, file.Path)
 		file.Check(t, obj, remote.Precision())
+	})
+
+	// TestAbout tests the About optional interface
+	t.Run("TestObjectAbout", func(t *testing.T) {
+		skipIfNotOk(t)
+
+		// Check have About
+		doAbout := remote.Features().About
+		if doAbout == nil {
+			t.Skip("FS does not support About")
+		}
+
+		// Can't really check the output much!
+		usage, err := doAbout()
+		require.NoError(t, err)
+		require.NotNil(t, usage)
+		assert.NotEqual(t, int64(0), usage.Total)
 	})
 
 	// TestObjectPurge tests Purge

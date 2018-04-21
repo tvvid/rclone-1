@@ -33,6 +33,7 @@ See the following for detailed instructions for
   * [Google Drive](/drive/)
   * [HTTP](/http/)
   * [Hubic](/hubic/)
+  * [Mega](/mega/)
   * [Microsoft Azure Blob Storage](/azureblob/)
   * [Microsoft OneDrive](/onedrive/)
   * [Openstack Swift / Rackspace Cloudfiles / Memset Memstore](/swift/)
@@ -98,6 +99,7 @@ The main rclone commands with most used first
 * [rclone moveto](/commands/rclone_moveto/)	- Move file or directory from source to dest.
 * [rclone obscure](/commands/rclone_obscure/)	- Obscure password for use in the rclone.conf
 * [rclone cryptcheck](/commands/rclone_cryptcheck/)	- Check the integrity of a crypted remote.
+* [rclone about](/commands/rclone_about/)	- Get quota information from the remote.
 
 See the [commands index](/commands/) for the full list.
 
@@ -226,9 +228,9 @@ fraction and a unit suffix, such as "300ms", "-1.5h" or "2h45m". Valid
 time units are "ns", "us" (or "µs"), "ms", "s", "m", "h".
 
 Options which use SIZE use kByte by default.  However, a suffix of `b`
-for bytes, `k` for kBytes, `M` for MBytes and `G` for GBytes may be
-used.  These are the binary units, eg 1, 2\*\*10, 2\*\*20, 2\*\*30
-respectively.
+for bytes, `k` for kBytes, `M` for MBytes, `G` for GBytes, `T` for
+TBytes and `P` for PBytes may be used.  These are the binary units, eg
+1, 2\*\*10, 2\*\*20, 2\*\*30 respectively.
 
 ### --backup-dir=DIR ###
 
@@ -798,6 +800,19 @@ source file.
 This can be useful when transferring to a remote which doesn't support
 mod times directly as it is more accurate than a `--size-only` check
 and faster than using `--checksum`.
+
+### --use-server-modtime ###
+
+Some object-store backends (e.g, Swift, S3) do not preserve file modification
+times (modtime). On these backends, rclone stores the original modtime as
+additional metadata on the object. By default it will make an API call to
+retrieve the metadata when the modtime is needed by an operation.
+
+Use this flag to disable the extra API call and rely instead on the server's
+modified time. In cases such as a local to remote sync, knowing the local file
+is newer than the time it was last uploaded to the remote is sufficient. In
+those cases, this flag can speed up the process and reduce the number of API
+calls necessary.
 
 ### -v, -vv, --verbose ###
 

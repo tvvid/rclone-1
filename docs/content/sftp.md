@@ -10,12 +10,15 @@ date: "2017-02-01"
 SFTP is the [Secure (or SSH) File Transfer
 Protocol](https://en.wikipedia.org/wiki/SSH_File_Transfer_Protocol).
 
-It runs over SSH v2 and is standard with most modern SSH
-installations.
+SFTP runs over SSH v2 and is installed as standard with most modern
+SSH installations.
 
 Paths are specified as `remote:path`. If the path does not begin with
 a `/` it is relative to the home directory of the user.  An empty path
 `remote:` refers to the user's home directory.
+
+Note that some SFTP servers will need the leading `/` - Synology is a
+good example of this.
 
 Here is an example of making an SFTP configuration.  First run
 
@@ -167,10 +170,15 @@ your RClone backend configuration to disable this behaviour.
 
 SFTP supports checksums if the same login has shell access and `md5sum`
 or `sha1sum` as well as `echo` are in the remote's PATH.
-This remote check can be disabled by setting the configuration option
-`disable_hashcheck`. This may be required if you're connecting to SFTP servers
+This remote checksumming (file hashing) is recommended and enabled by default.
+Disabling the checksumming may be required if you are connecting to SFTP servers
 which are not under your control, and to which the execution of remote commands
-is prohibited.
+is prohibited.  Set the configuration option `disable_hashcheck` to `true` to
+disable checksumming.
+
+Note that some SFTP servers (eg Synology) the paths are different for
+SSH and SFTP so the hashes can't be calculated properly.  For them
+using `disable_hashcheck` is a good idea.
 
 The only ssh agent supported under Windows is Putty's pageant.
 

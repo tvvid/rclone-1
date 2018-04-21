@@ -885,9 +885,9 @@ func (f *Fs) MergeDirs(dirs []fs.Directory) error {
 			}
 		}
 		// rmdir (into trash) the now empty source directory
+		fs.Infof(srcDir, "removing empty directory")
 		err = f.rmdir(srcDir.ID(), true)
 		if err != nil {
-			fs.Infof(srcDir, "removing empty directory")
 			return errors.Wrapf(err, "MergDirs move failed to rmdir %q", srcDir)
 		}
 	}
@@ -1050,6 +1050,30 @@ func (f *Fs) CleanUp() error {
 	return nil
 }
 
+// About gets quota information
+func (f *Fs) About() (*fs.Usage, error) {
+	var about *drive.About
+	var err error
+	err = f.pacer.Call(func() (bool, error) {
+		about, err = f.svc.About.Get().Fields("storageQuota").Do()
+		return shouldRetry(err)
+	})
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to get Drive storageQuota")
+	}
+	q := about.StorageQuota
+	usage := &fs.Usage{
+		Used:    fs.NewUsageValue(q.UsageInDrive),           // bytes in use
+		Trashed: fs.NewUsageValue(q.UsageInDriveTrash),      // bytes in trash
+		Other:   fs.NewUsageValue(q.Usage - q.UsageInDrive), // other usage eg gmail in drive
+	}
+	if q.Limit > 0 {
+		usage.Total = fs.NewUsageValue(q.Limit)          // quota of bytes that can be used
+		usage.Free = fs.NewUsageValue(q.Limit - q.Usage) // bytes which can be uploaded before reaching the quota
+	}
+	return usage, nil
+}
+
 // Move src to this remote using server side move operations.
 //
 // This is stored with the remote path given
@@ -1195,10 +1219,16 @@ func (f *Fs) DirMove(src fs.Fs, srcRemote, dstRemote string) error {
 	}
 
 	// Find ID of src parent
-	_, srcDirectoryID, err := srcFs.dirCache.FindPath(srcRemote, false)
+	var srcDirectoryID string
+	if srcRemote == "" {
+		srcDirectoryID, err = srcFs.dirCache.RootParentID()
+	} else {
+		_, srcDirectoryID, err = srcFs.dirCache.FindPath(srcRemote, false)
+	}
 	if err != nil {
 		return err
 	}
+
 	// Find ID of src
 	srcID, err := srcFs.dirCache.FindDir(srcRemote, false)
 	if err != nil {
@@ -1635,6 +1665,7 @@ var (
 	_ fs.PutUncheckeder  = (*Fs)(nil)
 	_ fs.PublicLinker    = (*Fs)(nil)
 	_ fs.MergeDirser     = (*Fs)(nil)
+	_ fs.Abouter         = (*Fs)(nil)
 	_ fs.Object          = (*Object)(nil)
-	_ fs.MimeTyper       = &Object{}
+	_ fs.MimeTyper       = (*Object)(nil)
 )
