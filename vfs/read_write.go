@@ -116,7 +116,7 @@ func (fh *RWFileHandle) openPending(truncate bool) (err error) {
 		if o != nil && fh.file.rwOpens() == 0 {
 			cacheObj, err := fh.d.vfs.cache.f.NewObject(fh.remote)
 			if err == nil && cacheObj != nil {
-				cacheObj, err = copyObj(fh.d.vfs.cache.f, cacheObj, fh.remote, o)
+				_, err = copyObj(fh.d.vfs.cache.f, cacheObj, fh.remote, o)
 				if err != nil {
 					return errors.Wrap(err, "open RW handle failed to update cached file")
 				}
@@ -261,9 +261,9 @@ func (fh *RWFileHandle) close() (err error) {
 		return nil
 	}
 
-	copy := false
+	isCopied := false
 	if writer {
-		copy = fh.file.delWriter(fh, fh.modified())
+		isCopied = fh.file.delWriter(fh, fh.modified())
 		defer fh.file.finishWriterClose()
 	}
 
@@ -293,7 +293,7 @@ func (fh *RWFileHandle) close() (err error) {
 		}
 	}
 
-	if copy {
+	if isCopied {
 		// Transfer the temp file to the remote
 		cacheObj, err := fh.d.vfs.cache.f.NewObject(fh.remote)
 		if err != nil {

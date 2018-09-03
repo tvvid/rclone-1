@@ -10,6 +10,7 @@ import (
 
 	"github.com/ncw/rclone/fs"
 	"github.com/ncw/rclone/fs/list"
+	"github.com/ncw/rclone/fs/walk"
 	"github.com/pkg/errors"
 )
 
@@ -187,10 +188,32 @@ func (d *Dir) _readDir() error {
 		return err
 	}
 
+	err = d._readDirFromEntries(entries, nil, time.Time{})
+	if err != nil {
+		return err
+	}
+
+	d.read = when
+	return nil
+}
+
+// update d.items for each dir in the DirTree below this one and
+// set the last read time - must be called with the lock held
+func (d *Dir) _readDirFromDirTree(dirTree walk.DirTree, when time.Time) error {
+	return d._readDirFromEntries(dirTree[d.path], dirTree, when)
+}
+
+// update d.items and if dirTree is not nil update each dir in the DirTree below this one and
+// set the last read time - must be called with the lock held
+func (d *Dir) _readDirFromEntries(entries fs.DirEntries, dirTree walk.DirTree, when time.Time) error {
+	var err error
 	// Cache the items by name
 	found := make(map[string]struct{})
 	for _, entry := range entries {
 		name := path.Base(entry.Remote())
+		if name == "." || name == ".." {
+			continue
+		}
 		node := d.items[name]
 		found[name] = struct{}{}
 		switch item := entry.(type) {
@@ -203,10 +226,23 @@ func (d *Dir) _readDir() error {
 				node = newFile(d, obj, name)
 			}
 		case fs.Directory:
-			dir := item
 			// Reuse old dir value if it exists
 			if node == nil || !node.IsDir() {
-				node = newDir(d.vfs, d.f, d, dir)
+				node = newDir(d.vfs, d.f, d, item)
+			}
+			if dirTree != nil {
+				dir := node.(*Dir)
+				dir.mu.Lock()
+				err = dir._readDirFromDirTree(dirTree, when)
+				if err != nil {
+					dir.read = time.Time{}
+				} else {
+					dir.read = when
+				}
+				dir.mu.Unlock()
+				if err != nil {
+					return err
+				}
 			}
 		default:
 			err = errors.Errorf("unknown type %T", item)
@@ -221,8 +257,35 @@ func (d *Dir) _readDir() error {
 			delete(d.items, name)
 		}
 	}
+	return nil
+}
+
+// readDirTree forces a refresh of the complete directory tree
+func (d *Dir) readDirTree() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	when := time.Now()
+	d.read = time.Time{}
+	fs.Debugf(d.path, "Reading directory tree")
+	dt, err := walk.NewDirTree(d.f, d.path, false, -1)
+	if err != nil {
+		return err
+	}
+	err = d._readDirFromDirTree(dt, when)
+	if err != nil {
+		return err
+	}
+	fs.Debugf(d.path, "Reading directory tree done in %s", time.Since(when))
 	d.read = when
 	return nil
+}
+
+// readDir forces a refresh of the directory
+func (d *Dir) readDir() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.read = time.Time{}
+	return d._readDir()
 }
 
 // stat a single item in the directory
@@ -439,29 +502,25 @@ func (d *Dir) Rename(oldName, newName string, destDir *Dir) error {
 	}
 	switch x := oldNode.DirEntry().(type) {
 	case nil:
-		fs.Errorf(oldPath, "Dir.Rename cant rename open file")
-		return EPERM
-	case fs.Object:
-		oldObject := x
-		// FIXME: could Copy then Delete if Move not available
-		// - though care needed if case insensitive...
-		doMove := d.f.Features().Move
-		if doMove == nil {
-			err := errors.Errorf("Fs %q can't rename files (no Move)", d.f)
-			fs.Errorf(oldPath, "Dir.Rename error: %v", err)
-			return err
-		}
-		newObject, err := doMove(oldObject, newPath)
-		if err != nil {
-			fs.Errorf(oldPath, "Dir.Rename error: %v", err)
-			return err
-		}
-		// Update the node with the new details
-		if oldNode != nil {
-			if oldFile, ok := oldNode.(*File); ok {
-				fs.Debugf(x, "Updating file with %v %p", newObject, oldFile)
-				oldFile.rename(destDir, newObject)
+		if oldFile, ok := oldNode.(*File); ok {
+			if err = oldFile.rename(destDir, newName); err != nil {
+				fs.Errorf(oldPath, "Dir.Rename error: %v", err)
+				return err
 			}
+		} else {
+			fs.Errorf(oldPath, "Dir.Rename can't rename open file that is not a vfs.File")
+			return EPERM
+		}
+	case fs.Object:
+		if oldFile, ok := oldNode.(*File); ok {
+			if err = oldFile.rename(destDir, newName); err != nil {
+				fs.Errorf(oldPath, "Dir.Rename error: %v", err)
+				return err
+			}
+		} else {
+			err := errors.Errorf("Fs %q can't rename file that is not a vfs.File", d.f)
+			fs.Errorf(oldPath, "Dir.Rename error: %v", err)
+			return err
 		}
 	case fs.Directory:
 		doDirMove := d.f.Features().DirMove

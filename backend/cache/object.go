@@ -44,7 +44,7 @@ func NewObject(f *Fs, remote string) *Object {
 
 	cacheType := objectInCache
 	parentFs := f.UnWrap()
-	if f.tempWritePath != "" {
+	if f.opt.TempWritePath != "" {
 		_, err := f.cache.SearchPendingUpload(fullRemote)
 		if err == nil { // queued for upload
 			cacheType = objectPendingUpload
@@ -75,7 +75,7 @@ func ObjectFromOriginal(f *Fs, o fs.Object) *Object {
 
 	cacheType := objectInCache
 	parentFs := f.UnWrap()
-	if f.tempWritePath != "" {
+	if f.opt.TempWritePath != "" {
 		_, err := f.cache.SearchPendingUpload(fullRemote)
 		if err == nil { // queued for upload
 			cacheType = objectPendingUpload
@@ -153,7 +153,7 @@ func (o *Object) Storable() bool {
 // 2. is not pending a notification from the wrapped fs
 func (o *Object) refresh() error {
 	isNotified := o.CacheFs.isNotifiedRemote(o.Remote())
-	isExpired := time.Now().After(o.CacheTs.Add(o.CacheFs.fileAge))
+	isExpired := time.Now().After(o.CacheTs.Add(time.Duration(o.CacheFs.opt.InfoAge)))
 	if !isExpired && !isNotified {
 		return nil
 	}
@@ -237,7 +237,7 @@ func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOptio
 		return err
 	}
 	// pause background uploads if active
-	if o.CacheFs.tempWritePath != "" {
+	if o.CacheFs.opt.TempWritePath != "" {
 		o.CacheFs.backgroundRunner.pause()
 		defer o.CacheFs.backgroundRunner.play()
 		// don't allow started uploads
@@ -256,6 +256,8 @@ func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOptio
 
 	// deleting cached chunks and info to be replaced with new ones
 	_ = o.CacheFs.cache.RemoveObject(o.abs())
+	// advertise to ChangeNotify if wrapped doesn't do that
+	o.CacheFs.notifyChangeUpstreamIfNeeded(o.Remote(), fs.EntryObject)
 
 	o.CacheModTime = src.ModTime().UnixNano()
 	o.CacheSize = src.Size()
@@ -272,7 +274,7 @@ func (o *Object) Remove() error {
 		return err
 	}
 	// pause background uploads if active
-	if o.CacheFs.tempWritePath != "" {
+	if o.CacheFs.opt.TempWritePath != "" {
 		o.CacheFs.backgroundRunner.pause()
 		defer o.CacheFs.backgroundRunner.play()
 		// don't allow started uploads
@@ -351,6 +353,13 @@ func (o *Object) tempFileStartedUpload() bool {
 	return started
 }
 
+// UnWrap returns the Object that this Object is wrapping or
+// nil if it isn't wrapping anything
+func (o *Object) UnWrap() fs.Object {
+	return o.Object
+}
+
 var (
-	_ fs.Object = (*Object)(nil)
+	_ fs.Object          = (*Object)(nil)
+	_ fs.ObjectUnWrapper = (*Object)(nil)
 )

@@ -202,7 +202,10 @@ actively logged-in users, for example build machines.
 To use a Service Account instead of OAuth2 token flow, enter the path
 to your Service Account credentials at the `service_account_file`
 prompt during `rclone config` and rclone won't use the browser based
-authentication flow.
+authentication flow. If you'd rather stuff the contents of the
+credentials file into the rclone config file, you can set
+`service_account_credentials` with the actual contents of the file
+instead, or set the equivalent environment variable.
 
 #### Use case - Google Apps/G-suite account and individual Drive ####
 
@@ -309,6 +312,45 @@ d) Delete this remote
 y/e/d> y
 ```
 
+### --fast-list ###
+
+This remote supports `--fast-list` which allows you to use fewer
+transactions in exchange for more memory. See the [rclone
+docs](/docs/#fast-list) for more details.
+
+It does this by combining multiple `list` calls into a single API request.
+
+This works by combining many `'%s' in parents` filters into one expression.
+To list the contents of directories a, b and c, the the following requests will be send by the regular `List` function:
+```
+trashed=false and 'a' in parents
+trashed=false and 'b' in parents
+trashed=false and 'c' in parents
+```
+These can now be combined into a single request:
+```
+trashed=false and ('a' in parents or 'b' in parents or 'c' in parents)
+```
+
+The implementation of `ListR` will put up to 50 `parents` filters into one request.
+It will  use the `--checkers` value to specify the number of requests to run in parallel.
+
+In tests, these batch requests were up to 20x faster than the regular method.
+Running the following command against different sized folders gives:
+```
+rclone lsjson -vv -R --checkers=6 gdrive:folder
+```
+
+small folder (220 directories, 700 files):
+
+- without `--fast-list`: 38s
+- with `--fast-list`: 10s
+
+large folder (10600 directories, 39000 files):
+
+- without `--fast-list`: 22:05 min
+- with `--fast-list`: 58s
+
 ### Modified time ###
 
 Google drive stores modification times accurate to 1 ms.
@@ -350,6 +392,14 @@ arguments.
 
 Here are the command line options specific to this cloud storage
 system.
+
+#### --drive-acknowledge-abuse ####
+
+If downloading a file returns the error `This file has been identified
+as malware or spam and cannot be downloaded` with the error code
+`cannotDownloadAbusiveFile` then supply this flag to rclone to
+indicate you acknowledge the risks of downloading the file and rclone
+will download it anyway.
 
 #### --drive-auth-owner-only ####
 
@@ -411,9 +461,24 @@ Here are the possible extensions with their corresponding mime types.
 | xlsx | application/vnd.openxmlformats-officedocument.spreadsheetml.sheet | Microsoft Office Spreadsheet |
 | zip  | application/zip | A ZIP file of HTML, Images CSS |
 
+#### --drive-alternate-export ####
+
+If this option is set this instructs rclone to use an alternate set of
+export URLs for drive documents.  Users have reported that the
+official export URLs can't export large documents, whereas these
+unofficial ones can.
+
+See rclone issue [#2243](https://github.com/ncw/rclone/issues/2243) for background,
+[this google drive issue](https://issuetracker.google.com/issues/36761333) and
+[this helpful post](https://www.labnol.org/internet/direct-links-for-google-drive/28356/).
+
 #### --drive-impersonate user ####
 
 When using a service account, this instructs rclone to impersonate the user passed in.
+
+#### --drive-keep-revision-forever ####
+
+Keeps new head revision of the file forever.
 
 #### --drive-list-chunk int ####
 

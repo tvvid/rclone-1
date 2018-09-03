@@ -11,6 +11,8 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	_ "net/http/pprof" // install the pprof http handlers
+
 	"strings"
 
 	"github.com/ncw/rclone/cmd/serve/httplib"

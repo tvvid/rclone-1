@@ -91,7 +91,7 @@ Contributors
   * John Papandriopoulos <jpap@users.noreply.github.com>
   * Zhiming Wang <zmwangx@gmail.com>
   * Andy Pilate <cubox@cubox.me>
-  * Oliver Heyme <olihey@googlemail.com> <olihey@users.noreply.github.com>
+  * Oliver Heyme <olihey@googlemail.com> <olihey@users.noreply.github.com> <de8olihe@lego.com>
   * wuyu <wuyu@yunify.com>
   * Andrei Dragomir <adragomi@adobe.com>
   * Christian Brüggemann <mail@cbruegg.com>
@@ -159,3 +159,33 @@ Contributors
   * Craig Rachel <craig@craigrachel.com>
   * Michael G. Noll <miguno@users.noreply.github.com>
   * hensur <me@hensur.de>
+  * Oliver Heyme <de8olihe@lego.com>
+  * Richard Yang <richard@yenforyang.com>
+  * Piotr Oleszczyk <piotr.oleszczyk@gmail.com>
+  * Rodrigo <rodarima@gmail.com>
+  * NoLooseEnds <NoLooseEnds@users.noreply.github.com>
+  * Jakub Karlicek <jakub@karlicek.me>
+  * John Clayton <john@codemonkeylabs.com>
+  * Kasper Byrdal Nielsen <byrdal76@gmail.com>
+  * Benjamin Joseph Dag <bjdag1234@users.noreply.github.com>
+  * themylogin <themylogin@gmail.com>
+  * Onno Zweers <onno.zweers@surfsara.nl>
+  * Jasper Lievisse Adriaanse <jasper@humppa.nl>
+  * sandeepkru <sandeep.ummadi@gmail.com>
+  * HerrH <atomtigerzoo@users.noreply.github.com>
+  * Andrew <4030760+sparkyman215@users.noreply.github.com>
+  * dan smith <XX1011@gmail.com>
+  * Oleg Kovalov <iamolegkovalov@gmail.com>
+  * Ruben Vandamme <github-com-00ff86@vandamme.email>
+  * Cnly <minecnly@gmail.com>
+  * Andres Alvarez <1671935+kir4h@users.noreply.github.com>
+  * reddi1 <xreddi@gmail.com>
+  * Matt Tucker <matthewtckr@gmail.com>
+  * Sebastian Bünger <buengese@gmail.com>
+  * Martin Polden <mpolden@mpolden.no>
+  * Alex Chen <Cnly@users.noreply.github.com>
+  * Denis <deniskovpen@gmail.com>
+  * bsteiss <35940619+bsteiss@users.noreply.github.com>
+  * Cédric Connes <cedric.connes@gmail.com>
+  * Dr. Tobias Quathamer <toddy15@users.noreply.github.com>
+  * dcpu <42736967+dcpu@users.noreply.github.com>

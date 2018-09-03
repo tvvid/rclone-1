@@ -130,7 +130,7 @@ func NewFilter(opt *Opt) (f *Filter, err error) {
 	}
 	if f.Opt.MaxAge.IsSet() {
 		f.ModTimeFrom = time.Now().Add(-time.Duration(f.Opt.MaxAge))
-		if !f.ModTimeTo.IsZero() && f.ModTimeFrom.Before(f.ModTimeTo) {
+		if !f.ModTimeTo.IsZero() && f.ModTimeTo.Before(f.ModTimeFrom) {
 			log.Fatal("filter: --min-age can't be larger than --max-age")
 		}
 		fs.Debugf(nil, "--max-age %v to %v", f.Opt.MaxAge, f.ModTimeFrom)
@@ -173,7 +173,7 @@ func NewFilter(opt *Opt) (f *Filter, err error) {
 	}
 
 	if addImplicitExclude && foundExcludeRule {
-		fs.Infof(nil, "Using --filter is recommended instead of both --include and --exclude as the order they are parsed in is indeterminate")
+		fs.Errorf(nil, "Using --filter is recommended instead of both --include and --exclude as the order they are parsed in is indeterminate")
 	}
 
 	for _, rule := range f.Opt.FilterRule {

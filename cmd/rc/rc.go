@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"net/http"
 	"os"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"github.com/ncw/rclone/fs/rc"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
 var (
@@ -38,7 +40,7 @@ Arguments should be passed in as parameter=value.
 
 The result will be returned as a JSON object by default.
 
-Use "rclone rc list" to see a list of all possible commands.`,
+Use "rclone rc" to see a list of all possible commands.`,
 	Run: func(command *cobra.Command, args []string) {
 		cmd.CheckArgs(0, 1E9, command, args)
 		cmd.Run(false, false, command, func() error {
@@ -57,6 +59,14 @@ func doCall(path string, in rc.Params) (out rc.Params, err error) {
 	// Do HTTP request
 	client := fshttp.NewClient(fs.Config)
 	url := url
+	// set the user use --rc-addr as well as --url
+	if rcAddrFlag := pflag.Lookup("rc-addr"); rcAddrFlag != nil && rcAddrFlag.Changed {
+		url = rcAddrFlag.Value.String()
+		if strings.HasPrefix(url, ":") {
+			url = "localhost" + url
+		}
+		url = "http://" + url + "/"
+	}
 	if !strings.HasSuffix(url, "/") {
 		url += "/"
 	}
@@ -70,6 +80,19 @@ func doCall(path string, in rc.Params) (out rc.Params, err error) {
 		return nil, errors.Wrap(err, "connection failed")
 	}
 	defer fs.CheckClose(resp.Body, &err)
+
+	if resp.StatusCode != http.StatusOK {
+		var body []byte
+		body, err = ioutil.ReadAll(resp.Body)
+		var bodyString string
+		if err == nil {
+			bodyString = string(body)
+		} else {
+			bodyString = err.Error()
+		}
+		bodyString = strings.TrimSpace(bodyString)
+		return nil, errors.Errorf("Failed to read rc response: %s: %s", resp.Status, bodyString)
+	}
 
 	// Parse output
 	out = make(rc.Params)

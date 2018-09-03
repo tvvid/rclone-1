@@ -4,6 +4,7 @@ package operations
 import (
 	"bytes"
 	"context"
+	"encoding/csv"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -131,16 +132,16 @@ func equal(src fs.ObjectInfo, dst fs.Object, sizeOnly, checkSum bool) bool {
 	}
 
 	// Sizes the same so check the mtime
-	if fs.Config.ModifyWindow == fs.ModTimeNotSupported {
+	modifyWindow := fs.GetModifyWindow(src.Fs(), dst.Fs())
+	if modifyWindow == fs.ModTimeNotSupported {
 		fs.Debugf(src, "Sizes identical")
 		return true
 	}
 	srcModTime := src.ModTime()
 	dstModTime := dst.ModTime()
 	dt := dstModTime.Sub(srcModTime)
-	ModifyWindow := fs.Config.ModifyWindow
-	if dt < ModifyWindow && dt > -ModifyWindow {
-		fs.Debugf(src, "Size and modification time the same (differ by %s, within tolerance %s)", dt, ModifyWindow)
+	if dt < modifyWindow && dt > -modifyWindow {
+		fs.Debugf(src, "Size and modification time the same (differ by %s, within tolerance %s)", dt, modifyWindow)
 		return true
 	}
 
@@ -500,22 +501,6 @@ func DeleteFiles(toBeDeleted fs.ObjectsChan) error {
 	return DeleteFilesWithBackupDir(toBeDeleted, nil)
 }
 
-// Read a Objects into add() for the given Fs.
-// dir is the start directory, "" for root
-// If includeAll is specified all files will be added,
-// otherwise only files passing the filter will be added.
-//
-// Each object is passed ito the function provided.  If that returns
-// an error then the listing will be aborted and that error returned.
-func readFilesFn(f fs.Fs, includeAll bool, dir string, add func(fs.Object) error) (err error) {
-	return walk.Walk(f, "", includeAll, fs.Config.MaxDepth, func(dirPath string, entries fs.DirEntries, err error) error {
-		if err != nil {
-			return err
-		}
-		return entries.ForObjectError(add)
-	})
-}
-
 // SameConfig returns true if fdst and fsrc are using the same config
 // file entry
 func SameConfig(fdst, fsrc fs.Info) bool {
@@ -576,6 +561,7 @@ type checkFn func(a, b fs.Object) (differ bool, noHash bool)
 type checkMarch struct {
 	fdst, fsrc      fs.Fs
 	check           checkFn
+	oneway          bool
 	differences     int32
 	noHashes        int32
 	srcFilesMissing int32
@@ -586,6 +572,9 @@ type checkMarch struct {
 func (c *checkMarch) DstOnly(dst fs.DirEntry) (recurse bool) {
 	switch dst.(type) {
 	case fs.Object:
+		if c.oneway {
+			return false
+		}
 		err := errors.Errorf("File not in %v", c.fsrc)
 		fs.Errorf(dst, "%v", err)
 		fs.CountError(err)
@@ -681,11 +670,12 @@ func (c *checkMarch) Match(dst, src fs.DirEntry) (recurse bool) {
 //
 // it returns true if differences were found
 // it also returns whether it couldn't be hashed
-func CheckFn(fdst, fsrc fs.Fs, check checkFn) error {
+func CheckFn(fdst, fsrc fs.Fs, check checkFn, oneway bool) error {
 	c := &checkMarch{
-		fdst:  fdst,
-		fsrc:  fsrc,
-		check: check,
+		fdst:   fdst,
+		fsrc:   fsrc,
+		check:  check,
+		oneway: oneway,
 	}
 
 	// set up a march over fdst and fsrc
@@ -711,8 +701,8 @@ func CheckFn(fdst, fsrc fs.Fs, check checkFn) error {
 }
 
 // Check the files in fsrc and fdst according to Size and hash
-func Check(fdst, fsrc fs.Fs) error {
-	return CheckFn(fdst, fsrc, checkIdentical)
+func Check(fdst, fsrc fs.Fs, oneway bool) error {
+	return CheckFn(fdst, fsrc, checkIdentical, oneway)
 }
 
 // CheckEqualReaders checks to see if in1 and in2 have the same
@@ -769,7 +759,7 @@ func CheckIdentical(dst, src fs.Object) (differ bool, err error) {
 
 // CheckDownload checks the files in fsrc and fdst according to Size
 // and the actual contents of the files.
-func CheckDownload(fdst, fsrc fs.Fs) error {
+func CheckDownload(fdst, fsrc fs.Fs, oneway bool) error {
 	check := func(a, b fs.Object) (differ bool, noHash bool) {
 		differ, err := CheckIdentical(a, b)
 		if err != nil {
@@ -779,7 +769,7 @@ func CheckDownload(fdst, fsrc fs.Fs) error {
 		}
 		return differ, false
 	}
-	return CheckFn(fdst, fsrc, check)
+	return CheckFn(fdst, fsrc, check, oneway)
 }
 
 // ListFn lists the Fs to the supplied function
@@ -992,15 +982,15 @@ func Purge(f fs.Fs, dir string) error {
 // Delete removes all the contents of a container.  Unlike Purge, it
 // obeys includes and excludes.
 func Delete(f fs.Fs) error {
-	delete := make(fs.ObjectsChan, fs.Config.Transfers)
+	delChan := make(fs.ObjectsChan, fs.Config.Transfers)
 	delErr := make(chan error, 1)
 	go func() {
-		delErr <- DeleteFiles(delete)
+		delErr <- DeleteFiles(delChan)
 	}()
 	err := ListFn(f, func(o fs.Object) {
-		delete <- o
+		delChan <- o
 	})
-	close(delete)
+	close(delChan)
 	delError := <-delErr
 	if err == nil {
 		err = delError
@@ -1295,7 +1285,7 @@ func NeedTransfer(dst, src fs.Object) bool {
 		dstModTime := dst.ModTime()
 		dt := dstModTime.Sub(srcModTime)
 		// If have a mutually agreed precision then use that
-		modifyWindow := fs.Config.ModifyWindow
+		modifyWindow := fs.GetModifyWindow(dst.Fs(), src.Fs())
 		if modifyWindow == fs.ModTimeNotSupported {
 			// Otherwise use 1 second as a safe default as
 			// the resolution of the time a file was
@@ -1323,6 +1313,45 @@ func NeedTransfer(dst, src fs.Object) bool {
 		}
 	}
 	return true
+}
+
+// RcatSize reads data from the Reader until EOF and uploads it to a file on remote.
+// Pass in size >=0 if known, <0 if not known
+func RcatSize(fdst fs.Fs, dstFileName string, in io.ReadCloser, size int64, modTime time.Time) (dst fs.Object, err error) {
+	var obj fs.Object
+
+	if size >= 0 {
+		// Size known use Put
+		accounting.Stats.Transferring(dstFileName)
+		body := ioutil.NopCloser(in)                                 // we let the server close the body
+		in := accounting.NewAccountSizeName(body, size, dstFileName) // account the transfer (no buffering)
+		var err error
+		defer func() {
+			closeErr := in.Close()
+			if closeErr != nil {
+				accounting.Stats.Error(closeErr)
+				fs.Errorf(dstFileName, "Post request: close failed: %v", closeErr)
+			}
+			accounting.Stats.DoneTransferring(dstFileName, err == nil)
+		}()
+		info := object.NewStaticObjectInfo(dstFileName, modTime, size, true, nil, fdst)
+		obj, err = fdst.Put(in, info)
+		if err != nil {
+			fs.Errorf(dstFileName, "Post request put error: %v", err)
+
+			return nil, err
+		}
+	} else {
+		// Size unknown use Rcat
+		obj, err = Rcat(fdst, dstFileName, in, modTime)
+		if err != nil {
+			fs.Errorf(dstFileName, "Post request rcat error: %v", err)
+
+			return nil, err
+		}
+	}
+
+	return obj, nil
 }
 
 // moveOrCopyFile moves or copies a single file possibly to a new name
@@ -1382,9 +1411,11 @@ func CopyFile(fdst fs.Fs, fsrc fs.Fs, dstFileName string, srcFileName string) (e
 type ListFormat struct {
 	separator string
 	dirSlash  bool
+	absolute  bool
 	output    []func() string
 	entry     fs.DirEntry
-	hash      bool
+	csv       *csv.Writer
+	buf       bytes.Buffer
 }
 
 // SetSeparator changes separator in struct
@@ -1395,6 +1426,26 @@ func (l *ListFormat) SetSeparator(separator string) {
 // SetDirSlash defines if slash should be printed
 func (l *ListFormat) SetDirSlash(dirSlash bool) {
 	l.dirSlash = dirSlash
+}
+
+// SetAbsolute prints a leading slash in front of path names
+func (l *ListFormat) SetAbsolute(absolute bool) {
+	l.absolute = absolute
+}
+
+// SetCSV defines if the output should be csv
+//
+// Note that you should call SetSeparator before this if you want a
+// custom separator
+func (l *ListFormat) SetCSV(useCSV bool) {
+	if useCSV {
+		l.csv = csv.NewWriter(&l.buf)
+		if l.separator != "" {
+			l.csv.Comma = []rune(l.separator)[0]
+		}
+	} else {
+		l.csv = nil
+	}
 }
 
 // SetOutput sets functions used to create files information
@@ -1417,12 +1468,15 @@ func (l *ListFormat) AddSize() {
 // AddPath adds path to file to output
 func (l *ListFormat) AddPath() {
 	l.AppendOutput(func() string {
-		_, isDir := l.entry.(fs.Directory)
-
-		if isDir && l.dirSlash {
-			return l.entry.Remote() + "/"
+		remote := l.entry.Remote()
+		if l.absolute && !strings.HasPrefix(remote, "/") {
+			remote = "/" + remote
 		}
-		return l.entry.Remote()
+		_, isDir := l.entry.(fs.Directory)
+		if isDir && l.dirSlash {
+			remote += "/"
+		}
+		return remote
 	})
 }
 
@@ -1437,20 +1491,42 @@ func (l *ListFormat) AddHash(ht hash.Type) {
 	})
 }
 
+// AddID adds file's ID to the output if known
+func (l *ListFormat) AddID() {
+	l.AppendOutput(func() string {
+		if do, ok := l.entry.(fs.IDer); ok {
+			return do.ID()
+		}
+		return ""
+	})
+}
+
+// AddMimeType adds file's MimeType to the output if known
+func (l *ListFormat) AddMimeType() {
+	l.AppendOutput(func() string {
+		return fs.MimeTypeDirEntry(l.entry)
+	})
+}
+
 // AppendOutput adds string generated by specific function to printed output
 func (l *ListFormat) AppendOutput(functionToAppend func() string) {
-	if len(l.output) > 0 {
-		l.output = append(l.output, func() string { return l.separator })
-	}
 	l.output = append(l.output, functionToAppend)
 }
 
-// ListFormatted prints information about specific file in specific format
-func ListFormatted(entry *fs.DirEntry, list *ListFormat) string {
-	list.entry = *entry
-	var out string
-	for _, fun := range list.output {
-		out += fun()
+// Format prints information about the DirEntry in the format defined
+func (l *ListFormat) Format(entry fs.DirEntry) (result string) {
+	l.entry = entry
+	var out []string
+	for _, fun := range l.output {
+		out = append(out, fun())
 	}
-	return out
+	if l.csv != nil {
+		l.buf.Reset()
+		_ = l.csv.Write(out) // can't fail writing to bytes.Buffer
+		l.csv.Flush()
+		result = strings.TrimRight(l.buf.String(), "\n")
+	} else {
+		result = strings.Join(out, l.separator)
+	}
+	return result
 }

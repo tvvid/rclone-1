@@ -49,12 +49,13 @@ type Handle struct {
 	offset         int64
 	seenOffsets    map[int64]bool
 	mu             sync.Mutex
+	workersWg      sync.WaitGroup
 	confirmReading chan bool
-
-	UseMemory bool
-	workers   []*worker
-	closed    bool
-	reading   bool
+	workers        int
+	maxWorkerID    int
+	UseMemory      bool
+	closed         bool
+	reading        bool
 }
 
 // NewObjectHandle returns a new Handle for an existing Object
@@ -65,14 +66,14 @@ func NewObjectHandle(o *Object, cfs *Fs) *Handle {
 		offset:        0,
 		preloadOffset: -1, // -1 to trigger the first preload
 
-		UseMemory: cfs.chunkMemory,
+		UseMemory: !cfs.opt.ChunkNoMemory,
 		reading:   false,
 	}
 	r.seenOffsets = make(map[int64]bool)
 	r.memory = NewMemory(-1)
 
 	// create a larger buffer to queue up requests
-	r.preloadQueue = make(chan int64, r.cfs.totalWorkers*10)
+	r.preloadQueue = make(chan int64, r.cfs.opt.TotalWorkers*10)
 	r.confirmReading = make(chan bool)
 	r.startReadWorkers()
 	return r
@@ -95,10 +96,10 @@ func (r *Handle) String() string {
 
 // startReadWorkers will start the worker pool
 func (r *Handle) startReadWorkers() {
-	if r.hasAtLeastOneWorker() {
+	if r.workers > 0 {
 		return
 	}
-	totalWorkers := r.cacheFs().totalWorkers
+	totalWorkers := r.cacheFs().opt.TotalWorkers
 
 	if r.cacheFs().plexConnector.isConfigured() {
 		if !r.cacheFs().plexConnector.isConnected() {
@@ -117,26 +118,27 @@ func (r *Handle) startReadWorkers() {
 
 // scaleOutWorkers will increase the worker pool count by the provided amount
 func (r *Handle) scaleWorkers(desired int) {
-	current := len(r.workers)
+	current := r.workers
 	if current == desired {
 		return
 	}
 	if current > desired {
 		// scale in gracefully
-		for i := 0; i < current-desired; i++ {
+		for r.workers > desired {
 			r.preloadQueue <- -1
+			r.workers--
 		}
 	} else {
 		// scale out
-		for i := 0; i < desired-current; i++ {
+		for r.workers < desired {
 			w := &worker{
 				r:  r,
-				ch: r.preloadQueue,
-				id: current + i,
+				id: r.maxWorkerID,
 			}
+			r.workersWg.Add(1)
+			r.workers++
+			r.maxWorkerID++
 			go w.run()
-
-			r.workers = append(r.workers, w)
 		}
 	}
 	// ignore first scale out from 0
@@ -147,17 +149,16 @@ func (r *Handle) scaleWorkers(desired int) {
 
 func (r *Handle) confirmExternalReading() {
 	// if we have a max value of workers
-	// or there's no external confirmation available
 	// then we skip this step
-	if len(r.workers) > 1 ||
-		!r.cacheFs().plexConnector.isConnected() {
+	if r.workers > 1 ||
+		!r.cacheFs().plexConnector.isConfigured() {
 		return
 	}
 	if !r.cacheFs().plexConnector.isPlaying(r.cachedObject) {
 		return
 	}
 	fs.Infof(r, "confirmed reading by external reader")
-	r.scaleWorkers(r.cacheFs().totalMaxWorkers)
+	r.scaleWorkers(r.cacheFs().opt.TotalWorkers)
 }
 
 // queueOffset will send an offset to the workers if it's different from the last one
@@ -179,8 +180,8 @@ func (r *Handle) queueOffset(offset int64) {
 			}
 		}
 
-		for i := 0; i < len(r.workers); i++ {
-			o := r.preloadOffset + r.cacheFs().chunkSize*int64(i)
+		for i := 0; i < r.workers; i++ {
+			o := r.preloadOffset + int64(r.cacheFs().opt.ChunkSize)*int64(i)
 			if o < 0 || o >= r.cachedObject.Size() {
 				continue
 			}
@@ -194,16 +195,6 @@ func (r *Handle) queueOffset(offset int64) {
 	}
 }
 
-func (r *Handle) hasAtLeastOneWorker() bool {
-	oneWorker := false
-	for i := 0; i < len(r.workers); i++ {
-		if r.workers[i].isRunning() {
-			oneWorker = true
-		}
-	}
-	return oneWorker
-}
-
 // getChunk is called by the FS to retrieve a specific chunk of known start and size from where it can find it
 // it can be from transient or persistent cache
 // it will also build the chunk from the cache's specific chunk boundaries and build the final desired chunk in a buffer
@@ -212,7 +203,7 @@ func (r *Handle) getChunk(chunkStart int64) ([]byte, error) {
 	var err error
 
 	// we calculate the modulus of the requested offset with the size of a chunk
-	offset := chunkStart % r.cacheFs().chunkSize
+	offset := chunkStart % int64(r.cacheFs().opt.ChunkSize)
 
 	// we align the start offset of the first chunk to a likely chunk in the storage
 	chunkStart = chunkStart - offset
@@ -229,7 +220,7 @@ func (r *Handle) getChunk(chunkStart int64) ([]byte, error) {
 	if !found {
 		// we're gonna give the workers a chance to pickup the chunk
 		// and retry a couple of times
-		for i := 0; i < r.cacheFs().readRetries*8; i++ {
+		for i := 0; i < r.cacheFs().opt.ReadRetries*8; i++ {
 			data, err = r.storage().GetChunk(r.cachedObject, chunkStart)
 			if err == nil {
 				found = true
@@ -244,7 +235,7 @@ func (r *Handle) getChunk(chunkStart int64) ([]byte, error) {
 	// not found in ram or
 	// the worker didn't managed to download the chunk in time so we abort and close the stream
 	if err != nil || len(data) == 0 || !found {
-		if !r.hasAtLeastOneWorker() {
+		if r.workers == 0 {
 			fs.Errorf(r, "out of workers")
 			return nil, io.ErrUnexpectedEOF
 		}
@@ -256,7 +247,7 @@ func (r *Handle) getChunk(chunkStart int64) ([]byte, error) {
 	if offset > 0 {
 		if offset > int64(len(data)) {
 			fs.Errorf(r, "unexpected conditions during reading. current position: %v, current chunk position: %v, current chunk size: %v, offset: %v, chunk size: %v, file size: %v",
-				r.offset, chunkStart, len(data), offset, r.cacheFs().chunkSize, r.cachedObject.Size())
+				r.offset, chunkStart, len(data), offset, r.cacheFs().opt.ChunkSize, r.cachedObject.Size())
 			return nil, io.ErrUnexpectedEOF
 		}
 		data = data[int(offset):]
@@ -305,14 +296,7 @@ func (r *Handle) Close() error {
 	close(r.preloadQueue)
 	r.closed = true
 	// wait for workers to complete their jobs before returning
-	waitCount := 3
-	for i := 0; i < len(r.workers); i++ {
-		waitIdx := 0
-		for r.workers[i].isRunning() && waitIdx < waitCount {
-			time.Sleep(time.Second)
-			waitIdx++
-		}
-	}
+	r.workersWg.Wait()
 	r.memory.db.Flush()
 
 	fs.Debugf(r, "cache reader closed %v", r.offset)
@@ -339,9 +323,9 @@ func (r *Handle) Seek(offset int64, whence int) (int64, error) {
 		err = errors.Errorf("cache: unimplemented seek whence %v", whence)
 	}
 
-	chunkStart := r.offset - (r.offset % r.cacheFs().chunkSize)
-	if chunkStart >= r.cacheFs().chunkSize {
-		chunkStart = chunkStart - r.cacheFs().chunkSize
+	chunkStart := r.offset - (r.offset % int64(r.cacheFs().opt.ChunkSize))
+	if chunkStart >= int64(r.cacheFs().opt.ChunkSize) {
+		chunkStart = chunkStart - int64(r.cacheFs().opt.ChunkSize)
 	}
 	r.queueOffset(chunkStart)
 
@@ -349,12 +333,9 @@ func (r *Handle) Seek(offset int64, whence int) (int64, error) {
 }
 
 type worker struct {
-	r       *Handle
-	ch      <-chan int64
-	rc      io.ReadCloser
-	id      int
-	running bool
-	mu      sync.Mutex
+	r  *Handle
+	rc io.ReadCloser
+	id int
 }
 
 // String is a representation of this worker
@@ -399,33 +380,19 @@ func (w *worker) reader(offset, end int64, closeOpen bool) (io.ReadCloser, error
 	})
 }
 
-func (w *worker) isRunning() bool {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.running
-}
-
-func (w *worker) setRunning(f bool) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.running = f
-}
-
 // run is the main loop for the worker which receives offsets to preload
 func (w *worker) run() {
 	var err error
 	var data []byte
-	defer w.setRunning(false)
 	defer func() {
 		if w.rc != nil {
 			_ = w.rc.Close()
-			w.setRunning(false)
 		}
+		w.r.workersWg.Done()
 	}()
 
 	for {
-		chunkStart, open := <-w.ch
-		w.setRunning(true)
+		chunkStart, open := <-w.r.preloadQueue
 		if chunkStart < 0 || !open {
 			break
 		}
@@ -446,14 +413,13 @@ func (w *worker) run() {
 					continue
 				}
 			}
-			err = nil
 		} else {
 			if w.r.storage().HasChunk(w.r.cachedObject, chunkStart) {
 				continue
 			}
 		}
 
-		chunkEnd := chunkStart + w.r.cacheFs().chunkSize
+		chunkEnd := chunkStart + int64(w.r.cacheFs().opt.ChunkSize)
 		// TODO: Remove this comment if it proves to be reliable for #1896
 		//if chunkEnd > w.r.cachedObject.Size() {
 		//	chunkEnd = w.r.cachedObject.Size()
@@ -468,7 +434,7 @@ func (w *worker) download(chunkStart, chunkEnd int64, retry int) {
 	var data []byte
 
 	// stop retries
-	if retry >= w.r.cacheFs().readRetries {
+	if retry >= w.r.cacheFs().opt.ReadRetries {
 		return
 	}
 	// back-off between retries
@@ -493,7 +459,7 @@ func (w *worker) download(chunkStart, chunkEnd int64, retry int) {
 	}
 
 	data = make([]byte, chunkEnd-chunkStart)
-	sourceRead := 0
+	var sourceRead int
 	sourceRead, err = io.ReadFull(w.rc, data)
 	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
 		fs.Errorf(w, "failed to read chunk %v: %v", chunkStart, err)
@@ -614,7 +580,7 @@ func (b *backgroundWriter) run() {
 			return
 		}
 
-		absPath, err := b.fs.cache.getPendingUpload(b.fs.Root(), b.fs.tempWriteWait)
+		absPath, err := b.fs.cache.getPendingUpload(b.fs.Root(), time.Duration(b.fs.opt.TempWaitTime))
 		if err != nil || absPath == "" || !b.fs.isRootInPath(absPath) {
 			time.Sleep(time.Second)
 			continue
@@ -629,6 +595,23 @@ func (b *backgroundWriter) run() {
 			_ = b.fs.cache.rollbackPendingUpload(absPath)
 			fs.Errorf(remote, "background upload: %v", err)
 			continue
+		}
+		// clean empty dirs up to root
+		thisDir := cleanPath(path.Dir(remote))
+		for thisDir != "" {
+			thisList, err := b.fs.tempFs.List(thisDir)
+			if err != nil {
+				break
+			}
+			if len(thisList) > 0 {
+				break
+			}
+			err = b.fs.tempFs.Rmdir(thisDir)
+			fs.Debugf(thisDir, "cleaned from temp path")
+			if err != nil {
+				break
+			}
+			thisDir = cleanPath(path.Dir(thisDir))
 		}
 		fs.Infof(remote, "background upload: uploaded entry")
 		err = b.fs.cache.removePendingUpload(absPath)

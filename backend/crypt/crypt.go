@@ -5,24 +5,19 @@ import (
 	"fmt"
 	"io"
 	"path"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/ncw/rclone/fs"
-	"github.com/ncw/rclone/fs/config"
-	"github.com/ncw/rclone/fs/config/flags"
+	"github.com/ncw/rclone/fs/accounting"
+	"github.com/ncw/rclone/fs/config/configmap"
+	"github.com/ncw/rclone/fs/config/configstruct"
 	"github.com/ncw/rclone/fs/config/obscure"
 	"github.com/ncw/rclone/fs/hash"
 	"github.com/pkg/errors"
 )
 
 // Globals
-var (
-	// Flags
-	cryptShowMapping = flags.BoolP("crypt-show-mapping", "", false, "For all files listed show how the names encrypt.")
-)
-
 // Register with Fs
 func init() {
 	fs.Register(&fs.RegInfo{
@@ -30,11 +25,13 @@ func init() {
 		Description: "Encrypt/Decrypt a remote",
 		NewFs:       NewFs,
 		Options: []fs.Option{{
-			Name: "remote",
-			Help: "Remote to encrypt/decrypt.\nNormally should contain a ':' and a path, eg \"myremote:path/to/dir\",\n\"myremote:bucket\" or maybe \"myremote:\" (not recommended).",
+			Name:     "remote",
+			Help:     "Remote to encrypt/decrypt.\nNormally should contain a ':' and a path, eg \"myremote:path/to/dir\",\n\"myremote:bucket\" or maybe \"myremote:\" (not recommended).",
+			Required: true,
 		}, {
-			Name: "filename_encryption",
-			Help: "How to encrypt the filenames.",
+			Name:    "filename_encryption",
+			Help:    "How to encrypt the filenames.",
+			Default: "standard",
 			Examples: []fs.OptionExample{
 				{
 					Value: "off",
@@ -48,8 +45,9 @@ func init() {
 				},
 			},
 		}, {
-			Name: "directory_name_encryption",
-			Help: "Option to either encrypt directory names or leave them intact.",
+			Name:    "directory_name_encryption",
+			Help:    "Option to either encrypt directory names or leave them intact.",
+			Default: true,
 			Examples: []fs.OptionExample{
 				{
 					Value: "true",
@@ -68,50 +66,67 @@ func init() {
 			Name:       "password2",
 			Help:       "Password or pass phrase for salt. Optional but recommended.\nShould be different to the previous password.",
 			IsPassword: true,
-			Optional:   true,
+		}, {
+			Name:     "show_mapping",
+			Help:     "For all files listed show how the names encrypt.",
+			Default:  false,
+			Hide:     fs.OptionHideConfigurator,
+			Advanced: true,
 		}},
 	})
 }
 
-// NewCipher constructs a Cipher for the given config name
-func NewCipher(name string) (Cipher, error) {
-	mode, err := NewNameEncryptionMode(config.FileGet(name, "filename_encryption", "standard"))
+// newCipherForConfig constructs a Cipher for the given config name
+func newCipherForConfig(opt *Options) (Cipher, error) {
+	mode, err := NewNameEncryptionMode(opt.FilenameEncryption)
 	if err != nil {
 		return nil, err
 	}
-	dirNameEncrypt, err := strconv.ParseBool(config.FileGet(name, "directory_name_encryption", "true"))
-	if err != nil {
-		return nil, err
-	}
-	password := config.FileGet(name, "password", "")
-	if password == "" {
+	if opt.Password == "" {
 		return nil, errors.New("password not set in config file")
 	}
-	password, err = obscure.Reveal(password)
+	password, err := obscure.Reveal(opt.Password)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to decrypt password")
 	}
-	salt := config.FileGet(name, "password2", "")
-	if salt != "" {
-		salt, err = obscure.Reveal(salt)
+	var salt string
+	if opt.Password2 != "" {
+		salt, err = obscure.Reveal(opt.Password2)
 		if err != nil {
 			return nil, errors.Wrap(err, "failed to decrypt password2")
 		}
 	}
-	cipher, err := newCipher(mode, password, salt, dirNameEncrypt)
+	cipher, err := newCipher(mode, password, salt, opt.DirectoryNameEncryption)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to make cipher")
 	}
 	return cipher, nil
 }
 
-// NewFs contstructs an Fs from the path, container:path
-func NewFs(name, rpath string) (fs.Fs, error) {
-	cipher, err := NewCipher(name)
+// NewCipher constructs a Cipher for the given config
+func NewCipher(m configmap.Mapper) (Cipher, error) {
+	// Parse config into Options struct
+	opt := new(Options)
+	err := configstruct.Set(m, opt)
 	if err != nil {
 		return nil, err
 	}
-	remote := config.FileGet(name, "remote")
+	return newCipherForConfig(opt)
+}
+
+// NewFs contstructs an Fs from the path, container:path
+func NewFs(name, rpath string, m configmap.Mapper) (fs.Fs, error) {
+	// Parse config into Options struct
+	opt := new(Options)
+	err := configstruct.Set(m, opt)
+	if err != nil {
+		return nil, err
+	}
+	cipher, err := newCipherForConfig(opt)
+	if err != nil {
+		return nil, err
+	}
+	remote := opt.Remote
 	if strings.HasPrefix(remote, name+":") {
 		return nil, errors.New("can't point crypt remote at itself - check the value of the remote setting")
 	}
@@ -130,6 +145,7 @@ func NewFs(name, rpath string) (fs.Fs, error) {
 		Fs:     wrappedFs,
 		name:   name,
 		root:   rpath,
+		opt:    *opt,
 		cipher: cipher,
 	}
 	// the features here are ones we could support, and they are
@@ -161,14 +177,24 @@ func NewFs(name, rpath string) (fs.Fs, error) {
 	return f, err
 }
 
+// Options defines the configuration for this backend
+type Options struct {
+	Remote                  string `config:"remote"`
+	FilenameEncryption      string `config:"filename_encryption"`
+	DirectoryNameEncryption bool   `config:"directory_name_encryption"`
+	Password                string `config:"password"`
+	Password2               string `config:"password2"`
+	ShowMapping             bool   `config:"show_mapping"`
+}
+
 // Fs represents a wrapped fs.Fs
 type Fs struct {
 	fs.Fs
 	name     string
 	root     string
+	opt      Options
 	features *fs.Features // optional features
 	cipher   Cipher
-	mode     NameEncryptionMode
 }
 
 // Name of the remote (as passed into NewFs)
@@ -199,7 +225,7 @@ func (f *Fs) add(entries *fs.DirEntries, obj fs.Object) {
 		fs.Debugf(remote, "Skipping undecryptable file name: %v", err)
 		return
 	}
-	if *cryptShowMapping {
+	if f.opt.ShowMapping {
 		fs.Logf(decryptedRemote, "Encrypts to %q", remote)
 	}
 	*entries = append(*entries, f.newObject(obj))
@@ -213,7 +239,7 @@ func (f *Fs) addDir(entries *fs.DirEntries, dir fs.Directory) {
 		fs.Debugf(remote, "Skipping undecryptable dir name: %v", err)
 		return
 	}
-	if *cryptShowMapping {
+	if f.opt.ShowMapping {
 		fs.Logf(decryptedRemote, "Encrypts to %q", remote)
 	}
 	*entries = append(*entries, f.newDir(dir))
@@ -291,14 +317,54 @@ type putFn func(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.O
 
 // put implements Put or PutStream
 func (f *Fs) put(in io.Reader, src fs.ObjectInfo, options []fs.OpenOption, put putFn) (fs.Object, error) {
+	// Encrypt the data into wrappedIn
 	wrappedIn, err := f.cipher.EncryptData(in)
 	if err != nil {
 		return nil, err
 	}
+
+	// Find a hash the destination supports to compute a hash of
+	// the encrypted data
+	ht := f.Fs.Hashes().GetOne()
+	var hasher *hash.MultiHasher
+	if ht != hash.None {
+		hasher, err = hash.NewMultiHasherTypes(hash.NewHashSet(ht))
+		if err != nil {
+			return nil, err
+		}
+		// unwrap the accounting
+		var wrap accounting.WrapFn
+		wrappedIn, wrap = accounting.UnWrap(wrappedIn)
+		// add the hasher
+		wrappedIn = io.TeeReader(wrappedIn, hasher)
+		// wrap the accounting back on
+		wrappedIn = wrap(wrappedIn)
+	}
+
+	// Transfer the data
 	o, err := put(wrappedIn, f.newObjectInfo(src), options...)
 	if err != nil {
 		return nil, err
 	}
+
+	// Check the hashes of the encrypted data if we were comparing them
+	if ht != hash.None && hasher != nil {
+		srcHash := hasher.Sums()[ht]
+		var dstHash string
+		dstHash, err = o.Hash(ht)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to read destination hash")
+		}
+		if srcHash != "" && dstHash != "" && srcHash != dstHash {
+			// remove object
+			err = o.Remove()
+			if err != nil {
+				fs.Errorf(o, "Failed to remove corrupted object: %v", err)
+			}
+			return nil, errors.Errorf("corrupted on transfer: %v crypted hash differ %q vs %q", ht, srcHash, dstHash)
+		}
+	}
+
 	return f.newObject(o), nil
 }
 
@@ -636,24 +702,24 @@ func (o *Object) Open(options ...fs.OpenOption) (rc io.ReadCloser, err error) {
 
 // Update in to the object with the modTime given of the given size
 func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
-	wrappedIn, err := o.f.cipher.EncryptData(in)
-	if err != nil {
-		return err
+	update := func(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+		return o.Object, o.Object.Update(in, src, options...)
 	}
-	return o.Object.Update(wrappedIn, o.f.newObjectInfo(src))
+	_, err := o.f.put(in, src, options, update)
+	return err
 }
 
 // newDir returns a dir with the Name decrypted
 func (f *Fs) newDir(dir fs.Directory) fs.Directory {
-	new := fs.NewDirCopy(dir)
+	newDir := fs.NewDirCopy(dir)
 	remote := dir.Remote()
 	decryptedRemote, err := f.cipher.DecryptDirName(remote)
 	if err != nil {
 		fs.Debugf(remote, "Undecryptable dir name: %v", err)
 	} else {
-		new.SetRemote(decryptedRemote)
+		newDir.SetRemote(decryptedRemote)
 	}
-	return new
+	return newDir
 }
 
 // ObjectInfo describes a wrapped fs.ObjectInfo for being the source

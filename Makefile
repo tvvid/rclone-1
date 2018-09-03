@@ -1,12 +1,28 @@
 SHELL = bash
-TAG := $(shell echo $$(git describe --abbrev=8 --tags)-$${APPVEYOR_REPO_BRANCH:-$${TRAVIS_BRANCH:-$$(git rev-parse --abbrev-ref HEAD)}} | sed 's/-\([0-9]\)-/-00\1-/; s/-\([0-9][0-9]\)-/-0\1-/; s/-\(HEAD\|master\)$$//')
+BRANCH := $(or $(APPVEYOR_REPO_BRANCH),$(TRAVIS_BRANCH),$(shell git rev-parse --abbrev-ref HEAD))
 LAST_TAG := $(shell git describe --tags --abbrev=0)
+ifeq ($(BRANCH),$(LAST_TAG))
+	BRANCH := master
+endif
+TAG_BRANCH := -$(BRANCH)
+BRANCH_PATH := branch/
+ifeq ($(subst HEAD,,$(subst master,,$(BRANCH))),)
+	TAG_BRANCH :=
+	BRANCH_PATH :=
+endif
+TAG := $(shell echo $$(git describe --abbrev=8 --tags | sed 's/-\([0-9]\)-/-00\1-/; s/-\([0-9][0-9]\)-/-0\1-/'))$(TAG_BRANCH)
 NEW_TAG := $(shell echo $(LAST_TAG) | perl -lpe 's/v//; $$_ += 0.01; $$_ = sprintf("v%.2f", $$_)')
+ifneq ($(TAG),$(LAST_TAG))
+	TAG := $(TAG)-beta
+endif
 GO_VERSION := $(shell go version)
 GO_FILES := $(shell go list ./... | grep -v /vendor/ )
-# Run full tests if go >= go1.9
-FULL_TESTS := $(shell go version | perl -lne 'print "go$$1.$$2" if /go(\d+)\.(\d+)/ && ($$1 > 1 || $$2 >= 9)')
-BETA_URL := https://beta.rclone.org/$(TAG)/
+# Run full tests if go >= go1.11
+FULL_TESTS := $(shell go version | perl -lne 'print "go$$1.$$2" if /go(\d+)\.(\d+)/ && ($$1 > 1 || $$2 >= 11)')
+BETA_PATH := $(BRANCH_PATH)$(TAG)
+BETA_URL := https://beta.rclone.org/$(BETA_PATH)/
+BETA_UPLOAD_ROOT := memstore:beta-rclone-org
+BETA_UPLOAD := $(BETA_UPLOAD_ROOT)/$(BETA_PATH)
 # Pass in GOTAGS=xyz on the make command line to set build tags
 ifdef GOTAGS
 BUILDTAGS=-tags "$(GOTAGS)"
@@ -21,6 +37,7 @@ rclone:
 
 vars:
 	@echo SHELL="'$(SHELL)'"
+	@echo BRANCH="'$(BRANCH)'"
 	@echo TAG="'$(TAG)'"
 	@echo LAST_TAG="'$(LAST_TAG)'"
 	@echo NEW_TAG="'$(NEW_TAG)'"
@@ -56,26 +73,36 @@ else
 	@echo Skipping source quality tests as version of go too old
 endif
 
+gometalinter_install:
+	go get -u github.com/alecthomas/gometalinter
+	gometalinter --install --update
+
+# We aren't using gometalinter as the default linter yet because
+# 1. it doesn't support build tags: https://github.com/alecthomas/gometalinter/issues/275
+# 2. can't get -printfuncs working with the vet linter
+gometalinter:
+	gometalinter ./...
+
 # Get the build dependencies
 build_dep:
 ifdef FULL_TESTS
 	go get -u github.com/kisielk/errcheck
 	go get -u golang.org/x/tools/cmd/goimports
 	go get -u github.com/golang/lint/golint
-	go get -u github.com/inconshreveable/mousetrap
-	go get -u github.com/tools/godep
 endif
 
 # Get the release dependencies
 release_dep:
-	go get -u github.com/goreleaser/nfpm
+	go get -u github.com/goreleaser/nfpm/...
+	go get -u github.com/aktau/github-release
 
 # Update dependencies
 update:
-	go get -u github.com/golang/dep/cmd/dep
-	dep ensure -update -v
+	GO111MODULE=on go get -u ./...
+	GO111MODULE=on go tidy
+	GO111MODULE=on go vendor
 
-doc:	rclone.1 MANUAL.html MANUAL.txt
+doc:	rclone.1 MANUAL.html MANUAL.txt rcdocs commanddocs
 
 rclone.1:	MANUAL.md
 	pandoc -s --from markdown --to man MANUAL.md -o rclone.1
@@ -91,6 +118,9 @@ MANUAL.txt:	MANUAL.md
 
 commanddocs: rclone
 	rclone gendocs docs/content/commands/
+
+rcdocs: rclone
+	bin/make_rc_docs.sh
 
 install: rclone
 	install -d ${DESTDIR}/usr/bin
@@ -112,9 +142,9 @@ tarball:
 	git archive -9 --format=tar.gz --prefix=rclone-$(TAG)/ -o build/rclone-$(TAG).tar.gz $(TAG)
 
 sign_upload:
-	cd build && md5sum rclone-* | gpg --clearsign > MD5SUMS
-	cd build && sha1sum rclone-* | gpg --clearsign > SHA1SUMS
-	cd build && sha256sum rclone-* | gpg --clearsign > SHA256SUMS
+	cd build && md5sum rclone-v* | gpg --clearsign > MD5SUMS
+	cd build && sha1sum rclone-v* | gpg --clearsign > SHA1SUMS
+	cd build && sha256sum rclone-v* | gpg --clearsign > SHA256SUMS
 
 check_sign:
 	cd build && gpg --verify MD5SUMS && gpg --decrypt MD5SUMS | md5sum -c
@@ -122,8 +152,8 @@ check_sign:
 	cd build && gpg --verify SHA256SUMS && gpg --decrypt SHA256SUMS | sha256sum -c
 
 upload:
-	rclone -v copy --exclude '*current*' build/ memstore:downloads-rclone-org/$(TAG)
-	rclone -v copy --include '*current*' --include version.txt build/ memstore:downloads-rclone-org
+	rclone -P copy build/ memstore:downloads-rclone-org/$(TAG)
+	rclone lsf build --files-only --include '*.{zip,deb,rpm}' --include version.txt | xargs -i bash -c 'i={}; j="$$i"; [[ $$i =~ (.*)(-v[0-9\.]+-)(.*) ]] && j=$${BASH_REMATCH[1]}-current-$${BASH_REMATCH[3]}; rclone copyto -v "memstore:downloads-rclone-org/$(TAG)/$$i" "memstore:downloads-rclone-org/$$j"'
 
 upload_github:
 	./bin/upload-github $(TAG)
@@ -132,43 +162,47 @@ cross:	doc
 	go run bin/cross-compile.go -release current $(BUILDTAGS) $(TAG)
 
 beta:
-	go run bin/cross-compile.go $(BUILDTAGS) $(TAG)β
-	rclone -v copy build/ memstore:pub-rclone-org/$(TAG)β
-	@echo Beta release ready at https://pub.rclone.org/$(TAG)%CE%B2/
+	go run bin/cross-compile.go $(BUILDTAGS) $(TAG)
+	rclone -v copy build/ memstore:pub-rclone-org/$(TAG)
+	@echo Beta release ready at https://pub.rclone.org/$(TAG)/
 
 log_since_last_release:
 	git log $(LAST_TAG)..
 
 compile_all:
 ifdef FULL_TESTS
-	go run bin/cross-compile.go -parallel 8 -compile-only $(BUILDTAGS) $(TAG)β
+	go run bin/cross-compile.go -parallel 8 -compile-only $(BUILDTAGS) $(TAG)
 else
 	@echo Skipping compile all as version of go too old
 endif
 
 appveyor_upload:
-	rclone --config bin/travis.rclone.conf -v copy --exclude '*beta-latest*' build/ memstore:beta-rclone-org/$(TAG)
-ifeq ($(APPVEYOR_REPO_BRANCH),master)
-	rclone --config bin/travis.rclone.conf -v copy --include '*beta-latest*' --include version.txt build/ memstore:beta-rclone-org
+	rclone --config bin/travis.rclone.conf -v copy --exclude '*beta-latest*' build/ $(BETA_UPLOAD)
+ifndef BRANCH_PATH
+	rclone --config bin/travis.rclone.conf -v copy --include '*beta-latest*' --include version.txt build/ $(BETA_UPLOAD_ROOT)
 endif
 	@echo Beta release ready at $(BETA_URL)
+
+BUILD_FLAGS := -exclude "^(windows|darwin)/"
+ifeq ($(TRAVIS_OS_NAME),osx)
+	BUILD_FLAGS := -include "^darwin/" -cgo
+endif
 
 travis_beta:
+ifeq ($(TRAVIS_OS_NAME),linux)
 	go run bin/get-github-release.go -extract nfpm goreleaser/nfpm 'nfpm_.*_Linux_x86_64.tar.gz'
+endif
 	git log $(LAST_TAG).. > /tmp/git-log.txt
-	go run bin/cross-compile.go -release beta-latest -git-log /tmp/git-log.txt -exclude "^windows/" -parallel 8 $(BUILDTAGS) $(TAG)β
-	rclone --config bin/travis.rclone.conf -v copy --exclude '*beta-latest*' build/ memstore:beta-rclone-org/$(TAG)
-ifeq ($(TRAVIS_BRANCH),master)
-	rclone --config bin/travis.rclone.conf -v copy --include '*beta-latest*' --include version.txt build/ memstore:beta-rclone-org
+	go run bin/cross-compile.go -release beta-latest -git-log /tmp/git-log.txt $(BUILD_FLAGS) -parallel 8 $(BUILDTAGS) $(TAG)
+	rclone --config bin/travis.rclone.conf -v copy --exclude '*beta-latest*' build/ $(BETA_UPLOAD)
+ifndef BRANCH_PATH
+	rclone --config bin/travis.rclone.conf -v copy --include '*beta-latest*' --include version.txt build/ $(BETA_UPLOAD_ROOT)
 endif
 	@echo Beta release ready at $(BETA_URL)
 
-# Fetch the windows builds from appveyor
-fetch_windows:
-	rclone -v copy --include 'rclone-v*-windows-*.zip' memstore:beta-rclone-org/$(TAG) build/
-	-#cp -av build/rclone-v*-windows-386.zip build/rclone-current-windows-386.zip
-	-#cp -av build/rclone-v*-windows-amd64.zip build/rclone-current-windows-amd64.zip
-	md5sum build/rclone-*-windows-*.zip | sort
+# Fetch the binary builds from travis and appveyor
+fetch_binaries:
+	rclone -P sync $(BETA_UPLOAD) build/
 
 serve:	website
 	cd docs && hugo server -v -w
@@ -179,10 +213,10 @@ tag:	doc
 	echo -e "package fs\n\n// Version of rclone\nvar Version = \"$(NEW_TAG)\"\n" | gofmt > fs/version.go
 	echo -n "$(NEW_TAG)" > docs/layouts/partials/version.html
 	git tag -s -m "Version $(NEW_TAG)" $(NEW_TAG)
+	bin/make_changelog.py $(LAST_TAG) $(NEW_TAG) > docs/content/changelog.md.new
+	mv docs/content/changelog.md.new docs/content/changelog.md
 	@echo "Edit the new changelog in docs/content/changelog.md"
-	@echo "  * $(NEW_TAG) -" `date -I` >> docs/content/changelog.md
-	@git log $(LAST_TAG)..$(NEW_TAG) --oneline >> docs/content/changelog.md
-	@echo "Then commit the changes"
+	@echo "Then commit all the changes"
 	@echo git commit -m \"Version $(NEW_TAG)\" -a -v
 	@echo "And finally run make retag before make cross etc"
 

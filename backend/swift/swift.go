@@ -14,8 +14,8 @@ import (
 	"time"
 
 	"github.com/ncw/rclone/fs"
-	"github.com/ncw/rclone/fs/config"
-	"github.com/ncw/rclone/fs/config/flags"
+	"github.com/ncw/rclone/fs/config/configmap"
+	"github.com/ncw/rclone/fs/config/configstruct"
 	"github.com/ncw/rclone/fs/fserrors"
 	"github.com/ncw/rclone/fs/fshttp"
 	"github.com/ncw/rclone/fs/hash"
@@ -31,11 +31,6 @@ const (
 	listChunks                 = 1000                    // chunk size to read directory listings
 )
 
-// Globals
-var (
-	chunkSize = fs.SizeSuffix(5 * 1024 * 1024 * 1024)
-)
-
 // Register with Fs
 func init() {
 	fs.Register(&fs.RegInfo{
@@ -43,8 +38,9 @@ func init() {
 		Description: "Openstack Swift (Rackspace Cloud Files, Memset Memstore, OVH)",
 		NewFs:       NewFs,
 		Options: []fs.Option{{
-			Name: "env_auth",
-			Help: "Get swift credentials from environment variables in standard OpenStack form.",
+			Name:    "env_auth",
+			Help:    "Get swift credentials from environment variables in standard OpenStack form.",
+			Default: false,
 			Examples: []fs.OptionExample{
 				{
 					Value: "false",
@@ -107,11 +103,13 @@ func init() {
 			Name: "auth_token",
 			Help: "Auth Token from alternate authentication - optional (OS_AUTH_TOKEN)",
 		}, {
-			Name: "auth_version",
-			Help: "AuthVersion - optional - set to (1,2,3) if your auth URL has no version (ST_AUTH_VERSION)",
+			Name:    "auth_version",
+			Help:    "AuthVersion - optional - set to (1,2,3) if your auth URL has no version (ST_AUTH_VERSION)",
+			Default: 0,
 		}, {
-			Name: "endpoint_type",
-			Help: "Endpoint type to choose from the service catalogue (OS_ENDPOINT_TYPE)",
+			Name:    "endpoint_type",
+			Help:    "Endpoint type to choose from the service catalogue (OS_ENDPOINT_TYPE)",
+			Default: "public",
 			Examples: []fs.OptionExample{{
 				Help:  "Public (default, choose this if not sure)",
 				Value: "public",
@@ -122,10 +120,47 @@ func init() {
 				Help:  "Admin",
 				Value: "admin",
 			}},
-		},
-		},
+		}, {
+			Name:    "storage_policy",
+			Help:    "The storage policy to use when creating a new container",
+			Default: "",
+			Examples: []fs.OptionExample{{
+				Help:  "Default",
+				Value: "",
+			}, {
+				Help:  "OVH Public Cloud Storage",
+				Value: "pcs",
+			}, {
+				Help:  "OVH Public Cloud Archive",
+				Value: "pca",
+			}},
+		}, {
+			Name:     "chunk_size",
+			Help:     "Above this size files will be chunked into a _segments container.",
+			Default:  fs.SizeSuffix(5 * 1024 * 1024 * 1024),
+			Advanced: true,
+		}},
 	})
-	flags.VarP(&chunkSize, "swift-chunk-size", "", "Above this size files will be chunked into a _segments container.")
+}
+
+// Options defines the configuration for this backend
+type Options struct {
+	EnvAuth       bool          `config:"env_auth"`
+	User          string        `config:"user"`
+	Key           string        `config:"key"`
+	Auth          string        `config:"auth"`
+	UserID        string        `config:"user_id"`
+	Domain        string        `config:"domain"`
+	Tenant        string        `config:"tenant"`
+	TenantID      string        `config:"tenant_id"`
+	TenantDomain  string        `config:"tenant_domain"`
+	Region        string        `config:"region"`
+	StorageURL    string        `config:"storage_url"`
+	AuthToken     string        `config:"auth_token"`
+	AuthVersion   int           `config:"auth_version"`
+	StoragePolicy string        `config:"storage_policy"`
+	EndpointType  string        `config:"endpoint_type"`
+	ChunkSize     fs.SizeSuffix `config:"chunk_size"`
 }
 
 // Fs represents a remote swift server
@@ -133,6 +168,7 @@ type Fs struct {
 	name              string            // name of this remote
 	root              string            // the path we are working on if any
 	features          *fs.Features      // optional features
+	opt               Options           // options for this backend
 	c                 *swift.Connection // the connection to the swift server
 	container         string            // the container we are working on
 	containerOKMu     sync.Mutex        // mutex to protect container OK
@@ -180,7 +216,7 @@ func (f *Fs) Features() *fs.Features {
 }
 
 // Pattern to match a swift path
-var matcher = regexp.MustCompile(`^([^/]*)(.*)$`)
+var matcher = regexp.MustCompile(`^/*([^/]*)(.*)$`)
 
 // parseParse parses a swift 'url'
 func parsePath(path string) (container, directory string, err error) {
@@ -195,33 +231,33 @@ func parsePath(path string) (container, directory string, err error) {
 }
 
 // swiftConnection makes a connection to swift
-func swiftConnection(name string) (*swift.Connection, error) {
+func swiftConnection(opt *Options, name string) (*swift.Connection, error) {
 	c := &swift.Connection{
 		// Keep these in the same order as the Config for ease of checking
-		UserName:       config.FileGet(name, "user"),
-		ApiKey:         config.FileGet(name, "key"),
-		AuthUrl:        config.FileGet(name, "auth"),
-		UserId:         config.FileGet(name, "user_id"),
-		Domain:         config.FileGet(name, "domain"),
-		Tenant:         config.FileGet(name, "tenant"),
-		TenantId:       config.FileGet(name, "tenant_id"),
-		TenantDomain:   config.FileGet(name, "tenant_domain"),
-		Region:         config.FileGet(name, "region"),
-		StorageUrl:     config.FileGet(name, "storage_url"),
-		AuthToken:      config.FileGet(name, "auth_token"),
-		AuthVersion:    config.FileGetInt(name, "auth_version", 0),
-		EndpointType:   swift.EndpointType(config.FileGet(name, "endpoint_type", "public")),
+		UserName:       opt.User,
+		ApiKey:         opt.Key,
+		AuthUrl:        opt.Auth,
+		UserId:         opt.UserID,
+		Domain:         opt.Domain,
+		Tenant:         opt.Tenant,
+		TenantId:       opt.TenantID,
+		TenantDomain:   opt.TenantDomain,
+		Region:         opt.Region,
+		StorageUrl:     opt.StorageURL,
+		AuthToken:      opt.AuthToken,
+		AuthVersion:    opt.AuthVersion,
+		EndpointType:   swift.EndpointType(opt.EndpointType),
 		ConnectTimeout: 10 * fs.Config.ConnectTimeout, // Use the timeouts in the transport
 		Timeout:        10 * fs.Config.Timeout,        // Use the timeouts in the transport
 		Transport:      fshttp.NewTransport(fs.Config),
 	}
-	if config.FileGetBool(name, "env_auth", false) {
+	if opt.EnvAuth {
 		err := c.ApplyEnvironment()
 		if err != nil {
 			return nil, errors.Wrap(err, "failed to read environment variables")
 		}
 	}
-	StorageUrl, AuthToken := c.StorageUrl, c.AuthToken
+	StorageUrl, AuthToken := c.StorageUrl, c.AuthToken // nolint
 	if !c.Authenticated() {
 		if c.UserName == "" && c.UserId == "" {
 			return nil, errors.New("user name or user id not found for authentication (and no storage_url+auth_token is provided)")
@@ -241,6 +277,15 @@ func swiftConnection(name string) (*swift.Connection, error) {
 	// provided by wrapping the existing auth, so we can just
 	// override one or the other or both.
 	if StorageUrl != "" || AuthToken != "" {
+		// Re-write StorageURL and AuthToken if they are being
+		// overridden as c.Authenticate above will have
+		// overwritten them.
+		if StorageUrl != "" {
+			c.StorageUrl = StorageUrl
+		}
+		if AuthToken != "" {
+			c.AuthToken = AuthToken
+		}
 		c.Auth = newAuth(c.Auth, StorageUrl, AuthToken)
 	}
 	return c, nil
@@ -251,13 +296,14 @@ func swiftConnection(name string) (*swift.Connection, error) {
 //
 // if noCheckContainer is set then the Fs won't check the container
 // exists before creating it.
-func NewFsWithConnection(name, root string, c *swift.Connection, noCheckContainer bool) (fs.Fs, error) {
+func NewFsWithConnection(opt *Options, name, root string, c *swift.Connection, noCheckContainer bool) (fs.Fs, error) {
 	container, directory, err := parsePath(root)
 	if err != nil {
 		return nil, err
 	}
 	f := &Fs{
 		name:              name,
+		opt:               *opt,
 		c:                 c,
 		container:         container,
 		segmentsContainer: container + "_segments",
@@ -288,12 +334,19 @@ func NewFsWithConnection(name, root string, c *swift.Connection, noCheckContaine
 }
 
 // NewFs contstructs an Fs from the path, container:path
-func NewFs(name, root string) (fs.Fs, error) {
-	c, err := swiftConnection(name)
+func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
+	// Parse config into Options struct
+	opt := new(Options)
+	err := configstruct.Set(m, opt)
 	if err != nil {
 		return nil, err
 	}
-	return NewFsWithConnection(name, root, c, false)
+
+	c, err := swiftConnection(opt, name)
+	if err != nil {
+		return nil, err
+	}
+	return NewFsWithConnection(opt, name, root, c, false)
 }
 
 // Return an Object from a path
@@ -391,7 +444,8 @@ func (f *Fs) list(dir string, recurse bool, fn addEntryFn) error {
 			err = fn(d)
 		} else {
 			// newObjectWithInfo does a full metadata read on 0 size objects which might be dynamic large objects
-			o, err := f.newObjectWithInfo(remote, object)
+			var o fs.Object
+			o, err = f.newObjectWithInfo(remote, object)
 			if err != nil {
 				return err
 			}
@@ -553,7 +607,11 @@ func (f *Fs) Mkdir(dir string) error {
 		_, _, err = f.c.Container(f.container)
 	}
 	if err == swift.ContainerNotFound {
-		err = f.c.ContainerCreate(f.container, nil)
+		headers := swift.Headers{}
+		if f.opt.StoragePolicy != "" {
+			headers["X-Storage-Policy"] = f.opt.StoragePolicy
+		}
+		err = f.c.ContainerCreate(f.container, headers)
 	}
 	if err == nil {
 		f.containerOK = true
@@ -847,10 +905,14 @@ func urlEncode(str string) string {
 // container.  It returns a string which prefixes current segments.
 func (o *Object) updateChunks(in0 io.Reader, headers swift.Headers, size int64, contentType string) (string, error) {
 	// Create the segmentsContainer if it doesn't exist
-	var err error = swift.ContainerNotFound
+	var err error
 	_, _, err = o.fs.c.Container(o.fs.segmentsContainer)
 	if err == swift.ContainerNotFound {
-		err = o.fs.c.ContainerCreate(o.fs.segmentsContainer, nil)
+		headers := swift.Headers{}
+		if o.fs.opt.StoragePolicy != "" {
+			headers["X-Storage-Policy"] = o.fs.opt.StoragePolicy
+		}
+		err = o.fs.c.ContainerCreate(o.fs.segmentsContainer, headers)
 	}
 	if err != nil {
 		return "", err
@@ -870,7 +932,7 @@ func (o *Object) updateChunks(in0 io.Reader, headers swift.Headers, size int64, 
 			fs.Debugf(o, "Uploading segments into %q seems done (%v)", o.fs.segmentsContainer, err)
 			break
 		}
-		n := int64(chunkSize)
+		n := int64(o.fs.opt.ChunkSize)
 		if size != -1 {
 			n = min(left, n)
 			headers["Content-Length"] = strconv.FormatInt(n, 10) // set Content-Length as we know it
@@ -920,7 +982,7 @@ func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOptio
 	contentType := fs.MimeType(src)
 	headers := m.ObjectHeaders()
 	uniquePrefix := ""
-	if size > int64(chunkSize) || size == -1 {
+	if size > int64(o.fs.opt.ChunkSize) || size == -1 {
 		uniquePrefix, err = o.updateChunks(in, headers, size, contentType)
 		if err != nil {
 			return err

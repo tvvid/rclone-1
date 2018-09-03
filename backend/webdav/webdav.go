@@ -19,12 +19,12 @@ package webdav
 // For example the ownCloud WebDAV server does it that way.
 
 import (
+	"encoding/xml"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"path"
-	"regexp"
 	"strings"
 	"time"
 
@@ -32,6 +32,8 @@ import (
 	"github.com/ncw/rclone/backend/webdav/odrvcookie"
 	"github.com/ncw/rclone/fs"
 	"github.com/ncw/rclone/fs/config"
+	"github.com/ncw/rclone/fs/config/configmap"
+	"github.com/ncw/rclone/fs/config/configstruct"
 	"github.com/ncw/rclone/fs/config/obscure"
 	"github.com/ncw/rclone/fs/fserrors"
 	"github.com/ncw/rclone/fs/fshttp"
@@ -44,7 +46,8 @@ import (
 const (
 	minSleep      = 10 * time.Millisecond
 	maxSleep      = 2 * time.Second
-	decayConstant = 2 // bigger for slower decay, exponential
+	decayConstant = 2   // bigger for slower decay, exponential
+	defaultDepth  = "1" // depth for PROPFIND
 )
 
 // Register with Fs
@@ -56,15 +59,14 @@ func init() {
 		Options: []fs.Option{{
 			Name:     "url",
 			Help:     "URL of http host to connect to",
-			Optional: false,
+			Required: true,
 			Examples: []fs.OptionExample{{
 				Value: "https://example.com",
 				Help:  "Connect to example.com",
 			}},
 		}, {
-			Name:     "vendor",
-			Help:     "Name of the Webdav site/service/software you are using",
-			Optional: false,
+			Name: "vendor",
+			Help: "Name of the Webdav site/service/software you are using",
 			Examples: []fs.OptionExample{{
 				Value: "nextcloud",
 				Help:  "Nextcloud",
@@ -79,33 +81,41 @@ func init() {
 				Help:  "Other site/service or software",
 			}},
 		}, {
-			Name:     "user",
-			Help:     "User name",
-			Optional: true,
+			Name: "user",
+			Help: "User name",
 		}, {
 			Name:       "pass",
 			Help:       "Password.",
-			Optional:   true,
 			IsPassword: true,
+		}, {
+			Name: "bearer_token",
+			Help: "Bearer token instead of user/pass (eg a Macaroon)",
 		}},
 	})
 }
 
+// Options defines the configuration for this backend
+type Options struct {
+	URL    string `config:"url"`
+	Vendor string `config:"vendor"`
+	User   string `config:"user"`
+	Pass   string `config:"pass"`
+}
+
 // Fs represents a remote webdav
 type Fs struct {
-	name        string        // name of this remote
-	root        string        // the path we are working on
-	features    *fs.Features  // optional features
-	endpoint    *url.URL      // URL of the host
-	endpointURL string        // endpoint as a string
-	srv         *rest.Client  // the connection to the one drive server
-	pacer       *pacer.Pacer  // pacer for API calls
-	user        string        // username
-	pass        string        // password
-	vendor      string        // name of the vendor
-	precision   time.Duration // mod time precision
-	canStream   bool          // set if can stream
-	useOCMtime  bool          // set if can use X-OC-Mtime
+	name               string        // name of this remote
+	root               string        // the path we are working on
+	opt                Options       // parsed options
+	features           *fs.Features  // optional features
+	endpoint           *url.URL      // URL of the host
+	endpointURL        string        // endpoint as a string
+	srv                *rest.Client  // the connection to the one drive server
+	pacer              *pacer.Pacer  // pacer for API calls
+	precision          time.Duration // mod time precision
+	canStream          bool          // set if can stream
+	useOCMtime         bool          // set if can use X-OC-Mtime
+	retryWithZeroDepth bool          // some vendors (sharepoint) won't list files when Depth is 1 (our default)
 }
 
 // Object describes a webdav object
@@ -117,7 +127,6 @@ type Object struct {
 	hasMetaData bool      // whether info below has been set
 	size        int64     // size of the object
 	modTime     time.Time // modification time of the object
-	id          string    // ID of the object
 	sha1        string    // SHA-1 of the object content
 }
 
@@ -141,15 +150,6 @@ func (f *Fs) String() string {
 // Features returns the optional features of this Fs
 func (f *Fs) Features() *fs.Features {
 	return f.features
-}
-
-// Pattern to match a webdav path
-var matcher = regexp.MustCompile(`^([^/]*)(.*)$`)
-
-// parsePath parses an webdav 'url'
-func parsePath(path string) (root string) {
-	root = strings.Trim(path, "/")
-	return
 }
 
 // retryErrorCodes is a slice of error codes that we will retry
@@ -184,11 +184,15 @@ func itemIsDir(item *api.Response) bool {
 }
 
 // readMetaDataForPath reads the metadata from the path
-func (f *Fs) readMetaDataForPath(path string) (info *api.Prop, err error) {
+func (f *Fs) readMetaDataForPath(path string, depth string) (info *api.Prop, err error) {
 	// FIXME how do we read back additional properties?
 	opts := rest.Opts{
 		Method: "PROPFIND",
 		Path:   f.filePath(path),
+		ExtraHeaders: map[string]string{
+			"Depth": depth,
+		},
+		NoRedirect: true,
 	}
 	var result api.Multistatus
 	var resp *http.Response
@@ -198,7 +202,16 @@ func (f *Fs) readMetaDataForPath(path string) (info *api.Prop, err error) {
 	})
 	if apiErr, ok := err.(*api.Error); ok {
 		// does not exist
-		if apiErr.StatusCode == http.StatusNotFound {
+		switch apiErr.StatusCode {
+		case http.StatusNotFound:
+			if f.retryWithZeroDepth && depth != "0" {
+				return f.readMetaDataForPath(path, "0")
+			}
+			return nil, fs.ErrorObjectNotFound
+		case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther:
+			// Some sort of redirect - go doesn't deal with these properly (it resets
+			// the method to GET).  However we can assume that if it was redirected the
+			// object was not found.
 			return nil, fs.ErrorObjectNotFound
 		}
 	}
@@ -220,11 +233,16 @@ func (f *Fs) readMetaDataForPath(path string) (info *api.Prop, err error) {
 
 // errorHandler parses a non 2xx error response into an error
 func errorHandler(resp *http.Response) error {
+	body, err := rest.ReadBody(resp)
+	if err != nil {
+		return errors.Wrap(err, "error when trying to read error from body")
+	}
 	// Decode error response
 	errResponse := new(api.Error)
-	err := rest.DecodeXML(resp, &errResponse)
+	err = xml.Unmarshal(body, &errResponse)
 	if err != nil {
-		fs.Debugf(nil, "Couldn't decode error response: %v", err)
+		// set the Message to be the body if can't parse the XML
+		errResponse.Message = strings.TrimSpace(string(body))
 	}
 	errResponse.Status = resp.Status
 	errResponse.StatusCode = resp.StatusCode
@@ -255,26 +273,36 @@ func (o *Object) filePath() string {
 }
 
 // NewFs constructs an Fs from the path, container:path
-func NewFs(name, root string) (fs.Fs, error) {
-	endpoint := config.FileGet(name, "url")
-	if !strings.HasSuffix(endpoint, "/") {
-		endpoint += "/"
+func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
+	// Parse config into Options struct
+	opt := new(Options)
+	err := configstruct.Set(m, opt)
+	if err != nil {
+		return nil, err
 	}
+	rootIsDir := strings.HasSuffix(root, "/")
 	root = strings.Trim(root, "/")
 
 	user := config.FileGet(name, "user")
 	pass := config.FileGet(name, "pass")
-	if pass != "" {
+	bearerToken := config.FileGet(name, "bearer_token")
+	if !strings.HasSuffix(opt.URL, "/") {
+		opt.URL += "/"
+	}
+	if opt.Pass != "" {
 		var err error
-		pass, err = obscure.Reveal(pass)
+		opt.Pass, err = obscure.Reveal(opt.Pass)
 		if err != nil {
 			return nil, errors.Wrap(err, "couldn't decrypt password")
 		}
 	}
-	vendor := config.FileGet(name, "vendor")
+	if opt.Vendor == "" {
+		opt.Vendor = "other"
+	}
+	root = strings.Trim(root, "/")
 
 	// Parse the endpoint
-	u, err := url.Parse(endpoint)
+	u, err := url.Parse(opt.URL)
 	if err != nil {
 		return nil, err
 	}
@@ -282,24 +310,28 @@ func NewFs(name, root string) (fs.Fs, error) {
 	f := &Fs{
 		name:        name,
 		root:        root,
+		opt:         *opt,
 		endpoint:    u,
 		endpointURL: u.String(),
-		srv:         rest.NewClient(fshttp.NewClient(fs.Config)).SetRoot(u.String()).SetUserPass(user, pass),
+		srv:         rest.NewClient(fshttp.NewClient(fs.Config)).SetRoot(u.String()),
 		pacer:       pacer.New().SetMinSleep(minSleep).SetMaxSleep(maxSleep).SetDecayConstant(decayConstant),
-		user:        user,
-		pass:        pass,
 		precision:   fs.ModTimeNotSupported,
 	}
 	f.features = (&fs.Features{
 		CanHaveEmptyDirectories: true,
 	}).Fill(f)
+	if user != "" || pass != "" {
+		f.srv.SetUserPass(opt.User, opt.Pass)
+	} else if bearerToken != "" {
+		f.srv.SetHeader("Authorization", "BEARER "+bearerToken)
+	}
 	f.srv.SetErrorHandler(errorHandler)
-	err = f.setQuirks(vendor)
+	err = f.setQuirks(opt.Vendor)
 	if err != nil {
 		return nil, err
 	}
 
-	if root != "" {
+	if root != "" && !rootIsDir {
 		// Check to see if the root actually an existing file
 		remote := path.Base(root)
 		f.root = path.Dir(root)
@@ -323,10 +355,6 @@ func NewFs(name, root string) (fs.Fs, error) {
 
 // setQuirks adjusts the Fs for the vendor passed in
 func (f *Fs) setQuirks(vendor string) error {
-	if vendor == "" {
-		vendor = "other"
-	}
-	f.vendor = vendor
 	switch vendor {
 	case "owncloud":
 		f.canStream = true
@@ -339,12 +367,18 @@ func (f *Fs) setQuirks(vendor string) error {
 		// To mount sharepoint, two Cookies are required
 		// They have to be set instead of BasicAuth
 		f.srv.RemoveHeader("Authorization") // We don't need this Header if using cookies
-		spCk := odrvcookie.New(f.user, f.pass, f.endpointURL)
+		spCk := odrvcookie.New(f.opt.User, f.opt.Pass, f.endpointURL)
 		spCookies, err := spCk.Cookies()
 		if err != nil {
 			return err
 		}
 		f.srv.SetCookie(&spCookies.FedAuth, &spCookies.RtFa)
+
+		// sharepoint, unlike the other vendors, only lists files if the depth header is set to 0
+		// however, rclone defaults to 1 since it provides recursive directory listing
+		// to determine if we may have found a file, the request has to be resent
+		// with the depth set to 0
+		f.retryWithZeroDepth = true
 	case "other":
 	default:
 		fs.Debugf(f, "Unknown vendor %q", vendor)
@@ -395,12 +429,12 @@ type listAllFn func(string, bool, *api.Prop) bool
 // Lists the directory required calling the user function on each item found
 //
 // If the user fn ever returns true then it early exits with found = true
-func (f *Fs) listAll(dir string, directoriesOnly bool, filesOnly bool, fn listAllFn) (found bool, err error) {
+func (f *Fs) listAll(dir string, directoriesOnly bool, filesOnly bool, depth string, fn listAllFn) (found bool, err error) {
 	opts := rest.Opts{
 		Method: "PROPFIND",
 		Path:   f.dirPath(dir), // FIXME Should not start with /
 		ExtraHeaders: map[string]string{
-			"Depth": "1",
+			"Depth": depth,
 		},
 	}
 	var result api.Multistatus
@@ -413,6 +447,9 @@ func (f *Fs) listAll(dir string, directoriesOnly bool, filesOnly bool, fn listAl
 		if apiErr, ok := err.(*api.Error); ok {
 			// does not exist
 			if apiErr.StatusCode == http.StatusNotFound {
+				if f.retryWithZeroDepth && depth != "0" {
+					return f.listAll(dir, directoriesOnly, filesOnly, "0", fn)
+				}
 				return found, fs.ErrorDirNotFound
 			}
 		}
@@ -486,7 +523,7 @@ func (f *Fs) listAll(dir string, directoriesOnly bool, filesOnly bool, fn listAl
 // found.
 func (f *Fs) List(dir string) (entries fs.DirEntries, err error) {
 	var iErr error
-	_, err = f.listAll(dir, false, false, func(remote string, isDir bool, info *api.Prop) bool {
+	_, err = f.listAll(dir, false, false, defaultDepth, func(remote string, isDir bool, info *api.Prop) bool {
 		if isDir {
 			d := fs.NewDir(remote, time.Time(info.Modified))
 			// .SetID(info.ID)
@@ -544,6 +581,11 @@ func (f *Fs) PutStream(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption
 // mkParentDir makes the parent of the native path dirPath if
 // necessary and any directories above that
 func (f *Fs) mkParentDir(dirPath string) error {
+	// defer log.Trace(dirPath, "")("")
+	// chop off trailing / if it exists
+	if strings.HasSuffix(dirPath, "/") {
+		dirPath = dirPath[:len(dirPath)-1]
+	}
 	parent := path.Dir(dirPath)
 	if parent == "." {
 		parent = ""
@@ -553,9 +595,14 @@ func (f *Fs) mkParentDir(dirPath string) error {
 
 // mkdir makes the directory and parents using native paths
 func (f *Fs) mkdir(dirPath string) error {
+	// defer log.Trace(dirPath, "")("")
 	// We assume the root is already ceated
 	if dirPath == "" {
 		return nil
+	}
+	// Collections must end with /
+	if !strings.HasSuffix(dirPath, "/") {
+		dirPath += "/"
 	}
 	opts := rest.Opts{
 		Method:     "MKCOL",
@@ -568,7 +615,7 @@ func (f *Fs) mkdir(dirPath string) error {
 	})
 	if apiErr, ok := err.(*api.Error); ok {
 		// already exists
-		if apiErr.StatusCode == http.StatusMethodNotAllowed {
+		if apiErr.StatusCode == http.StatusMethodNotAllowed || apiErr.StatusCode == http.StatusNotAcceptable {
 			return nil
 		}
 		// parent does not exists
@@ -592,7 +639,7 @@ func (f *Fs) Mkdir(dir string) error {
 //
 // if the directory does not exist then err will be ErrorDirNotFound
 func (f *Fs) dirNotEmpty(dir string) (found bool, err error) {
-	return f.listAll(dir, false, false, func(remote string, isDir bool, info *api.Prop) bool {
+	return f.listAll(dir, false, false, defaultDepth, func(remote string, isDir bool, info *api.Prop) bool {
 		return true
 	})
 }
@@ -843,7 +890,7 @@ func (o *Object) readMetaData() (err error) {
 	if o.hasMetaData {
 		return nil
 	}
-	info, err := o.fs.readMetaDataForPath(o.remote)
+	info, err := o.fs.readMetaDataForPath(o.remote, defaultDepth)
 	if err != nil {
 		return err
 	}
@@ -921,6 +968,8 @@ func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOptio
 		return shouldRetry(resp, err)
 	})
 	if err != nil {
+		// Remove failed upload
+		_ = o.Remove()
 		return err
 	}
 	// read metadata from remote

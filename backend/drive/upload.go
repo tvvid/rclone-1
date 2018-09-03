@@ -30,9 +30,6 @@ import (
 const (
 	// statusResumeIncomplete is the code returned by the Google uploader when the transfer is not yet complete.
 	statusResumeIncomplete = 308
-
-	// Number of times to try each chunk
-	maxTries = 10
 )
 
 // resumableUpload is used by the generated APIs to provide resumable uploads.
@@ -60,6 +57,9 @@ func (f *Fs) Upload(in io.Reader, size int64, contentType string, fileID string,
 	params.Set("fields", partialFields)
 	if f.isTeamDrive {
 		params.Set("supportsTeamDrives", "true")
+	}
+	if f.opt.KeepRevisionForever {
+		params.Set("keepRevisionForever", "true")
 	}
 	urls := "https://www.googleapis.com/upload/drive/v3/files"
 	method := "POST"
@@ -192,16 +192,16 @@ func (rx *resumableUpload) transferChunk(start int64, chunk io.ReadSeeker, chunk
 }
 
 // Upload uploads the chunks from the input
-// It retries each chunk maxTries times (with a pause of uploadPause between attempts).
+// It retries each chunk using the pacer and --low-level-retries
 func (rx *resumableUpload) Upload() (*drive.File, error) {
 	start := int64(0)
 	var StatusCode int
 	var err error
-	buf := make([]byte, int(chunkSize))
+	buf := make([]byte, int(rx.f.opt.ChunkSize))
 	for start < rx.ContentLength {
 		reqSize := rx.ContentLength - start
-		if reqSize >= int64(chunkSize) {
-			reqSize = int64(chunkSize)
+		if reqSize >= int64(rx.f.opt.ChunkSize) {
+			reqSize = int64(rx.f.opt.ChunkSize)
 		}
 		chunk := readers.NewRepeatableLimitReaderBuffer(rx.Media, buf, reqSize)
 

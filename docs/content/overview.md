@@ -27,9 +27,11 @@ Here is an overview of the major features of each cloud storage system.
 | Google Drive                 | MD5         | Yes     | No               | Yes             | R/W       |
 | HTTP                         | -           | No      | No               | No              | R         |
 | Hubic                        | MD5         | Yes     | No               | No              | R/W       |
+| Jottacloud                   | MD5         | Yes     | Yes              | No              | R/W       |
 | Mega                         | -           | No      | No               | Yes             | -         |
 | Microsoft Azure Blob Storage | MD5         | Yes     | No               | No              | R/W       |
 | Microsoft OneDrive           | SHA1 ‡‡     | Yes     | Yes              | No              | R         |
+| OpenDrive                    | MD5         | Yes     | Yes              | No              | -         |
 | Openstack Swift              | MD5         | Yes     | No               | No              | R/W       |
 | pCloud                       | MD5, SHA1   | Yes     | No               | No              | W         |
 | QingStor                     | MD5         | No      | No               | No              | R/W       |
@@ -133,12 +135,14 @@ operations more efficient.
 | Dropbox                      | Yes   | Yes  | Yes  | Yes     | No [#575](https://github.com/ncw/rclone/issues/575) | No  | Yes | Yes | Yes |
 | FTP                          | No    | No   | Yes  | Yes     | No      | No    | Yes          | No [#2178](https://github.com/ncw/rclone/issues/2178) | No  |
 | Google Cloud Storage         | Yes   | Yes  | No   | No      | No      | Yes   | Yes          | No [#2178](https://github.com/ncw/rclone/issues/2178) | No  |
-| Google Drive                 | Yes   | Yes  | Yes  | Yes     | Yes     | No    | Yes          | Yes         | Yes |
+| Google Drive                 | Yes   | Yes  | Yes  | Yes     | Yes     | Yes   | Yes          | Yes         | Yes |
 | HTTP                         | No    | No   | No   | No      | No      | No    | No           | No [#2178](https://github.com/ncw/rclone/issues/2178) | No  |
 | Hubic                        | Yes † | Yes  | No   | No      | No      | Yes   | Yes          | No [#2178](https://github.com/ncw/rclone/issues/2178) | Yes |
+| Jottacloud                   | Yes   | Yes  | Yes  | Yes     | No      | No    | No           | No                                                    | No  |
 | Mega                         | Yes   | No   | Yes  | Yes     | No      | No    | No           | No [#2178](https://github.com/ncw/rclone/issues/2178) | Yes |
 | Microsoft Azure Blob Storage | Yes   | Yes  | No   | No      | No      | Yes   | No           | No [#2178](https://github.com/ncw/rclone/issues/2178) | No  |
-| Microsoft OneDrive           | Yes   | Yes  | Yes  | No [#197](https://github.com/ncw/rclone/issues/197) | No [#575](https://github.com/ncw/rclone/issues/575) | No | No | No [#2178](https://github.com/ncw/rclone/issues/2178) | Yes |
+| Microsoft OneDrive           | Yes   | Yes  | Yes  | Yes     | No [#575](https://github.com/ncw/rclone/issues/575) | No | No | No [#2178](https://github.com/ncw/rclone/issues/2178) | Yes |
+| OpenDrive                    | Yes   | Yes  | Yes  | Yes     | No      | No    | No           | No                                                    | No  |
 | Openstack Swift              | Yes † | Yes  | No   | No      | No      | Yes   | Yes          | No [#2178](https://github.com/ncw/rclone/issues/2178) | Yes |
 | pCloud                       | Yes   | Yes  | Yes  | Yes     | Yes     | No    | No           | No [#2178](https://github.com/ncw/rclone/issues/2178) | Yes |
 | QingStor                     | No    | Yes  | No   | No      | No      | Yes   | No           | No [#2178](https://github.com/ncw/rclone/issues/2178) | No  |

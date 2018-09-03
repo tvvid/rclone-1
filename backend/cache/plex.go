@@ -16,7 +16,6 @@ import (
 	"io/ioutil"
 
 	"github.com/ncw/rclone/fs"
-	"github.com/ncw/rclone/fs/config"
 	"github.com/patrickmn/go-cache"
 	"golang.org/x/net/websocket"
 )
@@ -60,10 +59,11 @@ type plexConnector struct {
 	running    bool
 	runningMu  sync.Mutex
 	stateCache *cache.Cache
+	saveToken  func(string)
 }
 
 // newPlexConnector connects to a Plex server and generates a token
-func newPlexConnector(f *Fs, plexURL, username, password string) (*plexConnector, error) {
+func newPlexConnector(f *Fs, plexURL, username, password string, saveToken func(string)) (*plexConnector, error) {
 	u, err := url.ParseRequestURI(strings.TrimRight(plexURL, "/"))
 	if err != nil {
 		return nil, err
@@ -76,6 +76,7 @@ func newPlexConnector(f *Fs, plexURL, username, password string) (*plexConnector
 		password:   password,
 		token:      "",
 		stateCache: cache.New(time.Hour, time.Minute),
+		saveToken:  saveToken,
 	}
 
 	return pc, nil
@@ -107,8 +108,11 @@ func (p *plexConnector) closeWebsocket() {
 }
 
 func (p *plexConnector) listenWebsocket() {
+	p.runningMu.Lock()
+	defer p.runningMu.Unlock()
+
 	u := strings.Replace(p.url.String(), "http://", "ws://", 1)
-	u = strings.Replace(u, "https://", "ws://", 1)
+	u = strings.Replace(u, "https://", "wss://", 1)
 	conn, err := websocket.Dial(fmt.Sprintf(defPlexNotificationURL, strings.TrimRight(u, "/"), p.token),
 		"", "http://localhost")
 	if err != nil {
@@ -127,8 +131,8 @@ func (p *plexConnector) listenWebsocket() {
 			err := websocket.JSON.Receive(conn, notif)
 			if err != nil {
 				fs.Debugf("plex", "%v", err)
-				time.Sleep(time.Second)
-				continue
+				p.closeWebsocket()
+				break
 			}
 			// we're only interested in play events
 			if notif.Container.Type == "playing" {
@@ -206,8 +210,9 @@ func (p *plexConnector) authenticate() error {
 	}
 	p.token = token
 	if p.token != "" {
-		config.FileSet(p.f.Name(), "plex_token", p.token)
-		config.SaveConfig()
+		if p.saveToken != nil {
+			p.saveToken(p.token)
+		}
 		fs.Infof(p.f.Name(), "Connected to Plex server: %v", p.url.String())
 	}
 	p.listenWebsocket()
@@ -229,6 +234,9 @@ func (p *plexConnector) isConfigured() bool {
 
 func (p *plexConnector) isPlaying(co *Object) bool {
 	var err error
+	if !p.isConnected() {
+		p.listenWebsocket()
+	}
 
 	remote := co.Remote()
 	if cr, yes := p.f.isWrappedByCrypt(); yes {

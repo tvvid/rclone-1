@@ -19,13 +19,13 @@ import (
 	"fmt"
 	"io"
 	"path"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/ncw/rclone/fs"
-	"github.com/ncw/rclone/fs/config/flags"
+	"github.com/ncw/rclone/fs/config/configmap"
+	"github.com/ncw/rclone/fs/config/configstruct"
 	"github.com/ncw/rclone/fs/config/obscure"
 	"github.com/ncw/rclone/fs/fshttp"
 	"github.com/ncw/rclone/fs/hash"
@@ -38,12 +38,11 @@ import (
 const (
 	minSleep      = 10 * time.Millisecond
 	maxSleep      = 2 * time.Second
-	decayConstant = 2    // bigger for slower decay, exponential
-	useTrash      = true // FIXME make configurable - rclone global
+	eventWaitTime = 500 * time.Millisecond
+	decayConstant = 2 // bigger for slower decay, exponential
 )
 
 var (
-	megaDebug   = flags.BoolP("mega-debug", "", false, "If set then output more debug from mega.")
 	megaCacheMu sync.Mutex                // mutex for the below
 	megaCache   = map[string]*mega.Mega{} // cache logged in Mega's by user
 )
@@ -57,20 +56,39 @@ func init() {
 		Options: []fs.Option{{
 			Name:     "user",
 			Help:     "User name",
-			Optional: true,
+			Required: true,
 		}, {
 			Name:       "pass",
 			Help:       "Password.",
-			Optional:   true,
+			Required:   true,
 			IsPassword: true,
+		}, {
+			Name:     "debug",
+			Help:     "Output more debug from Mega.",
+			Default:  false,
+			Advanced: true,
+		}, {
+			Name:     "hard_delete",
+			Help:     "Delete files permanently rather than putting them into the trash.",
+			Default:  false,
+			Advanced: true,
 		}},
 	})
+}
+
+// Options defines the configuration for this backend
+type Options struct {
+	User       string `config:"user"`
+	Pass       string `config:"pass"`
+	Debug      bool   `config:"debug"`
+	HardDelete bool   `config:"hard_delete"`
 }
 
 // Fs represents a remote mega
 type Fs struct {
 	name       string       // name of this remote
 	root       string       // the path we are working on
+	opt        Options      // parsed config options
 	features   *fs.Features // optional features
 	srv        *mega.Mega   // the connection to the server
 	pacer      *pacer.Pacer // pacer for API calls
@@ -114,9 +132,6 @@ func (f *Fs) Features() *fs.Features {
 	return f.features
 }
 
-// Pattern to match a mega path
-var matcher = regexp.MustCompile(`^([^/]*)(.*)$`)
-
 // parsePath parses an mega 'url'
 func parsePath(path string) (root string) {
 	root = strings.Trim(path, "/")
@@ -147,12 +162,16 @@ func (f *Fs) readMetaDataForPath(remote string) (info *mega.Node, err error) {
 }
 
 // NewFs constructs an Fs from the path, container:path
-func NewFs(name, root string) (fs.Fs, error) {
-	user := fs.ConfigFileGet(name, "user")
-	pass := fs.ConfigFileGet(name, "pass")
-	if pass != "" {
+func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
+	// Parse config into Options struct
+	opt := new(Options)
+	err := configstruct.Set(m, opt)
+	if err != nil {
+		return nil, err
+	}
+	if opt.Pass != "" {
 		var err error
-		pass, err = obscure.Reveal(pass)
+		opt.Pass, err = obscure.Reveal(opt.Pass)
 		if err != nil {
 			return nil, errors.Wrap(err, "couldn't decrypt password")
 		}
@@ -165,30 +184,31 @@ func NewFs(name, root string) (fs.Fs, error) {
 	// them up between different remotes.
 	megaCacheMu.Lock()
 	defer megaCacheMu.Unlock()
-	srv := megaCache[user]
+	srv := megaCache[opt.User]
 	if srv == nil {
 		srv = mega.New().SetClient(fshttp.NewClient(fs.Config))
 		srv.SetRetries(fs.Config.LowLevelRetries) // let mega do the low level retries
 		srv.SetLogger(func(format string, v ...interface{}) {
 			fs.Infof("*go-mega*", format, v...)
 		})
-		if *megaDebug {
+		if opt.Debug {
 			srv.SetDebugger(func(format string, v ...interface{}) {
 				fs.Debugf("*go-mega*", format, v...)
 			})
 		}
 
-		err := srv.Login(user, pass)
+		err := srv.Login(opt.User, opt.Pass)
 		if err != nil {
 			return nil, errors.Wrap(err, "couldn't login")
 		}
-		megaCache[user] = srv
+		megaCache[opt.User] = srv
 	}
 
 	root = parsePath(root)
 	f := &Fs{
 		name:  name,
 		root:  root,
+		opt:   *opt,
 		srv:   srv,
 		pacer: pacer.New().SetMinSleep(minSleep).SetMaxSleep(maxSleep).SetDecayConstant(decayConstant),
 	}
@@ -198,7 +218,7 @@ func NewFs(name, root string) (fs.Fs, error) {
 	}).Fill(f)
 
 	// Find the root node and check if it is a file or not
-	_, err := f.findRoot(false)
+	_, err = f.findRoot(false)
 	switch err {
 	case nil:
 		// root node found and is a directory
@@ -542,7 +562,7 @@ func (f *Fs) Mkdir(dir string) error {
 // deleteNode removes a file or directory, observing useTrash
 func (f *Fs) deleteNode(node *mega.Node) (err error) {
 	err = f.pacer.Call(func() (bool, error) {
-		err = f.srv.Delete(node, !useTrash)
+		err = f.srv.Delete(node, f.opt.HardDelete)
 		return shouldRetry(err)
 	})
 	return err
@@ -573,6 +593,8 @@ func (f *Fs) purgeCheck(dir string, check bool) error {
 		}
 	}
 
+	waitEvent := f.srv.WaitEventsStart()
+
 	err = f.deleteNode(dirNode)
 	if err != nil {
 		return errors.Wrap(err, "delete directory node failed")
@@ -582,7 +604,8 @@ func (f *Fs) purgeCheck(dir string, check bool) error {
 	if dirNode == rootNode {
 		f.clearRoot()
 	}
-	time.Sleep(100 * time.Millisecond) // FIXME give the callback a chance
+
+	f.srv.WaitEvents(waitEvent, eventWaitTime)
 	return nil
 }
 
@@ -656,6 +679,8 @@ func (f *Fs) move(dstRemote string, srcFs *Fs, srcRemote string, info *mega.Node
 		}
 	}
 
+	waitEvent := f.srv.WaitEventsStart()
+
 	// rename the object if required
 	if srcLeaf != dstLeaf {
 		//log.Printf("rename %q to %q", srcLeaf, dstLeaf)
@@ -668,7 +693,8 @@ func (f *Fs) move(dstRemote string, srcFs *Fs, srcRemote string, info *mega.Node
 		}
 	}
 
-	time.Sleep(100 * time.Millisecond) // FIXME give events a chance...
+	f.srv.WaitEvents(waitEvent, eventWaitTime)
+
 	return nil
 }
 
@@ -1114,6 +1140,11 @@ func (o *Object) Remove() error {
 	return nil
 }
 
+// ID returns the ID of the Object if known, or "" if not
+func (o *Object) ID() string {
+	return o.info.GetHash()
+}
+
 // Check the interfaces are satisfied
 var (
 	_ fs.Fs              = (*Fs)(nil)
@@ -1126,4 +1157,5 @@ var (
 	_ fs.MergeDirser     = (*Fs)(nil)
 	_ fs.Abouter         = (*Fs)(nil)
 	_ fs.Object          = (*Object)(nil)
+	_ fs.IDer            = (*Object)(nil)
 )

@@ -22,6 +22,7 @@ var (
 	recurse       bool
 	showHash      bool
 	showEncrypted bool
+	showOrigIDs   bool
 	noModTime     bool
 )
 
@@ -31,6 +32,7 @@ func init() {
 	commandDefintion.Flags().BoolVarP(&showHash, "hash", "", false, "Include hashes in the output (may take longer).")
 	commandDefintion.Flags().BoolVarP(&noModTime, "no-modtime", "", false, "Don't read the modification time (can speed things up).")
 	commandDefintion.Flags().BoolVarP(&showEncrypted, "encrypted", "M", false, "Show the encrypted names.")
+	commandDefintion.Flags().BoolVarP(&showOrigIDs, "original", "", false, "Show the ID of the underlying Object.")
 }
 
 // lsJSON in the struct which gets marshalled for each line
@@ -39,9 +41,12 @@ type lsJSON struct {
 	Name      string
 	Encrypted string `json:",omitempty"`
 	Size      int64
+	MimeType  string    `json:",omitempty"`
 	ModTime   Timestamp //`json:",omitempty"`
 	IsDir     bool
 	Hashes    map[string]string `json:",omitempty"`
+	ID        string            `json:",omitempty"`
+	OrigID    string            `json:",omitempty"`
 }
 
 // Timestamp a time in RFC3339 format with Nanosecond precision secongs
@@ -69,7 +74,10 @@ The output is an array of Items, where each Item looks like this
          "MD5" : "b1946ac92492d2347c6235b4d2611184",
          "DropboxHash" : "ecb65bb98f9d905b70458986c39fcbad7715e5f2fcc3b1f07767d7c83e2438cc"
       },
+      "ID": "y2djkhiujf83u33",
+      "OrigID": "UYOJVTUW00Q1RzTDA",
       "IsDir" : false,
+      "MimeType" : "application/octet-stream",
       "ModTime" : "2017-05-31T16:15:57.034468261+01:00",
       "Name" : "file.txt",
       "Encrypted" : "v0qpsdq8anpci8n929v3uu9338",
@@ -98,14 +106,14 @@ can be processed line by line as each item is written one to a line.
 		fsrc := cmd.NewFsSrc(args)
 		var cipher crypt.Cipher
 		if showEncrypted {
-			fsInfo, configName, _, err := fs.ParseRemote(args[0])
+			fsInfo, _, _, config, err := fs.ConfigFs(args[0])
 			if err != nil {
 				log.Fatalf(err.Error())
 			}
 			if fsInfo.Name != "crypt" {
 				log.Fatalf("The remote needs to be of type \"crypt\"")
 			}
-			cipher, err = crypt.NewCipher(configName)
+			cipher, err = crypt.NewCipher(config)
 			if err != nil {
 				log.Fatalf(err.Error())
 			}
@@ -121,9 +129,10 @@ can be processed line by line as each item is written one to a line.
 				}
 				for _, entry := range entries {
 					item := lsJSON{
-						Path: entry.Remote(),
-						Name: path.Base(entry.Remote()),
-						Size: entry.Size(),
+						Path:     entry.Remote(),
+						Name:     path.Base(entry.Remote()),
+						Size:     entry.Size(),
+						MimeType: fs.MimeTypeDirEntry(entry),
 					}
 					if !noModTime {
 						item.ModTime = Timestamp(entry.ModTime())
@@ -136,6 +145,26 @@ can be processed line by line as each item is written one to a line.
 							item.Encrypted = cipher.EncryptFileName(path.Base(entry.Remote()))
 						default:
 							fs.Errorf(nil, "Unknown type %T in listing", entry)
+						}
+					}
+					if do, ok := entry.(fs.IDer); ok {
+						item.ID = do.ID()
+					}
+					if showOrigIDs {
+						cur := entry
+						for {
+							u, ok := cur.(fs.ObjectUnWrapper)
+							if !ok {
+								break // not a wrapped object, use current id
+							}
+							next := u.UnWrap()
+							if next == nil {
+								break // no base object found, use current id
+							}
+							cur = next
+						}
+						if do, ok := cur.(fs.IDer); ok {
+							item.OrigID = do.ID()
 						}
 					}
 					switch x := entry.(type) {

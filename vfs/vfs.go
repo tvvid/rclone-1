@@ -48,6 +48,8 @@ var DefaultOpt = Options{
 	CacheMode:         CacheModeOff,
 	CacheMaxAge:       3600 * time.Second,
 	CachePollInterval: 60 * time.Second,
+	ChunkSize:         128 * fs.MebiByte,
+	ChunkSizeLimit:    -1,
 }
 
 // Node represents either a directory (*Dir) or a file (*File)
@@ -189,6 +191,8 @@ type Options struct {
 	GID               uint32
 	DirPerms          os.FileMode
 	FilePerms         os.FileMode
+	ChunkSize         fs.SizeSuffix // if > 0 read files in chunks
+	ChunkSizeLimit    fs.SizeSuffix // if > ChunkSize double the chunk size after each chunk until reached
 	CacheMode         CacheMode
 	CacheMaxAge       time.Duration
 	CachePollInterval time.Duration
@@ -222,7 +226,7 @@ func New(f fs.Fs, opt *Options) *VFS {
 	// Start polling if required
 	if vfs.Opt.PollInterval > 0 {
 		if do := vfs.f.Features().ChangeNotify; do != nil {
-			do(vfs.root.ForgetPath, vfs.Opt.PollInterval)
+			do(vfs.notifyFunc, vfs.Opt.PollInterval)
 		} else {
 			fs.Infof(f, "poll-interval is not supported by this remote")
 		}
@@ -492,4 +496,14 @@ func (vfs *VFS) Statfs() (total, used, free int64) {
 		}
 	}
 	return
+}
+
+// notifyFunc removes the last path segement for directories and calls ForgetPath with the result.
+//
+// This ensures that new or renamed directories appear in their parent.
+func (vfs *VFS) notifyFunc(relativePath string, entryType fs.EntryType) {
+	if entryType == fs.EntryDirectory {
+		relativePath = path.Dir(relativePath)
+	}
+	vfs.root.ForgetPath(relativePath, entryType)
 }

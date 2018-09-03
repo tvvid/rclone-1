@@ -302,15 +302,15 @@ func Run(t *testing.T, opt *Opt) {
 		dir := "dir/subdir"
 		err := operations.Mkdir(remote, dir)
 		require.NoError(t, err)
-		fstest.CheckListingWithPrecision(t, remote, []fstest.Item{}, []string{"dir", "dir/subdir"}, fs.Config.ModifyWindow)
+		fstest.CheckListingWithPrecision(t, remote, []fstest.Item{}, []string{"dir", "dir/subdir"}, fs.GetModifyWindow(remote))
 
 		err = operations.Rmdir(remote, dir)
 		require.NoError(t, err)
-		fstest.CheckListingWithPrecision(t, remote, []fstest.Item{}, []string{"dir"}, fs.Config.ModifyWindow)
+		fstest.CheckListingWithPrecision(t, remote, []fstest.Item{}, []string{"dir"}, fs.GetModifyWindow(remote))
 
 		err = operations.Rmdir(remote, "dir")
 		require.NoError(t, err)
-		fstest.CheckListingWithPrecision(t, remote, []fstest.Item{}, []string{}, fs.Config.ModifyWindow)
+		fstest.CheckListingWithPrecision(t, remote, []fstest.Item{}, []string{}, fs.GetModifyWindow(remote))
 	})
 
 	// TestFsListEmpty tests listing an empty directory
@@ -379,16 +379,19 @@ func Run(t *testing.T, opt *Opt) {
 	//
 	// It makes sure that aborting a file half way through does not create
 	// a file on the remote.
+	//
+	// go test -v -run 'TestIntegration/Test(Setup|Init|FsMkdir|FsPutError)$'
 	t.Run("TestFsPutError", func(t *testing.T) {
 		skipIfNotOk(t)
 
-		// Read 50 bytes then produce an error
-		contents := fstest.RandomString(50)
+		const N = 5 * 1024
+		// Read N bytes then produce an error
+		contents := fstest.RandomString(N)
 		buf := bytes.NewBufferString(contents)
 		er := &errorReader{errors.New("potato")}
 		in := io.MultiReader(buf, er)
 
-		obji := object.NewStaticObjectInfo(file2.Path, file2.ModTime, 100, true, nil, nil)
+		obji := object.NewStaticObjectInfo(file2.Path, file2.ModTime, 2*N, true, nil, nil)
 		_, err := remote.Put(in, obji)
 		// assert.Nil(t, obj) - FIXME some remotes return the object even on nil
 		assert.NotNil(t, err)
@@ -662,7 +665,7 @@ func Run(t *testing.T, opt *Opt) {
 
 	// TestFsDirMove tests DirMove
 	//
-	// go test -v -run '^Test(Setup|Init|FsMkdir|FsPutFile1|FsPutFile2|FsUpdateFile1|FsDirMove)$
+	// go test -v -run 'TestIntegration/Test(Setup|Init|FsMkdir|FsPutFile1|FsPutFile2|FsUpdateFile1|FsDirMove)$
 	t.Run("TestFsDirMove", func(t *testing.T) {
 		skipIfNotOk(t)
 
@@ -906,6 +909,8 @@ func Run(t *testing.T, opt *Opt) {
 	})
 
 	// TestObjectOpenRange tests that Open works with RangeOption
+	//
+	// go test -v -run 'TestIntegration/Test(Setup|Init|FsMkdir|FsPutFile1|FsPutFile2|FsUpdateFile1|ObjectOpenRange)$'
 	t.Run("TestObjectOpenRange", func(t *testing.T) {
 		skipIfNotOk(t)
 		obj := findObject(t, remote, file1.Path)
@@ -976,6 +981,7 @@ func Run(t *testing.T, opt *Opt) {
 		file2Copy.Path = "z.txt"
 		file2Copy.WinPath = ""
 		fileRemote, err := fs.NewFs(remoteName)
+		require.NotNil(t, fileRemote)
 		assert.Equal(t, fs.ErrorIsFile, err)
 		fstest.CheckListing(t, fileRemote, []fstest.Item{file2Copy})
 	})
