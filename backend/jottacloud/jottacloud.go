@@ -25,6 +25,7 @@ import (
 	"github.com/ncw/rclone/fs/fserrors"
 	"github.com/ncw/rclone/fs/fshttp"
 	"github.com/ncw/rclone/fs/hash"
+	"github.com/ncw/rclone/fs/walk"
 	"github.com/ncw/rclone/lib/pacer"
 	"github.com/ncw/rclone/lib/rest"
 	"github.com/pkg/errors"
@@ -39,6 +40,7 @@ const (
 	defaultMountpoint = "Sync"
 	rootURL           = "https://www.jottacloud.com/jfs/"
 	apiURL            = "https://api.jottacloud.com"
+	shareURL          = "https://www.jottacloud.com/"
 	cachePrefix       = "rclone-jcmd5-"
 )
 
@@ -71,6 +73,16 @@ func init() {
 			Help:     "Files bigger than this will be cached on disk to calculate the MD5 if required.",
 			Default:  fs.SizeSuffix(10 * 1024 * 1024),
 			Advanced: true,
+		}, {
+			Name:     "hard_delete",
+			Help:     "Delete files permanently rather than putting them into the trash.",
+			Default:  false,
+			Advanced: true,
+		}, {
+			Name:     "unlink",
+			Help:     "Remove existing public link to file/folder with link command rather than creating.",
+			Default:  false,
+			Advanced: true,
 		}},
 	})
 }
@@ -81,6 +93,8 @@ type Options struct {
 	Pass               string        `config:"pass"`
 	Mountpoint         string        `config:"mountpoint"`
 	MD5MemoryThreshold fs.SizeSuffix `config:"md5_memory_limit"`
+	HardDelete         bool          `config:"hard_delete"`
+	Unlink             bool          `config:"unlink"`
 }
 
 // Fs represents a remote jottacloud
@@ -185,7 +199,7 @@ func (f *Fs) readMetaDataForPath(path string) (info *api.JottaFile, err error) {
 func (f *Fs) getAccountInfo() (info *api.AccountInfo, err error) {
 	opts := rest.Opts{
 		Method: "GET",
-		Path:   rest.URLPathEscape(f.user),
+		Path:   urlPathEscape(f.user),
 	}
 
 	var resp *http.Response
@@ -206,7 +220,7 @@ func (f *Fs) setEndpointURL(mountpoint string) (err error) {
 	if err != nil {
 		return errors.Wrap(err, "failed to get endpoint url")
 	}
-	f.endpointURL = rest.URLPathEscape(path.Join(info.Username, defaultDevice, mountpoint))
+	f.endpointURL = urlPathEscape(path.Join(info.Username, defaultDevice, mountpoint))
 	return nil
 }
 
@@ -227,9 +241,19 @@ func errorHandler(resp *http.Response) error {
 	return errResponse
 }
 
+// Jottacloud want's '+' to be URL encoded even though the RFC states it's not reserved
+func urlPathEscape(in string) string {
+	return strings.Replace(rest.URLPathEscape(in), "+", "%2B", -1)
+}
+
+// filePathRaw returns an unescaped file path (f.root, file)
+func (f *Fs) filePathRaw(file string) string {
+	return path.Join(f.endpointURL, replaceReservedChars(path.Join(f.root, file)))
+}
+
 // filePath returns a escaped file path (f.root, file)
 func (f *Fs) filePath(file string) string {
-	return rest.URLPathEscape(path.Join(f.endpointURL, replaceReservedChars(path.Join(f.root, file))))
+	return urlPathEscape(f.filePathRaw(file))
 }
 
 // filePath returns a escaped file path (f.root, remote)
@@ -425,6 +449,102 @@ func (f *Fs) List(dir string) (entries fs.DirEntries, err error) {
 	return entries, nil
 }
 
+// listFileDirFn is called from listFileDir to handle an object.
+type listFileDirFn func(fs.DirEntry) error
+
+// List the objects and directories into entries, from a
+// special kind of JottaFolder representing a FileDirLis
+func (f *Fs) listFileDir(remoteStartPath string, startFolder *api.JottaFolder, fn listFileDirFn) error {
+	pathPrefix := "/" + f.filePathRaw("") // Non-escaped prefix of API paths to be cut off, to be left with the remote path including the remoteStartPath
+	pathPrefixLength := len(pathPrefix)
+	startPath := path.Join(pathPrefix, remoteStartPath) // Non-escaped API path up to and including remoteStartPath, to decide if it should be created as a new dir object
+	startPathLength := len(startPath)
+	for i := range startFolder.Folders {
+		folder := &startFolder.Folders[i]
+		if folder.Deleted {
+			return nil
+		}
+		folderPath := path.Join(folder.Path, folder.Name)
+		remoteDirLength := len(folderPath) - pathPrefixLength
+		var remoteDir string
+		if remoteDirLength > 0 {
+			remoteDir = restoreReservedChars(folderPath[pathPrefixLength+1:])
+			if remoteDirLength > startPathLength {
+				d := fs.NewDir(remoteDir, time.Time(folder.ModifiedAt))
+				err := fn(d)
+				if err != nil {
+					return err
+				}
+			}
+		}
+		for i := range folder.Files {
+			file := &folder.Files[i]
+			if file.Deleted || file.State != "COMPLETED" {
+				continue
+			}
+			remoteFile := path.Join(remoteDir, restoreReservedChars(file.Name))
+			o, err := f.newObjectWithInfo(remoteFile, file)
+			if err != nil {
+				return err
+			}
+			err = fn(o)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// ListR lists the objects and directories of the Fs starting
+// from dir recursively into out.
+//
+// dir should be "" to start from the root, and should not
+// have trailing slashes.
+//
+// This should return ErrDirNotFound if the directory isn't
+// found.
+//
+// It should call callback for each tranche of entries read.
+// These need not be returned in any particular order.  If
+// callback returns an error then the listing will stop
+// immediately.
+//
+// Don't implement this unless you have a more efficient way
+// of listing recursively that doing a directory traversal.
+func (f *Fs) ListR(dir string, callback fs.ListRCallback) (err error) {
+	opts := rest.Opts{
+		Method:     "GET",
+		Path:       f.filePath(dir),
+		Parameters: url.Values{},
+	}
+	opts.Parameters.Set("mode", "list")
+
+	var resp *http.Response
+	var result api.JottaFolder // Could be JottaFileDirList, but JottaFolder is close enough
+	err = f.pacer.Call(func() (bool, error) {
+		resp, err = f.srv.CallXML(&opts, nil, &result)
+		return shouldRetry(resp, err)
+	})
+	if err != nil {
+		if apiErr, ok := err.(*api.Error); ok {
+			// does not exist
+			if apiErr.StatusCode == http.StatusNotFound {
+				return fs.ErrorDirNotFound
+			}
+		}
+		return errors.Wrap(err, "couldn't list files")
+	}
+	list := walk.NewListRHelper(callback)
+	err = f.listFileDir(dir, &result, func(entry fs.DirEntry) error {
+		return list.Add(entry)
+	})
+	if err != nil {
+		return err
+	}
+	return list.Flush()
+}
+
 // Creates from the parameters passed in a half finished Object which
 // must have setMetaData called on it
 //
@@ -498,7 +618,11 @@ func (f *Fs) purgeCheck(dir string, check bool) (err error) {
 		NoResponse: true,
 	}
 
-	opts.Parameters.Set("dlDir", "true")
+	if f.opt.HardDelete {
+		opts.Parameters.Set("rmDir", "true")
+	} else {
+		opts.Parameters.Set("dlDir", "true")
+	}
 
 	var resp *http.Response
 	err = f.pacer.Call(func() (bool, error) {
@@ -506,7 +630,7 @@ func (f *Fs) purgeCheck(dir string, check bool) (err error) {
 		return shouldRetry(resp, err)
 	})
 	if err != nil {
-		return errors.Wrap(err, "rmdir failed")
+		return errors.Wrap(err, "couldn't purge directory")
 	}
 
 	// TODO: Parse response?
@@ -579,7 +703,7 @@ func (f *Fs) Copy(src fs.Object, remote string) (fs.Object, error) {
 	info, err := f.copyOrMove("cp", srcObj.filePath(), remote)
 
 	if err != nil {
-		return nil, errors.Wrap(err, "copy failed")
+		return nil, errors.Wrap(err, "couldn't copy file")
 	}
 
 	return f.newObjectWithInfo(remote, info)
@@ -609,7 +733,7 @@ func (f *Fs) Move(src fs.Object, remote string) (fs.Object, error) {
 	info, err := f.copyOrMove("mv", srcObj.filePath(), remote)
 
 	if err != nil {
-		return nil, errors.Wrap(err, "move failed")
+		return nil, errors.Wrap(err, "couldn't move file")
 	}
 
 	return f.newObjectWithInfo(remote, info)
@@ -653,9 +777,55 @@ func (f *Fs) DirMove(src fs.Fs, srcRemote, dstRemote string) error {
 	_, err = f.copyOrMove("mvDir", path.Join(f.endpointURL, replaceReservedChars(srcPath))+"/", dstRemote)
 
 	if err != nil {
-		return errors.Wrap(err, "moveDir failed")
+		return errors.Wrap(err, "couldn't move directory")
 	}
 	return nil
+}
+
+// PublicLink generates a public link to the remote path (usually readable by anyone)
+func (f *Fs) PublicLink(remote string) (link string, err error) {
+	opts := rest.Opts{
+		Method:     "GET",
+		Path:       f.filePath(remote),
+		Parameters: url.Values{},
+	}
+
+	if f.opt.Unlink {
+		opts.Parameters.Set("mode", "disableShare")
+	} else {
+		opts.Parameters.Set("mode", "enableShare")
+	}
+
+	var resp *http.Response
+	var result api.JottaFile
+	err = f.pacer.Call(func() (bool, error) {
+		resp, err = f.srv.CallXML(&opts, nil, &result)
+		return shouldRetry(resp, err)
+	})
+
+	if apiErr, ok := err.(*api.Error); ok {
+		// does not exist
+		if apiErr.StatusCode == http.StatusNotFound {
+			return "", fs.ErrorObjectNotFound
+		}
+	}
+	if err != nil {
+		if f.opt.Unlink {
+			return "", errors.Wrap(err, "couldn't remove public link")
+		}
+		return "", errors.Wrap(err, "couldn't create public link")
+	}
+	if f.opt.Unlink {
+		if result.PublicSharePath != "" {
+			return "", errors.Errorf("couldn't remove public link - %q", result.PublicSharePath)
+		}
+		return "", nil
+	}
+	if result.PublicSharePath == "" {
+		return "", errors.New("couldn't create public link - no link path received")
+	}
+	link = path.Join(shareURL, result.PublicSharePath)
+	return link, nil
 }
 
 // About gets quota information
@@ -666,8 +836,11 @@ func (f *Fs) About() (*fs.Usage, error) {
 	}
 
 	usage := &fs.Usage{
-		Total: fs.NewUsageValue(info.Capacity),
-		Used:  fs.NewUsageValue(info.Usage),
+		Used: fs.NewUsageValue(info.Usage),
+	}
+	if info.Capacity > 0 {
+		usage.Total = fs.NewUsageValue(info.Capacity)
+		usage.Free = fs.NewUsageValue(info.Capacity - info.Usage)
 	}
 	return usage, nil
 }
@@ -914,7 +1087,11 @@ func (o *Object) Remove() error {
 		Parameters: url.Values{},
 	}
 
-	opts.Parameters.Set("dl", "true")
+	if o.fs.opt.HardDelete {
+		opts.Parameters.Set("rm", "true")
+	} else {
+		opts.Parameters.Set("dl", "true")
+	}
 
 	return o.fs.pacer.Call(func() (bool, error) {
 		resp, err := o.fs.srv.CallXML(&opts, nil, nil)
@@ -924,12 +1101,14 @@ func (o *Object) Remove() error {
 
 // Check the interfaces are satisfied
 var (
-	_ fs.Fs        = (*Fs)(nil)
-	_ fs.Purger    = (*Fs)(nil)
-	_ fs.Copier    = (*Fs)(nil)
-	_ fs.Mover     = (*Fs)(nil)
-	_ fs.DirMover  = (*Fs)(nil)
-	_ fs.Abouter   = (*Fs)(nil)
-	_ fs.Object    = (*Object)(nil)
-	_ fs.MimeTyper = (*Object)(nil)
+	_ fs.Fs           = (*Fs)(nil)
+	_ fs.Purger       = (*Fs)(nil)
+	_ fs.Copier       = (*Fs)(nil)
+	_ fs.Mover        = (*Fs)(nil)
+	_ fs.DirMover     = (*Fs)(nil)
+	_ fs.ListRer      = (*Fs)(nil)
+	_ fs.PublicLinker = (*Fs)(nil)
+	_ fs.Abouter      = (*Fs)(nil)
+	_ fs.Object       = (*Object)(nil)
+	_ fs.MimeTyper    = (*Object)(nil)
 )

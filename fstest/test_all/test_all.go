@@ -75,7 +75,7 @@ var (
 		{
 			Name:     "TestJottacloud:",
 			SubDir:   false,
-			FastList: false,
+			FastList: true,
 		},
 		{
 			Name:     "TestOneDrive:",
@@ -144,6 +144,11 @@ var (
 		},
 		{
 			Name:     "TestOpenDrive:",
+			SubDir:   false,
+			FastList: false,
+		},
+		{
+			Name:     "TestUnion:",
 			SubDir:   false,
 			FastList: false,
 		},

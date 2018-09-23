@@ -1,4 +1,4 @@
----
+-----
 title: "Cache"
 description: "Rclone docs for cache remote"
 date: "2017-09-03"
@@ -133,7 +133,8 @@ to the cloud provider without interrupting the reading (small blip can happen th
 
 Files are uploaded in sequence and only one file is uploaded at a time.
 Uploads will be stored in a queue and be processed based on the order they were added.
-The queue and the temporary storage is persistent across restarts and even purges of the cache.
+The queue and the temporary storage is persistent across restarts but
+can be cleared on startup with the `--cache-db-purge` flag.
 
 ### Write Support ###
 
@@ -180,6 +181,28 @@ and password) in your remote and it will be automatically enabled.
 
 Affected settings:
 - `cache-workers`: _Configured value_ during confirmed playback or _1_ all the other times
+
+##### Certificate Validation #####
+
+When the Plex server is configured to only accept secure connections, it is
+possible to use `.plex.direct` URL's to ensure certificate validation succeeds.
+These URL's are used by Plex internally to connect to the Plex server securely.
+
+The format for this URL's is the following:
+
+https://ip-with-dots-replaced.server-hash.plex.direct:32400/
+
+The `ip-with-dots-replaced` part can be any IPv4 address, where the dots
+have been replaced with dashes, e.g. `127.0.0.1` becomes `127-0-0-1`.
+
+To get the `server-hash` part, the easiest way is to visit
+
+https://plex.tv/api/resources?includeHttps=1&X-Plex-Token=your-plex-token
+
+This page will list all the available Plex servers for your account
+with at least one `.plex.direct` link for each. Copy one URL and replace
+the IP address with the desired address. This can be used as the
+`plex_url` value.
 
 ### Known issues ###
 
@@ -242,6 +265,19 @@ which makes it think we're downloading the full file instead of small chunks.
 Organizing the remotes in this order yelds better results:
 <span style="color:green">**cloud remote** -> **cache** -> **crypt**</span>
 
+#### absolute remote paths ####
+
+`cache` can not differentiate between relative and absolute paths for the wrapped remote.
+Any path given in the `remote` config setting and on the command line will be passed to
+the wrapped remote as is, but for storing the chunks on disk the path will be made
+relative by removing any leading `/` character.
+
+This behavior is irrelevant for most backend types, but there are backends where a leading `/`
+changes the effective directory, e.g. in the `sftp` backend paths starting with a `/` are
+relative to the root of the SSH server and paths without are relative to the user home directory.
+As a result `sftp:bin` and `sftp:/bin` will share the same cache folder, even if they represent
+a different directory on the SSH server.
+
 ### Cache and Remote Control (--rc) ###
 Cache supports the new `--rc` mode in rclone and can be remote controlled through the following end points:
 By default, the listener is disabled if you do not add the flag.
@@ -281,7 +317,7 @@ then `--cache-chunk-path` will use the same path as `--cache-db-path`.
 
 #### --cache-db-purge ####
 
-Flag to clear all the cached data for this remote before.
+Flag to clear all the cached data for this remote on start.
 
 **Default**: not set
 
@@ -292,7 +328,7 @@ connections. If the chunk size is changed, any downloaded chunks will be invalid
 
 **Default**: 5M
 
-#### --cache-total-chunk-size=SIZE ####
+#### --cache-chunk-total-size=SIZE ####
 
 The total size that the chunks can take up on the local disk. If `cache`
 exceeds this value then it will start to the delete the oldest chunks until 
@@ -303,7 +339,7 @@ it goes under this value.
 #### --cache-chunk-clean-interval=DURATION ####
 
 How often should `cache` perform cleanups of the chunk storage. The default value
-should be ok for most people. If you find that `cache` goes over `cache-total-chunk-size`
+should be ok for most people. If you find that `cache` goes over `cache-chunk-total-size`
 too often then try to lower this value to force it to perform cleanups more often.
 
 **Default**: 1m

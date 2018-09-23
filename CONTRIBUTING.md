@@ -64,14 +64,15 @@ packages which you can install with
 
 Make sure you
 
-  * Add documentation for a new feature (see below for where)
-  * Add unit tests for a new feature
+  * Add [documentation](#writing-documentation) for a new feature.
+  * Follow the [commit message guidelines](#commit-messages).
+  * Add [unit tests](#testing) for a new feature
   * squash commits down to one per feature
-  * rebase to master `git rebase master`
+  * rebase to master with `git rebase master`
 
 When you are done with that
 
-  git push origin my-new-feature
+    git push origin my-new-feature
 
 Go to the Github website and click [Create pull
 request](https://help.github.com/articles/creating-a-pull-request/).
@@ -80,6 +81,14 @@ You patch will get reviewed and you might get asked to fix some stuff.
 
 If so, then make the changes in the same branch, squash the commits,
 rebase it to master then push it to Github with `--force`.
+
+## Enabling CI for your fork ##
+
+The CI config files for rclone have taken care of forks of the project, so you can enable CI for your fork repo easily.
+
+rclone currently uses [Travis CI](https://travis-ci.org/), [AppVeyor](https://ci.appveyor.com/), and
+[Circle CI](https://circleci.com/) to build the project. To enable them for your fork, simply go into their
+websites, find your fork of rclone, and enable building there.
 
 ## Testing ##
 
@@ -195,13 +204,19 @@ file.
 ## Commit messages ##
 
 Please make the first line of your commit message a summary of the
-change, and prefix it with the directory of the change followed by a
-colon.  The changelog gets made by looking at just these first lines
-so make it good!
+change that a user (not a developer) of rclone would like to read, and
+prefix it with the directory of the change followed by a colon.  The
+changelog gets made by looking at just these first lines so make it
+good!
 
 If you have more to say about the commit, then enter a blank line and
 carry on the description.  Remember to say why the change was needed -
 the commit itself shows what was changed.
+
+Writing more is better than less.  Comparing the behaviour before the
+change to that after the change is very useful.  Imagine you are
+writing to yourself in 12 months time when you've forgotten everything
+about what you just did and you need to get up to speed quickly.
 
 If the change fixes an issue then write `Fixes #1234` in the commit
 message.  This can be on the subject line if it will fit.  If you
@@ -250,9 +265,8 @@ To add a dependency `github.com/ncw/new_dependency` see the
 instructions below.  These will fetch the dependency, add it to
 `go.mod` and `go.sum` and vendor it for older go versions.
 
-    export GO111MODULE=on
-    go get github.com/ncw/new_dependency
-    go mod vendor
+    GO111MODULE=on go get github.com/ncw/new_dependency
+    GO111MODULE=on go mod vendor
 
 You can add constraints on that package when doing `go get` (see the
 go docs linked above), but don't unless you really need to.
@@ -267,9 +281,8 @@ in `vendor`.
 
 If you need to update a dependency then run
 
-    export GO111MODULE=on
-    go get -u github.com/pkg/errors
-    go mod vendor
+    GO111MODULE=on go get -u github.com/pkg/errors
+    GO111MODULE=on go mod vendor
 
 Check in in a single commit as above.
 

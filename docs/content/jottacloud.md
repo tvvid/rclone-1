@@ -81,6 +81,15 @@ To copy a local directory to an Jottacloud directory called backup
 
     rclone copy /home/source remote:backup
 
+### --fast-list ###
+
+This remote supports `--fast-list` which allows you to use fewer
+transactions in exchange for more memory. See the [rclone
+docs](/docs/#fast-list) for more details.
+
+Note that the implementation in Jottacloud always uses only a single
+API request to get the entire list, so for large folders this could
+lead to long wait time before the first results are shown.
 
 ### Modified time and hashes ###
 
@@ -99,11 +108,21 @@ the `--jottacloud-md5-memory-limit` flag.
 
 ### Deleting files ###
 
-Any files you delete with rclone will end up in the trash. Due to a lack of API documentation emptying the trash is currently only possible via the Jottacloud website.
+By default rclone will send all files to the trash when deleting files.
+Due to a lack of API documentation emptying the trash is currently
+only possible via the Jottacloud website. If deleting permanently
+is required then use the `--jottacloud-hard-delete` flag,
+or set the equivalent environment variable.
 
 ### Versions ###
 
 Jottacloud supports file versioning. When rclone uploads a new version of a file it creates a new version of it. Currently rclone only supports retrieving the current version but older versions can be accessed via the Jottacloud Website.
+
+### Quota information ###
+
+To view your current quota you can use the `rclone about remote:`
+command which will display your usage limit (unless it is unlimited)
+and the current usage.
 
 ### Limitations ###
 
@@ -123,6 +142,17 @@ system.
 
 Files bigger than this will be cached on disk to calculate the MD5 if
 required. (default 10M)
+
+#### --jottacloud-hard-delete ####
+
+Controls whether files are sent to the trash or deleted
+permanently. Defaults to false, namely sending files to the trash.
+Use `--jottacloud-hard-delete=true` to delete files permanently instead.
+
+#### --jottacloud-unlink ####
+
+Set to true to make the link command remove existing public link to file/folder.
+Default is false, meaning link command will create or retrieve public link.
 
 ### Troubleshooting ###
 

@@ -171,7 +171,7 @@ Contributors
   * themylogin <themylogin@gmail.com>
   * Onno Zweers <onno.zweers@surfsara.nl>
   * Jasper Lievisse Adriaanse <jasper@humppa.nl>
-  * sandeepkru <sandeep.ummadi@gmail.com>
+  * sandeepkru <sandeep.ummadi@gmail.com> <sandeepkru@users.noreply.github.com>
   * HerrH <atomtigerzoo@users.noreply.github.com>
   * Andrew <4030760+sparkyman215@users.noreply.github.com>
   * dan smith <XX1011@gmail.com>
@@ -189,3 +189,12 @@ Contributors
   * Cédric Connes <cedric.connes@gmail.com>
   * Dr. Tobias Quathamer <toddy15@users.noreply.github.com>
   * dcpu <42736967+dcpu@users.noreply.github.com>
+  * Sheldon Rupp <me@shel.io>
+  * albertony <12441419+albertony@users.noreply.github.com>
+  * cron410 <cron410@gmail.com>
+  * Anagh Kumar Baranwal <anaghk.dos@gmail.com>
+  * Felix Brucker <felix@felixbrucker.com>
+  * Santiago Rodríguez <scollazo@users.noreply.github.com>
+  * Craig Miskell <craig.miskell@fluxfederation.com>
+  * Antoine GIRARD <sapk@sapk.fr>
+  * Joanna Marek <joanna.marek@u2i.com>

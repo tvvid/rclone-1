@@ -7,6 +7,7 @@ package azureblob
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
@@ -37,7 +38,7 @@ const (
 	minSleep              = 10 * time.Millisecond
 	maxSleep              = 10 * time.Second
 	decayConstant         = 1    // bigger for slower decay, exponential
-	listChunkSize         = 5000 // number of items to read at once
+	maxListChunkSize      = 5000 // number of items to read at once
 	modTimeKey            = "mtime"
 	timeFormatIn          = time.RFC3339
 	timeFormatOut         = "2006-01-02T15:04:05.000000000Z07:00"
@@ -81,6 +82,11 @@ func init() {
 			Default:  fs.SizeSuffix(defaultChunkSize),
 			Advanced: true,
 		}, {
+			Name:     "list_chunk",
+			Help:     "Size of blob list.",
+			Default:  maxListChunkSize,
+			Advanced: true,
+		}, {
 			Name: "access_tier",
 			Help: "Access tier of blob, supports hot, cool and archive tiers.\nArchived blobs can be restored by setting access tier to hot or cool." +
 				" Leave blank if you intend to use default access tier, which is set at account level",
@@ -91,13 +97,14 @@ func init() {
 
 // Options defines the configuration for this backend
 type Options struct {
-	Account      string        `config:"account"`
-	Key          string        `config:"key"`
-	Endpoint     string        `config:"endpoint"`
-	SASURL       string        `config:"sas_url"`
-	UploadCutoff fs.SizeSuffix `config:"upload_cutoff"`
-	ChunkSize    fs.SizeSuffix `config:"chunk_size"`
-	AccessTier   string        `config:"access_tier"`
+	Account       string        `config:"account"`
+	Key           string        `config:"key"`
+	Endpoint      string        `config:"endpoint"`
+	SASURL        string        `config:"sas_url"`
+	UploadCutoff  fs.SizeSuffix `config:"upload_cutoff"`
+	ChunkSize     fs.SizeSuffix `config:"chunk_size"`
+	ListChunkSize uint          `config:"list_chunk"`
+	AccessTier    string        `config:"access_tier"`
 }
 
 // Fs represents a remote azure server
@@ -171,6 +178,19 @@ func parsePath(path string) (container, directory string, err error) {
 	return
 }
 
+// validateAccessTier checks if azureblob supports user supplied tier
+func validateAccessTier(tier string) bool {
+	switch tier {
+	case string(azblob.AccessTierHot),
+		string(azblob.AccessTierCool),
+		string(azblob.AccessTierArchive):
+		// valid cases
+		return true
+	default:
+		return false
+	}
+}
+
 // retryErrorCodes is a slice of error codes that we will retry
 var retryErrorCodes = []int{
 	401, // Unauthorized (eg "Token has expired")
@@ -211,6 +231,9 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 	if opt.ChunkSize > maxChunkSize {
 		return nil, errors.Errorf("azure: chunk size can't be greater than %v - was %v", maxChunkSize, opt.ChunkSize)
 	}
+	if opt.ListChunkSize > maxListChunkSize {
+		return nil, errors.Errorf("azure: blob list size can't be greater than %v - was %v", maxListChunkSize, opt.ListChunkSize)
+	}
 	container, directory, err := parsePath(root)
 	if err != nil {
 		return nil, err
@@ -221,15 +244,9 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 
 	if opt.AccessTier == "" {
 		opt.AccessTier = string(defaultAccessTier)
-	} else {
-		switch opt.AccessTier {
-		case string(azblob.AccessTierHot):
-		case string(azblob.AccessTierCool):
-		case string(azblob.AccessTierArchive):
-			// valid cases
-		default:
-			return nil, errors.Errorf("azure: Supported access tiers are %s, %s and %s", string(azblob.AccessTierHot), string(azblob.AccessTierCool), azblob.AccessTierArchive)
-		}
+	} else if !validateAccessTier(opt.AccessTier) {
+		return nil, errors.Errorf("Azure Blob: Supported access tiers are %s, %s and %s",
+			string(azblob.AccessTierHot), string(azblob.AccessTierCool), string(azblob.AccessTierArchive))
 	}
 
 	var (
@@ -239,7 +256,11 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 	)
 	switch {
 	case opt.Account != "" && opt.Key != "":
-		credential := azblob.NewSharedKeyCredential(opt.Account, opt.Key)
+		credential, err := azblob.NewSharedKeyCredential(opt.Account, opt.Key)
+		if err != nil {
+			return nil, errors.Wrapf(err, "Failed to parse credentials")
+		}
+
 		u, err = url.Parse(fmt.Sprintf("https://%s.%s", opt.Account, opt.Endpoint))
 		if err != nil {
 			return nil, errors.Wrap(err, "failed to make azure storage url from account and endpoint")
@@ -285,6 +306,8 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 		ReadMimeType:  true,
 		WriteMimeType: true,
 		BucketBased:   true,
+		SetTier:       true,
+		GetTier:       true,
 	}).Fill(f)
 	if f.root != "" {
 		f.root += "/"
@@ -474,7 +497,7 @@ func (f *Fs) markContainerOK() {
 
 // listDir lists a single directory
 func (f *Fs) listDir(dir string) (entries fs.DirEntries, err error) {
-	err = f.list(dir, false, listChunkSize, func(remote string, object *azblob.BlobItem, isDirectory bool) error {
+	err = f.list(dir, false, f.opt.ListChunkSize, func(remote string, object *azblob.BlobItem, isDirectory bool) error {
 		entry, err := f.itemToDirEntry(remote, object, isDirectory)
 		if err != nil {
 			return err
@@ -545,7 +568,7 @@ func (f *Fs) ListR(dir string, callback fs.ListRCallback) (err error) {
 		return fs.ErrorListBucketRequired
 	}
 	list := walk.NewListRHelper(callback)
-	err = f.list(dir, true, listChunkSize, func(remote string, object *azblob.BlobItem, isDirectory bool) error {
+	err = f.list(dir, true, f.opt.ListChunkSize, func(remote string, object *azblob.BlobItem, isDirectory bool) error {
 		entry, err := f.itemToDirEntry(remote, object, isDirectory)
 		if err != nil {
 			return err
@@ -566,11 +589,11 @@ type listContainerFn func(*azblob.ContainerItem) error
 // listContainersToFn lists the containers to the function supplied
 func (f *Fs) listContainersToFn(fn listContainerFn) error {
 	params := azblob.ListContainersSegmentOptions{
-		MaxResults: int32(listChunkSize),
+		MaxResults: int32(f.opt.ListChunkSize),
 	}
 	ctx := context.Background()
 	for marker := (azblob.Marker{}); marker.NotDone(); {
-		var response *azblob.ListContainersResponse
+		var response *azblob.ListContainersSegmentResponse
 		err := f.pacer.Call(func() (bool, error) {
 			var err error
 			response, err = f.svcURL.ListContainersSegment(ctx, marker, params)
@@ -752,7 +775,7 @@ func (f *Fs) Copy(src fs.Object, remote string) (fs.Object, error) {
 	var startCopy *azblob.BlobStartCopyFromURLResponse
 
 	err = f.pacer.Call(func() (bool, error) {
-		startCopy, err = dstBlobURL.StartCopyFromURL(ctx, *source, nil, options, options)
+		startCopy, err = dstBlobURL.StartCopyFromURL(ctx, *source, nil, azblob.ModifiedAccessConditions{}, options)
 		return f.shouldRetry(err)
 	})
 	if err != nil {
@@ -837,9 +860,8 @@ func (o *Object) setMetadata(metadata azblob.Metadata) {
 //  o.md5
 //  o.meta
 func (o *Object) decodeMetaDataFromPropertiesResponse(info *azblob.BlobGetPropertiesResponse) (err error) {
-	// NOTE - In BlobGetPropertiesResponse, Client library returns MD5 as base64 decoded string
-	// unlike BlobProperties in BlobItem (used in decodeMetadataFromBlob) which returns base64
-	// encoded bytes. Object needs to maintain this as base64 encoded string.
+	// NOTE - Client library always returns MD5 as base64 decoded string, Object needs to maintain
+	// this as base64 encoded string.
 	o.md5 = base64.StdEncoding.EncodeToString(info.ContentMD5())
 	o.mimeType = info.ContentType()
 	o.size = info.ContentLength()
@@ -851,7 +873,9 @@ func (o *Object) decodeMetaDataFromPropertiesResponse(info *azblob.BlobGetProper
 }
 
 func (o *Object) decodeMetaDataFromBlob(info *azblob.BlobItem) (err error) {
-	o.md5 = string(info.Properties.ContentMD5)
+	// NOTE - Client library always returns MD5 as base64 decoded string, Object needs to maintain
+	// this as base64 encoded string.
+	o.md5 = base64.StdEncoding.EncodeToString(info.Properties.ContentMD5)
 	o.mimeType = *info.Properties.ContentType
 	o.size = *info.Properties.ContentLength
 	o.modTime = info.Properties.LastModified
@@ -1068,7 +1092,7 @@ func (o *Object) uploadMultipart(in io.Reader, size int64, blob *azblob.BlobURL,
 	var (
 		rawID   uint64
 		blockID = "" // id in base64 encoded form
-		blocks  = make([]string, totalParts)
+		blocks  []string
 	)
 
 	// increment the blockID
@@ -1125,11 +1149,14 @@ outer:
 			defer o.fs.uploadToken.Put()
 			fs.Debugf(o, "Uploading part %d/%d offset %v/%v part size %v", part+1, totalParts, fs.SizeSuffix(position), fs.SizeSuffix(size), fs.SizeSuffix(chunkSize))
 
+			// Upload the block, with MD5 for check
+			md5sum := md5.Sum(buf)
+			transactionalMD5 := md5sum[:]
 			err = o.fs.pacer.Call(func() (bool, error) {
 				bufferReader := bytes.NewReader(buf)
 				wrappedReader := wrap(bufferReader)
 				rs := readSeeker{wrappedReader, bufferReader}
-				_, err = blockBlobURL.StageBlock(ctx, blockID, rs, ac)
+				_, err = blockBlobURL.StageBlock(ctx, blockID, &rs, ac, transactionalMD5)
 				return o.fs.shouldRetry(err)
 			})
 
@@ -1236,16 +1263,7 @@ func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOptio
 	}
 
 	// Now, set blob tier based on configured access tier
-	desiredAccessTier := azblob.AccessTierType(o.fs.opt.AccessTier)
-	err = o.fs.pacer.Call(func() (bool, error) {
-		_, err := blob.SetTier(ctx, desiredAccessTier)
-		return o.fs.shouldRetry(err)
-	})
-
-	if err != nil {
-		return errors.Wrap(err, "Failed to set Blob Tier")
-	}
-	return nil
+	return o.SetTier(o.fs.opt.AccessTier)
 }
 
 // Remove an object
@@ -1268,6 +1286,41 @@ func (o *Object) MimeType() string {
 // AccessTier of an object, default is of type none
 func (o *Object) AccessTier() azblob.AccessTierType {
 	return o.accessTier
+}
+
+// SetTier performs changing object tier
+func (o *Object) SetTier(tier string) error {
+	if !validateAccessTier(tier) {
+		return errors.Errorf("Tier %s not supported by Azure Blob Storage", tier)
+	}
+
+	// Check if current tier already matches with desired tier
+	if o.GetTier() == tier {
+		return nil
+	}
+	desiredAccessTier := azblob.AccessTierType(tier)
+	blob := o.getBlobReference()
+	ctx := context.Background()
+	err := o.fs.pacer.Call(func() (bool, error) {
+		_, err := blob.SetTier(ctx, desiredAccessTier)
+		return o.fs.shouldRetry(err)
+	})
+
+	if err != nil {
+		return errors.Wrap(err, "Failed to set Blob Tier")
+	}
+
+	// Set access tier on local object also, this typically
+	// gets updated on get blob properties
+	o.accessTier = desiredAccessTier
+	fs.Debugf(o, "Successfully changed object tier to %s", tier)
+
+	return nil
+}
+
+// GetTier returns object tier in azure as string
+func (o *Object) GetTier() string {
+	return string(o.accessTier)
 }
 
 // Check the interfaces are satisfied

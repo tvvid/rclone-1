@@ -134,11 +134,12 @@ type ExtraConfigItem struct{ Name, Key, Value string }
 
 // Opt is options for Run
 type Opt struct {
-	RemoteName  string
-	NilObject   fs.Object
-	ExtraConfig []ExtraConfigItem
-	// SkipBadWindowsCharacters skips unusable characters for windows if set
-	SkipBadWindowsCharacters bool
+	RemoteName               string
+	NilObject                fs.Object
+	ExtraConfig              []ExtraConfigItem
+	SkipBadWindowsCharacters bool     // skips unusable characters for windows if set
+	SkipFsMatch              bool     // if set skip exact matching of Fs value
+	TiersToTest              []string // List of tiers which can be tested in setTier test
 }
 
 // Run runs the basic integration tests for a remote using the remote
@@ -196,6 +197,15 @@ func Run(t *testing.T, opt *Opt) {
 		fs.Config.UseListR = true
 		return func() {
 			fs.Config.UseListR = previous
+		}
+	}
+
+	// Skip if remote is not SetTier and GetTier capable
+	skipIfNotSetTier := func(t *testing.T) {
+		skipIfNotOk(t)
+		if remote.Features().SetTier == false ||
+			remote.Features().GetTier == false {
+			t.Skip("FS has no SetTier & GetTier interfaces")
 		}
 	}
 
@@ -815,13 +825,20 @@ func Run(t *testing.T, opt *Opt) {
 		skipIfNotOk(t)
 		obj := findObject(t, remote, file1.Path)
 		assert.Equal(t, file1.Path, obj.String())
-		assert.Equal(t, "<nil>", opt.NilObject.String())
+		if opt.NilObject != nil {
+			assert.Equal(t, "<nil>", opt.NilObject.String())
+		}
 	})
 
 	// TestObjectFs tests the object can be found
 	t.Run("TestObjectFs", func(t *testing.T) {
 		skipIfNotOk(t)
 		obj := findObject(t, remote, file1.Path)
+		// If this is set we don't do the direct comparison of
+		// the Fs from the object as it may be different
+		if opt.SkipFsMatch {
+			return
+		}
 		testRemote := remote
 		if obj.Fs() != testRemote {
 			// Check to see if this wraps something else
@@ -1051,6 +1068,27 @@ func Run(t *testing.T, opt *Opt) {
 		require.NotEqual(t, "", link4, "Link should not be empty")
 	})
 
+	// TestSetTier tests SetTier and GetTier functionality
+	t.Run("TestSetTier", func(t *testing.T) {
+		skipIfNotSetTier(t)
+		obj := findObject(t, remote, file1.Path)
+		setter, ok := obj.(fs.SetTierer)
+		assert.NotNil(t, ok)
+		getter, ok := obj.(fs.GetTierer)
+		assert.NotNil(t, ok)
+		// If interfaces are supported TiersToTest should contain
+		// at least one entry
+		supportedTiers := opt.TiersToTest
+		assert.NotEmpty(t, supportedTiers)
+		// test set tier changes on supported storage classes or tiers
+		for _, tier := range supportedTiers {
+			err := setter.SetTier(tier)
+			assert.Nil(t, err)
+			got := getter.GetTier()
+			assert.Equal(t, tier, got)
+		}
+	})
+
 	// TestObjectRemove tests Remove
 	t.Run("TestObjectRemove", func(t *testing.T) {
 		skipIfNotOk(t)
@@ -1122,6 +1160,16 @@ func Run(t *testing.T, opt *Opt) {
 		assert.NotEqual(t, int64(0), usage.Total)
 	})
 
+	// TestInternal calls InternalTest() on the Fs
+	t.Run("TestInternal", func(t *testing.T) {
+		skipIfNotOk(t)
+		if it, ok := remote.(InternalTester); ok {
+			it.InternalTest(t)
+		} else {
+			t.Skipf("%T does not implement InternalTester", remote)
+		}
+	})
+
 	// TestObjectPurge tests Purge
 	t.Run("TestObjectPurge", func(t *testing.T) {
 		skipIfNotOk(t)
@@ -1132,16 +1180,6 @@ func Run(t *testing.T, opt *Opt) {
 
 		err = operations.Purge(remote, "")
 		assert.Error(t, err, "Expecting error after on second purge")
-	})
-
-	// TestInternal calls InternalTest() on the Fs
-	t.Run("TestInternal", func(t *testing.T) {
-		skipIfNotOk(t)
-		if it, ok := remote.(InternalTester); ok {
-			it.InternalTest(t)
-		} else {
-			t.Skipf("%T does not implement InternalTester", remote)
-		}
 	})
 
 	// TestFinalise tidies up after the previous tests

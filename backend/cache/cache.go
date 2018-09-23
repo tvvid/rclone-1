@@ -82,6 +82,10 @@ func init() {
 			Hide:     fs.OptionHideBoth,
 			Advanced: true,
 		}, {
+			Name:     "plex_insecure",
+			Help:     "Skip all certificate verifications when connecting to the Plex server",
+			Advanced: true,
+		}, {
 			Name:    "chunk_size",
 			Help:    "The size of a chunk. Lower value good for slow connections but can affect seamless reading.",
 			Default: DefCacheChunkSize,
@@ -195,6 +199,7 @@ type Options struct {
 	PlexUsername       string        `config:"plex_username"`
 	PlexPassword       string        `config:"plex_password"`
 	PlexToken          string        `config:"plex_token"`
+	PlexInsecure       bool          `config:"plex_insecure"`
 	ChunkSize          fs.SizeSuffix `config:"chunk_size"`
 	InfoAge            fs.Duration   `config:"info_age"`
 	ChunkTotalSize     fs.SizeSuffix `config:"chunk_total_size"`
@@ -250,7 +255,7 @@ func NewFs(name, rootPath string, m configmap.Mapper) (fs.Fs, error) {
 		return nil, err
 	}
 	if opt.ChunkTotalSize < opt.ChunkSize*fs.SizeSuffix(opt.TotalWorkers) {
-		return nil, errors.Errorf("don't set cache-total-chunk-size(%v) less than cache-chunk-size(%v) * cache-workers(%v)",
+		return nil, errors.Errorf("don't set cache-chunk-total-size(%v) less than cache-chunk-size(%v) * cache-workers(%v)",
 			opt.ChunkTotalSize, opt.ChunkSize, opt.TotalWorkers)
 	}
 
@@ -263,10 +268,15 @@ func NewFs(name, rootPath string, m configmap.Mapper) (fs.Fs, error) {
 		return nil, errors.Wrapf(err, "failed to clean root path %q", rootPath)
 	}
 
-	remotePath := path.Join(opt.Remote, rpath)
-	wrappedFs, wrapErr := fs.NewFs(remotePath)
+	wInfo, wName, wPath, wConfig, err := fs.ConfigFs(opt.Remote)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to parse remote %q to wrap", opt.Remote)
+	}
+
+	remotePath := path.Join(wPath, rootPath)
+	wrappedFs, wrapErr := wInfo.NewFs(wName, remotePath, wConfig)
 	if wrapErr != nil && wrapErr != fs.ErrorIsFile {
-		return nil, errors.Wrapf(wrapErr, "failed to make remote %q to wrap", remotePath)
+		return nil, errors.Wrapf(wrapErr, "failed to make remote %s:%s to wrap", wName, remotePath)
 	}
 	var fsErr error
 	fs.Debugf(name, "wrapped %v:%v at root %v", wrappedFs.Name(), wrappedFs.Root(), rpath)
@@ -292,7 +302,7 @@ func NewFs(name, rootPath string, m configmap.Mapper) (fs.Fs, error) {
 	f.plexConnector = &plexConnector{}
 	if opt.PlexURL != "" {
 		if opt.PlexToken != "" {
-			f.plexConnector, err = newPlexConnectorWithToken(f, opt.PlexURL, opt.PlexToken)
+			f.plexConnector, err = newPlexConnectorWithToken(f, opt.PlexURL, opt.PlexToken, opt.PlexInsecure)
 			if err != nil {
 				return nil, errors.Wrapf(err, "failed to connect to the Plex API %v", opt.PlexURL)
 			}
@@ -302,7 +312,7 @@ func NewFs(name, rootPath string, m configmap.Mapper) (fs.Fs, error) {
 				if err != nil {
 					decPass = opt.PlexPassword
 				}
-				f.plexConnector, err = newPlexConnector(f, opt.PlexURL, opt.PlexUsername, decPass, func(token string) {
+				f.plexConnector, err = newPlexConnector(f, opt.PlexURL, opt.PlexUsername, decPass, opt.PlexInsecure, func(token string) {
 					m.Set("plex_token", token)
 				})
 				if err != nil {
@@ -666,7 +676,7 @@ func (f *Fs) rcFetch(in rc.Params) (rc.Params, error) {
 		}
 	}
 	type fileStatus struct {
-		Error         error
+		Error         string
 		FetchedChunks int
 	}
 	fetchedChunks := make(map[string]fileStatus, len(files))
@@ -675,13 +685,13 @@ func (f *Fs) rcFetch(in rc.Params) (rc.Params, error) {
 		var status fileStatus
 		o, err := f.NewObject(remote)
 		if err != nil {
-			status.Error = err
+			fetchedChunks[file] = fileStatus{Error: err.Error()}
 			continue
 		}
 		co := o.(*Object)
 		err = co.refreshFromSource(true)
 		if err != nil {
-			status.Error = err
+			fetchedChunks[file] = fileStatus{Error: err.Error()}
 			continue
 		}
 		handle := NewObjectHandle(co, f)
@@ -690,8 +700,8 @@ func (f *Fs) rcFetch(in rc.Params) (rc.Params, error) {
 		walkChunkRanges(crs, co.Size(), func(chunk int64) {
 			_, err := handle.getChunk(chunk * f.ChunkSize())
 			if err != nil {
-				if status.Error == nil {
-					status.Error = err
+				if status.Error == "" {
+					status.Error = err.Error()
 				}
 			} else {
 				status.FetchedChunks++
