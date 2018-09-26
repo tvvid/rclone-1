@@ -198,3 +198,6 @@ Contributors
   * Craig Miskell <craig.miskell@fluxfederation.com>
   * Antoine GIRARD <sapk@sapk.fr>
   * Joanna Marek <joanna.marek@u2i.com>
+  * frenos <frenos@users.noreply.github.com>
+  * ssaqua <ssaqua@users.noreply.github.com>
+  * xnaas <me@xnaas.info>
