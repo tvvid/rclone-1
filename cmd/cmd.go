@@ -17,11 +17,8 @@ import (
 	"runtime/pprof"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
-
-	"github.com/pkg/errors"
-	"github.com/spf13/cobra"
-	"github.com/spf13/pflag"
 
 	"github.com/ncw/rclone/fs"
 	"github.com/ncw/rclone/fs/accounting"
@@ -35,6 +32,9 @@ import (
 	"github.com/ncw/rclone/fs/rc"
 	"github.com/ncw/rclone/fs/rc/rcflags"
 	"github.com/ncw/rclone/lib/atexit"
+	"github.com/pkg/errors"
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
 // Globals
@@ -65,81 +65,6 @@ const (
 	exitCodeFatalError
 	exitCodeTransferExceeded
 )
-
-// Root is the main rclone command
-var Root = &cobra.Command{
-	Use:   "rclone",
-	Short: "Sync files and directories to and from local and remote object stores - " + fs.Version,
-	Long: `
-Rclone is a command line program to sync files and directories to and
-from various cloud storage systems and using file transfer services, such as:
-
-  * Amazon Drive
-  * Amazon S3
-  * Backblaze B2
-  * Box
-  * Dropbox
-  * FTP
-  * Google Cloud Storage
-  * Google Drive
-  * HTTP
-  * Hubic
-  * Jottacloud
-  * Mega
-  * Microsoft Azure Blob Storage
-  * Microsoft OneDrive
-  * OpenDrive
-  * Openstack Swift / Rackspace cloud files / Memset Memstore
-  * pCloud
-  * QingStor
-  * SFTP
-  * Webdav / Owncloud / Nextcloud
-  * Yandex Disk
-  * The local filesystem
-
-Features
-
-  * MD5/SHA1 hashes checked at all times for file integrity
-  * Timestamps preserved on files
-  * Partial syncs supported on a whole file basis
-  * Copy mode to just copy new/changed files
-  * Sync (one way) mode to make a directory identical
-  * Check mode to check for file hash equality
-  * Can sync to and from network, eg two different cloud accounts
-
-See the home page for installation, usage, documentation, changelog
-and configuration walkthroughs.
-
-  * https://rclone.org/
-`,
-	PersistentPostRun: func(cmd *cobra.Command, args []string) {
-		fs.Debugf("rclone", "Version %q finishing with parameters %q", fs.Version, os.Args)
-		atexit.Run()
-	},
-}
-
-// runRoot implements the main rclone command with no subcommands
-func runRoot(cmd *cobra.Command, args []string) {
-	if version {
-		ShowVersion()
-		resolveExitCode(nil)
-	} else {
-		_ = Root.Usage()
-		_, _ = fmt.Fprintf(os.Stderr, "Command not found.\n")
-		resolveExitCode(errorCommandNotFound)
-	}
-}
-
-func init() {
-	// Add global flags
-	configflags.AddFlags(pflag.CommandLine)
-	filterflags.AddFlags(pflag.CommandLine)
-	rcflags.AddFlags(pflag.CommandLine)
-
-	Root.Run = runRoot
-	Root.Flags().BoolVarP(&version, "version", "V", false, "Print the version number")
-	cobra.OnInitialize(initConfig)
-}
 
 // ShowVersion prints the version to stdout
 func ShowVersion() {
@@ -293,7 +218,7 @@ func ShowStats() bool {
 // Run the function with stats and retries if required
 func Run(Retry bool, showStats bool, cmd *cobra.Command, f func() error) {
 	var err error
-	var stopStats chan struct{}
+	stopStats := func() {}
 	if !showStats && ShowStats() {
 		showStats = true
 	}
@@ -331,9 +256,7 @@ func Run(Retry bool, showStats bool, cmd *cobra.Command, f func() error) {
 			time.Sleep(*retriesInterval)
 		}
 	}
-	if showStats {
-		close(stopStats)
-	}
+	stopStats()
 	if err != nil {
 		log.Printf("Failed to %s: %v", cmd.Name(), err)
 		resolveExitCode(err)
@@ -384,24 +307,31 @@ func CheckArgs(MinArgs, MaxArgs int, cmd *cobra.Command, args []string) {
 
 // StartStats prints the stats every statsInterval
 //
-// It returns a channel which should be closed to stop the stats.
-func StartStats() chan struct{} {
-	stopStats := make(chan struct{})
-	if *statsInterval > 0 {
-		go func() {
-			ticker := time.NewTicker(*statsInterval)
-			for {
-				select {
-				case <-ticker.C:
-					accounting.Stats.Log()
-				case <-stopStats:
-					ticker.Stop()
-					return
-				}
-			}
-		}()
+// It returns a func which should be called to stop the stats.
+func StartStats() func() {
+	if *statsInterval <= 0 {
+		return func() {}
 	}
-	return stopStats
+	stopStats := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(*statsInterval)
+		for {
+			select {
+			case <-ticker.C:
+				accounting.Stats.Log()
+			case <-stopStats:
+				ticker.Stop()
+				return
+			}
+		}
+	}()
+	return func() {
+		close(stopStats)
+		wg.Wait()
+	}
 }
 
 // initConfig is run by cobra after initialising the flags
@@ -501,8 +431,11 @@ func resolveExitCode(err error) {
 	}
 }
 
+var backendFlags map[string]struct{}
+
 // AddBackendFlags creates flags for all the backend options
 func AddBackendFlags() {
+	backendFlags = map[string]struct{}{}
 	for _, fsInfo := range fs.Registry {
 		done := map[string]struct{}{}
 		for i := range fsInfo.Options {
@@ -513,10 +446,7 @@ func AddBackendFlags() {
 			}
 			done[opt.Name] = struct{}{}
 			// Make a flag from each option
-			name := strings.Replace(opt.Name, "_", "-", -1) // convert snake_case to kebab-case
-			if !opt.NoPrefix {
-				name = fsInfo.Prefix + "-" + name
-			}
+			name := opt.FlagName(fsInfo.Prefix)
 			found := pflag.CommandLine.Lookup(name) != nil
 			if !found {
 				// Take first line of help only
@@ -533,6 +463,7 @@ func AddBackendFlags() {
 				if opt.Hide&fs.OptionHideCommandLine != 0 {
 					flag.Hidden = true
 				}
+				backendFlags[name] = struct{}{}
 			} else {
 				fs.Errorf(nil, "Not adding duplicate flag --%s", name)
 			}
@@ -543,6 +474,7 @@ func AddBackendFlags() {
 
 // Main runs rclone interpreting flags and commands out of os.Args
 func Main() {
+	setupRootCommand(Root)
 	AddBackendFlags()
 	if err := Root.Execute(); err != nil {
 		log.Fatalf("Fatal error: %v", err)

@@ -201,3 +201,10 @@ Contributors
   * frenos <frenos@users.noreply.github.com>
   * ssaqua <ssaqua@users.noreply.github.com>
   * xnaas <me@xnaas.info>
+  * Frantisek Fuka <fuka@fuxoft.cz>
+  * Paul Kohout <pauljkohout@yahoo.com>
+  * dcpu <43330287+dcpu@users.noreply.github.com>
+  * jackyzy823 <jackyzy823@gmail.com>
+  * David Haguenauer <ml@kurokatta.org>
+  * teresy <hi.teresy@gmail.com>
+  * buergi <patbuergi@gmx.de>

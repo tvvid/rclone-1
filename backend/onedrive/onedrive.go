@@ -43,6 +43,8 @@ const (
 	driveTypePersonal           = "personal"
 	driveTypeBusiness           = "business"
 	driveTypeSharepoint         = "documentLibrary"
+	defaultChunkSize            = 10 * fs.MebiByte
+	chunkSizeMultiple           = 320 * fs.KibiByte
 )
 
 // Globals
@@ -212,9 +214,12 @@ func init() {
 			Name: config.ConfigClientSecret,
 			Help: "Microsoft App Client Secret\nLeave blank normally.",
 		}, {
-			Name:     "chunk_size",
-			Help:     "Chunk size to upload files with - must be multiple of 320k.",
-			Default:  fs.SizeSuffix(10 * 1024 * 1024),
+			Name: "chunk_size",
+			Help: `Chunk size to upload files with - must be multiple of 320k.
+
+Above this size files will be chunked - must be multiple of 320k. Note
+that the chunks will be buffered into memory.`,
+			Default:  defaultChunkSize,
 			Advanced: true,
 		}, {
 			Name:     "drive_id",
@@ -226,15 +231,27 @@ func init() {
 			Help:     "The type of the drive ( personal | business | documentLibrary )",
 			Default:  "",
 			Advanced: true,
+		}, {
+			Name: "expose_onenote_files",
+			Help: `Set to make OneNote files show up in directory listings.
+
+By default rclone will hide OneNote files in directory listings because
+operations like "Open" and "Update" won't work on them.  But this
+behaviour may also prevent you from deleting them.  If you want to
+delete OneNote files or otherwise want them to show up in directory
+listing, set this option.`,
+			Default:  false,
+			Advanced: true,
 		}},
 	})
 }
 
 // Options defines the configuration for this backend
 type Options struct {
-	ChunkSize fs.SizeSuffix `config:"chunk_size"`
-	DriveID   string        `config:"drive_id"`
-	DriveType string        `config:"drive_type"`
+	ChunkSize          fs.SizeSuffix `config:"chunk_size"`
+	DriveID            string        `config:"drive_id"`
+	DriveType          string        `config:"drive_type"`
+	ExposeOneNoteFiles bool          `config:"expose_onenote_files"`
 }
 
 // Fs represents a remote one drive
@@ -255,15 +272,16 @@ type Fs struct {
 //
 // Will definitely have info but maybe not meta
 type Object struct {
-	fs           *Fs       // what this object is part of
-	remote       string    // The remote path
-	hasMetaData  bool      // whether info below has been set
-	size         int64     // size of the object
-	modTime      time.Time // modification time of the object
-	id           string    // ID of the object
-	sha1         string    // SHA-1 of the object content
-	quickxorhash string    // QuickXorHash of the object content
-	mimeType     string    // Content-Type of object from server (may not be as uploaded)
+	fs            *Fs       // what this object is part of
+	remote        string    // The remote path
+	hasMetaData   bool      // whether info below has been set
+	isOneNoteFile bool      // Whether the object is a OneNote file
+	size          int64     // size of the object
+	modTime       time.Time // modification time of the object
+	id            string    // ID of the object
+	sha1          string    // SHA-1 of the object content
+	quickxorhash  string    // QuickXorHash of the object content
+	mimeType      string    // Content-Type of object from server (may not be as uploaded)
 }
 
 // ------------------------------------------------------------
@@ -352,6 +370,25 @@ func errorHandler(resp *http.Response) error {
 	return errResponse
 }
 
+func checkUploadChunkSize(cs fs.SizeSuffix) error {
+	const minChunkSize = fs.Byte
+	if cs%chunkSizeMultiple != 0 {
+		return errors.Errorf("%s is not a multiple of %s", cs, chunkSizeMultiple)
+	}
+	if cs < minChunkSize {
+		return errors.Errorf("%s is less than %s", cs, minChunkSize)
+	}
+	return nil
+}
+
+func (f *Fs) setUploadChunkSize(cs fs.SizeSuffix) (old fs.SizeSuffix, err error) {
+	err = checkUploadChunkSize(cs)
+	if err == nil {
+		old, f.opt.ChunkSize = f.opt.ChunkSize, cs
+	}
+	return
+}
+
 // NewFs constructs an Fs from the path, container:path
 func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 	// Parse config into Options struct
@@ -360,8 +397,10 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 	if err != nil {
 		return nil, err
 	}
-	if opt.ChunkSize%(320*1024) != 0 {
-		return nil, errors.Errorf("chunk size %d is not a multiple of 320k", opt.ChunkSize)
+
+	err = checkUploadChunkSize(opt.ChunkSize)
+	if err != nil {
+		return nil, errors.Wrap(err, "onedrive: chunk size")
 	}
 
 	if opt.DriveID == "" || opt.DriveType == "" {
@@ -409,16 +448,16 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 	if err != nil {
 		// Assume it is a file
 		newRoot, remote := dircache.SplitPath(root)
-		newF := *f
-		newF.dirCache = dircache.New(newRoot, rootInfo.ID, &newF)
-		newF.root = newRoot
+		tempF := *f
+		tempF.dirCache = dircache.New(newRoot, rootInfo.ID, &tempF)
+		tempF.root = newRoot
 		// Make new Fs which is the parent
-		err = newF.dirCache.FindRoot(false)
+		err = tempF.dirCache.FindRoot(false)
 		if err != nil {
 			// No root so return old f
 			return f, nil
 		}
-		_, err := newF.newObjectWithInfo(remote, nil)
+		_, err := tempF.newObjectWithInfo(remote, nil)
 		if err != nil {
 			if err == fs.ErrorObjectNotFound {
 				// File doesn't exist so return old f
@@ -426,8 +465,13 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 			}
 			return nil, err
 		}
+		// XXX: update the old f here instead of returning tempF, since
+		// `features` were already filled with functions having *f as a receiver.
+		// See https://github.com/ncw/rclone/issues/2182
+		f.dirCache = tempF.dirCache
+		f.root = tempF.root
 		// return an error with an fs which points to the parent
-		return &newF, fs.ErrorIsFile
+		return f, fs.ErrorIsFile
 	}
 	return f, nil
 }
@@ -487,6 +531,9 @@ func (f *Fs) FindLeaf(pathID, leaf string) (pathIDOut string, found bool, err er
 			return "", false, nil
 		}
 		return "", false, err
+	}
+	if info.GetPackageType() == api.PackageTypeOneNote {
+		return "", false, errors.New("found OneNote file when looking for folder")
 	}
 	if info.GetFolder() == nil {
 		return "", false, errors.New("found file when looking for folder")
@@ -596,6 +643,11 @@ func (f *Fs) List(dir string) (entries fs.DirEntries, err error) {
 	}
 	var iErr error
 	_, err = f.listAll(directoryID, false, false, func(info *api.Item) bool {
+		if !f.opt.ExposeOneNoteFiles && info.GetPackageType() == api.PackageTypeOneNote {
+			fs.Debugf(info.Name, "OneNote file not shown in directory listing")
+			return false
+		}
+
 		remote := path.Join(dir, info.GetName())
 		folder := info.GetFolder()
 		if folder != nil {
@@ -1064,6 +1116,32 @@ func (f *Fs) Hashes() hash.Set {
 	return hash.Set(hash.QuickXorHash)
 }
 
+// PublicLink returns a link for downloading without accout.
+func (f *Fs) PublicLink(remote string) (link string, err error) {
+	info, _, err := f.readMetaDataForPath(f.srvPath(remote))
+	if err != nil {
+		return "", err
+	}
+	opts := newOptsCall(info.ID, "POST", "/createLink")
+
+	share := api.CreateShareLinkRequest{
+		Type:  "view",
+		Scope: "anonymous",
+	}
+
+	var resp *http.Response
+	var result api.CreateShareLinkResponse
+	err = f.pacer.Call(func() (bool, error) {
+		resp, err = f.srv.CallJSON(&opts, &share, &result)
+		return shouldRetry(resp, err)
+	})
+	if err != nil {
+		fmt.Println(err)
+		return "", err
+	}
+	return result.Link.WebURL, nil
+}
+
 // ------------------------------------------------------------
 
 // Fs returns the parent Fs
@@ -1084,9 +1162,14 @@ func (o *Object) Remote() string {
 	return o.remote
 }
 
+// srvPath returns a path for use in server given a remote
+func (f *Fs) srvPath(remote string) string {
+	return replaceReservedChars(f.rootSlash() + remote)
+}
+
 // srvPath returns a path for use in server
 func (o *Object) srvPath() string {
-	return replaceReservedChars(o.fs.rootSlash() + o.remote)
+	return o.fs.srvPath(o.remote)
 }
 
 // Hash returns the SHA-1 of an object returning a lowercase hex string
@@ -1120,6 +1203,8 @@ func (o *Object) setMetaData(info *api.Item) (err error) {
 	}
 	o.hasMetaData = true
 	o.size = info.GetSize()
+
+	o.isOneNoteFile = info.GetPackageType() == api.PackageTypeOneNote
 
 	// Docs: https://docs.microsoft.com/en-us/onedrive/developer/rest-api/resources/hashes
 	//
@@ -1232,6 +1317,10 @@ func (o *Object) Open(options ...fs.OpenOption) (in io.ReadCloser, err error) {
 	if o.id == "" {
 		return nil, errors.New("can't download - no id")
 	}
+	if o.isOneNoteFile {
+		return nil, errors.New("can't open a OneNote file")
+	}
+
 	fs.FixRangeOption(options, o.size)
 	var resp *http.Response
 	opts := newOptsCall(o.id, "GET", "/content")
@@ -1275,6 +1364,12 @@ func (o *Object) createUploadSession(modTime time.Time) (response *api.CreateUpl
 	var resp *http.Response
 	err = o.fs.pacer.Call(func() (bool, error) {
 		resp, err = o.fs.srv.CallJSON(&opts, &createRequest, &response)
+		if apiErr, ok := err.(*api.Error); ok {
+			if apiErr.ErrorInfo.Code == "nameAlreadyExists" {
+				// Make the error more user-friendly
+				err = errors.New(err.Error() + " (is it a OneNote file?)")
+			}
+		}
 		return shouldRetry(resp, err)
 	})
 	return response, err
@@ -1407,6 +1502,12 @@ func (o *Object) uploadSinglepart(in io.Reader, size int64, modTime time.Time) (
 
 	err = o.fs.pacer.Call(func() (bool, error) {
 		resp, err = o.fs.srv.CallJSON(&opts, nil, &info)
+		if apiErr, ok := err.(*api.Error); ok {
+			if apiErr.ErrorInfo.Code == "nameAlreadyExists" {
+				// Make the error more user-friendly
+				err = errors.New(err.Error() + " (is it a OneNote file?)")
+			}
+		}
 		return shouldRetry(resp, err)
 	})
 	if err != nil {
@@ -1425,6 +1526,10 @@ func (o *Object) uploadSinglepart(in io.Reader, size int64, modTime time.Time) (
 //
 // The new object may have been created if an error is returned
 func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (err error) {
+	if o.hasMetaData && o.isOneNoteFile {
+		return errors.New("can't upload content to a OneNote file")
+	}
+
 	o.fs.tokenRenewer.Start()
 	defer o.fs.tokenRenewer.Stop()
 
@@ -1494,6 +1599,7 @@ var (
 	_ fs.DirMover        = (*Fs)(nil)
 	_ fs.DirCacheFlusher = (*Fs)(nil)
 	_ fs.Abouter         = (*Fs)(nil)
+	_ fs.PublicLinker    = (*Fs)(nil)
 	_ fs.Object          = (*Object)(nil)
 	_ fs.MimeTyper       = &Object{}
 	_ fs.IDer            = &Object{}

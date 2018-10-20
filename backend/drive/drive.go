@@ -57,7 +57,8 @@ const (
 	defaultScope                = "drive"
 	// chunkSize is the size of the chunks created during a resumable upload and should be a power of two.
 	// 1<<18 is the minimum size supported by the Google uploader, and there is no maximum.
-	defaultChunkSize = fs.SizeSuffix(8 * 1024 * 1024)
+	minChunkSize     = 256 * fs.KibiByte
+	defaultChunkSize = 8 * fs.MebiByte
 	partialFields    = "id,name,size,md5Checksum,trashed,modifiedTime,createdTime,mimeType,parents,webViewLink"
 )
 
@@ -192,12 +193,12 @@ func init() {
 		}, {
 			Name:     "service_account_credentials",
 			Help:     "Service Account Credentials JSON blob\nLeave blank normally.\nNeeded only if you want use SA instead of interactive login.",
-			Hide:     fs.OptionHideBoth,
+			Hide:     fs.OptionHideConfigurator,
 			Advanced: true,
 		}, {
 			Name:     "team_drive",
 			Help:     "ID of the Team Drive",
-			Hide:     fs.OptionHideBoth,
+			Hide:     fs.OptionHideConfigurator,
 			Advanced: true,
 		}, {
 			Name:     "auth_owner_only",
@@ -207,22 +208,29 @@ func init() {
 		}, {
 			Name:     "use_trash",
 			Default:  true,
-			Help:     "Send files to the trash instead of deleting permanently.",
+			Help:     "Send files to the trash instead of deleting permanently.\nDefaults to true, namely sending files to the trash.\nUse `--drive-use-trash=false` to delete files permanently instead.",
 			Advanced: true,
 		}, {
 			Name:     "skip_gdocs",
 			Default:  false,
-			Help:     "Skip google documents in all listings.",
+			Help:     "Skip google documents in all listings.\nIf given, gdocs practically become invisible to rclone.",
 			Advanced: true,
 		}, {
-			Name:     "shared_with_me",
-			Default:  false,
-			Help:     "Only show files that are shared with me",
+			Name:    "shared_with_me",
+			Default: false,
+			Help: `Only show files that are shared with me.
+
+Instructs rclone to operate on your "Shared with me" folder (where
+Google Drive lets you access the files and folders others have shared
+with you).
+
+This works both with the "list" (lsd, lsl, etc) and the "copy"
+commands (copy, sync, etc), and with all other commands too.`,
 			Advanced: true,
 		}, {
 			Name:     "trashed_only",
 			Default:  false,
-			Help:     "Only show files that are in the trash",
+			Help:     "Only show files that are in the trash.\nThis will show trashed files in their original directory structure.",
 			Advanced: true,
 		}, {
 			Name:     "formats",
@@ -246,9 +254,25 @@ func init() {
 			Help:     "Allow the filetype to change when uploading Google docs (e.g. file.doc to file.docx). This will confuse sync and reupload every time.",
 			Advanced: true,
 		}, {
-			Name:     "use_created_date",
-			Default:  false,
-			Help:     "Use created date instead of modified date.",
+			Name:    "use_created_date",
+			Default: false,
+			Help: `Use file created date instead of modified date.,
+
+Useful when downloading data and you want the creation date used in
+place of the last modified date.
+
+**WARNING**: This flag may have some unexpected consequences.
+
+When uploading to your drive all files will be overwritten unless they
+haven't been modified since their creation. And the inverse will occur
+while downloading.  This side effect can be avoided by using the
+"--checksum" flag.
+
+This feature was implemented to retain photos capture date as recorded
+by google photos. You will first need to check the "Create a Google
+Photos folder" option in your google drive settings. You can then copy
+or move the photos locally and use the date the image was taken
+(created) set as the modification date.`,
 			Advanced: true,
 		}, {
 			Name:     "list_chunk",
@@ -261,9 +285,18 @@ func init() {
 			Help:     "Impersonate this user when using a service account.",
 			Advanced: true,
 		}, {
-			Name:     "alternate_export",
-			Default:  false,
-			Help:     "Use alternate export URLs for google documents export.",
+			Name:    "alternate_export",
+			Default: false,
+			Help: `Use alternate export URLs for google documents export.,
+
+If this option is set this instructs rclone to use an alternate set of
+export URLs for drive documents.  Users have reported that the
+official export URLs can't export large documents, whereas these
+unofficial ones can.
+
+See rclone issue [#2243](https://github.com/ncw/rclone/issues/2243) for background,
+[this google drive issue](https://issuetracker.google.com/issues/36761333) and
+[this helpful post](https://www.labnol.org/internet/direct-links-for-google-drive/28356/).`,
 			Advanced: true,
 		}, {
 			Name:     "upload_cutoff",
@@ -271,19 +304,30 @@ func init() {
 			Help:     "Cutoff for switching to chunked upload",
 			Advanced: true,
 		}, {
-			Name:     "chunk_size",
-			Default:  defaultChunkSize,
-			Help:     "Upload chunk size. Must a power of 2 >= 256k.",
+			Name:    "chunk_size",
+			Default: defaultChunkSize,
+			Help: `Upload chunk size. Must a power of 2 >= 256k.
+
+Making this larger will improve performance, but note that each chunk
+is buffered in memory one per transfer.
+
+Reducing this will reduce memory usage but decrease performance.`,
 			Advanced: true,
 		}, {
-			Name:     "acknowledge_abuse",
-			Default:  false,
-			Help:     "Set to allow files which return cannotDownloadAbusiveFile to be downloaded.",
+			Name:    "acknowledge_abuse",
+			Default: false,
+			Help: `Set to allow files which return cannotDownloadAbusiveFile to be downloaded.
+
+If downloading a file returns the error "This file has been identified
+as malware or spam and cannot be downloaded" with the error code
+"cannotDownloadAbusiveFile" then supply this flag to rclone to
+indicate you acknowledge the risks of downloading the file and rclone
+will download it anyway.`,
 			Advanced: true,
 		}, {
 			Name:     "keep_revision_forever",
 			Default:  false,
-			Help:     "Keep new head revision forever.",
+			Help:     "Keep new head revision of each file forever.",
 			Advanced: true,
 		}, {
 			Name:     "v2_download_min_size",
@@ -671,6 +715,7 @@ func configTeamDrive(opt *Options, m configmap.Mapper, name string) error {
 	fmt.Printf("Fetching team drive list...\n")
 	var driveIDs, driveNames []string
 	listTeamDrives := svc.Teamdrives.List().PageSize(100)
+	listFailed := false
 	for {
 		var teamDrives *drive.TeamDriveList
 		err = newPacer().Call(func() (bool, error) {
@@ -678,7 +723,9 @@ func configTeamDrive(opt *Options, m configmap.Mapper, name string) error {
 			return shouldRetry(err)
 		})
 		if err != nil {
-			return errors.Wrap(err, "list team drives failed")
+			fmt.Printf("Listing team drives failed: %v\n", err)
+			listFailed = true
+			break
 		}
 		for _, drive := range teamDrives.TeamDrives {
 			driveIDs = append(driveIDs, drive.Id)
@@ -690,7 +737,7 @@ func configTeamDrive(opt *Options, m configmap.Mapper, name string) error {
 		listTeamDrives.PageToken(teamDrives.NextPageToken)
 	}
 	var driveID string
-	if len(driveIDs) == 0 {
+	if !listFailed && len(driveIDs) == 0 {
 		fmt.Printf("No team drives found in your account")
 	} else {
 		driveID = config.Choose("Enter a Team Drive ID", driveIDs, driveNames, true)
@@ -744,6 +791,36 @@ func createOAuthClient(opt *Options, name string, m configmap.Mapper) (*http.Cli
 	return oAuthClient, nil
 }
 
+func checkUploadChunkSize(cs fs.SizeSuffix) error {
+	if !isPowerOfTwo(int64(cs)) {
+		return errors.Errorf("%v isn't a power of two", cs)
+	}
+	if cs < minChunkSize {
+		return errors.Errorf("%s is less than %s", cs, minChunkSize)
+	}
+	return nil
+}
+
+func (f *Fs) setUploadChunkSize(cs fs.SizeSuffix) (old fs.SizeSuffix, err error) {
+	err = checkUploadChunkSize(cs)
+	if err == nil {
+		old, f.opt.ChunkSize = f.opt.ChunkSize, cs
+	}
+	return
+}
+
+func checkUploadCutoff(cs fs.SizeSuffix) error {
+	return nil
+}
+
+func (f *Fs) setUploadCutoff(cs fs.SizeSuffix) (old fs.SizeSuffix, err error) {
+	err = checkUploadCutoff(cs)
+	if err == nil {
+		old, f.opt.UploadCutoff = f.opt.UploadCutoff, cs
+	}
+	return
+}
+
 // NewFs contstructs an Fs from the path, container:path
 func NewFs(name, path string, m configmap.Mapper) (fs.Fs, error) {
 	// Parse config into Options struct
@@ -752,11 +829,13 @@ func NewFs(name, path string, m configmap.Mapper) (fs.Fs, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !isPowerOfTwo(int64(opt.ChunkSize)) {
-		return nil, errors.Errorf("drive: chunk size %v isn't a power of two", opt.ChunkSize)
+	err = checkUploadCutoff(opt.UploadCutoff)
+	if err != nil {
+		return nil, errors.Wrap(err, "drive: upload cutoff")
 	}
-	if opt.ChunkSize < 256*1024 {
-		return nil, errors.Errorf("drive: chunk size can't be less than 256k - was %v", opt.ChunkSize)
+	err = checkUploadChunkSize(opt.ChunkSize)
+	if err != nil {
+		return nil, errors.Wrap(err, "drive: chunk size")
 	}
 
 	oAuthClient, err := createOAuthClient(opt, name, m)
@@ -2061,15 +2140,16 @@ func (f *Fs) changeNotifyRunner(notifyFunc func(string, fs.EntryType), startPage
 		}
 		var pathsToClear []entryType
 		for _, change := range changeList.Changes {
+			// find the previous path
 			if path, ok := f.dirCache.GetInv(change.FileId); ok {
 				if change.File != nil && change.File.MimeType != driveFolderType {
 					pathsToClear = append(pathsToClear, entryType{path: path, entryType: fs.EntryObject})
 				} else {
 					pathsToClear = append(pathsToClear, entryType{path: path, entryType: fs.EntryDirectory})
 				}
-				continue
 			}
 
+			// find the new path
 			if change.File != nil {
 				changeType := fs.EntryDirectory
 				if change.File.MimeType != driveFolderType {

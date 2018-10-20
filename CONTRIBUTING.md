@@ -21,14 +21,14 @@ with the [latest beta of rclone](https://beta.rclone.org/):
 ## Submitting a pull request ##
 
 If you find a bug that you'd like to fix, or a new feature that you'd
-like to implement then please submit a pull request via Github.
+like to implement then please submit a pull request via GitHub.
 
 If it is a big feature then make an issue first so it can be discussed.
 
 You'll need a Go environment set up with GOPATH set.  See [the Go
 getting started docs](https://golang.org/doc/install) for more info.
 
-First in your web browser press the fork button on [rclone's Github
+First in your web browser press the fork button on [rclone's GitHub
 page](https://github.com/ncw/rclone).
 
 Now in your terminal
@@ -74,13 +74,13 @@ When you are done with that
 
     git push origin my-new-feature
 
-Go to the Github website and click [Create pull
+Go to the GitHub website and click [Create pull
 request](https://help.github.com/articles/creating-a-pull-request/).
 
 You patch will get reviewed and you might get asked to fix some stuff.
 
 If so, then make the changes in the same branch, squash the commits,
-rebase it to master then push it to Github with `--force`.
+rebase it to master then push it to GitHub with `--force`.
 
 ## Enabling CI for your fork ##
 
@@ -182,10 +182,14 @@ with modules beneath.
 
 If you are adding a new feature then please update the documentation.
 
-If you add a new flag, then if it is a general flag, document it in
+If you add a new general flag (not for a backend), then document it in
 `docs/content/docs.md` - the flags there are supposed to be in
-alphabetical order.  If it is a remote specific flag, then document it
-in `docs/content/remote.md`.
+alphabetical order.
+
+If you add a new backend option/flag, then it should be documented in
+the source file in the `Help:` field.  The first line of this is used
+for the flag help, the remainder is shown to the user in `rclone
+config` and is added to the docs with `make backenddocs`.
 
 The only documentation you need to edit are the `docs/content/*.md`
 files.  The MANUAL.*, rclone.1, web site etc are all auto generated
@@ -354,8 +358,8 @@ See the [testing](#testing) section for more information on integration tests.
 
 Add your fs to the docs - you'll need to pick an icon for it from [fontawesome](http://fontawesome.io/icons/).  Keep lists of remotes in alphabetical order but with the local file system last.
 
-  * `README.md` - main Github page
-  * `docs/content/remote.md` - main docs page
+  * `README.md` - main GitHub page
+  * `docs/content/remote.md` - main docs page (note the backend options are automatically added to this file with `make backenddocs`)
   * `docs/content/overview.md` - overview docs
   * `docs/content/docs.md` - list of remotes in config section
   * `docs/content/about.md` - front page of rclone.org

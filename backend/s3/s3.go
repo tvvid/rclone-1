@@ -517,7 +517,7 @@ func init() {
 			}},
 		}, {
 			Name:     "storage_class",
-			Help:     "The storage class to use when storing objects in S3.",
+			Help:     "The storage class to use when storing new objects in S3.",
 			Provider: "AWS",
 			Examples: []fs.OptionExample{{
 				Value: "",
@@ -536,9 +536,18 @@ func init() {
 				Help:  "One Zone Infrequent Access storage class",
 			}},
 		}, {
-			Name:     "chunk_size",
-			Help:     "Chunk size to use for uploading",
-			Default:  fs.SizeSuffix(s3manager.MinUploadPartSize),
+			Name: "chunk_size",
+			Help: `Chunk size to use for uploading.
+
+Any files larger than this will be uploaded in chunks of this
+size. The default is 5MB. The minimum is 5MB.
+
+Note that "--s3-upload-concurrency" chunks of this size are buffered
+in memory per transfer.
+
+If you are transferring large files over high speed links and you have
+enough memory, then increasing this will speed up the transfers.`,
+			Default:  minChunkSize,
 			Advanced: true,
 		}, {
 			Name:     "disable_checksum",
@@ -548,17 +557,40 @@ func init() {
 		}, {
 			Name:     "session_token",
 			Help:     "An AWS session token",
-			Hide:     fs.OptionHideBoth,
 			Advanced: true,
 		}, {
-			Name:     "upload_concurrency",
-			Help:     "Concurrency for multipart uploads.",
+			Name: "upload_concurrency",
+			Help: `Concurrency for multipart uploads.
+
+This is the number of chunks of the same file that are uploaded
+concurrently.
+
+If you are uploading small numbers of large file over high speed link
+and these uploads do not fully utilize your bandwidth, then increasing
+this may help to speed up the transfers.`,
 			Default:  2,
 			Advanced: true,
 		}, {
-			Name:     "force_path_style",
-			Help:     "If true use path style access if false use virtual hosted style.\nSome providers (eg Aliyun OSS or Netease COS) require this.",
+			Name: "force_path_style",
+			Help: `If true use path style access if false use virtual hosted style.
+
+If this is true (the default) then rclone will use path style access,
+if false then rclone will use virtual path style. See [the AWS S3
+docs](https://docs.aws.amazon.com/AmazonS3/latest/dev/UsingBucket.html#access-bucket-intro)
+for more info.
+
+Some providers (eg Aliyun OSS or Netease COS) require this set to false.`,
 			Default:  true,
+			Advanced: true,
+		}, {
+			Name: "v2_auth",
+			Help: `If true use v2 authentication.
+
+If this is false (the default) then rclone will use v4 authentication.
+If it is set then rclone will use v2 authentication.
+
+Use this only if v4 signatures don't work, eg pre Jewel/v10 CEPH.`,
+			Default:  false,
 			Advanced: true,
 		}},
 	})
@@ -572,7 +604,8 @@ const (
 	maxRetries     = 10                            // number of retries to make of operations
 	maxSizeForCopy = 5 * 1024 * 1024 * 1024        // The maximum size of object we can COPY
 	maxFileSize    = 5 * 1024 * 1024 * 1024 * 1024 // largest possible upload file size
-	minSleep       = 10 * time.Millisecond         // In case of error, start at 10ms sleep.
+	minChunkSize   = fs.SizeSuffix(s3manager.MinUploadPartSize)
+	minSleep       = 10 * time.Millisecond // In case of error, start at 10ms sleep.
 )
 
 // Options defines the configuration for this backend
@@ -593,6 +626,7 @@ type Options struct {
 	SessionToken         string        `config:"session_token"`
 	UploadConcurrency    int           `config:"upload_concurrency"`
 	ForcePathStyle       bool          `config:"force_path_style"`
+	V2Auth               bool          `config:"v2_auth"`
 }
 
 // Fs represents a remote s3 server
@@ -767,7 +801,7 @@ func s3Connection(opt *Options) (*s3.S3, *session.Session, error) {
 	// awsConfig.WithLogLevel(aws.LogDebugWithSigning)
 	ses := session.New()
 	c := s3.New(ses, awsConfig)
-	if opt.Region == "other-v2-signature" {
+	if opt.V2Auth || opt.Region == "other-v2-signature" {
 		fs.Debugf(nil, "Using v2 auth")
 		signer := func(req *request.Request) {
 			// Ignore AnonymousCredentials object
@@ -783,6 +817,21 @@ func s3Connection(opt *Options) (*s3.S3, *session.Session, error) {
 	return c, ses, nil
 }
 
+func checkUploadChunkSize(cs fs.SizeSuffix) error {
+	if cs < minChunkSize {
+		return errors.Errorf("%s is less than %s", cs, minChunkSize)
+	}
+	return nil
+}
+
+func (f *Fs) setUploadChunkSize(cs fs.SizeSuffix) (old fs.SizeSuffix, err error) {
+	err = checkUploadChunkSize(cs)
+	if err == nil {
+		old, f.opt.ChunkSize = f.opt.ChunkSize, cs
+	}
+	return
+}
+
 // NewFs constructs an Fs from the path, bucket:path
 func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 	// Parse config into Options struct
@@ -791,8 +840,9 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 	if err != nil {
 		return nil, err
 	}
-	if opt.ChunkSize < fs.SizeSuffix(s3manager.MinUploadPartSize) {
-		return nil, errors.Errorf("s3 chunk size (%v) must be >= %v", opt.ChunkSize, fs.SizeSuffix(s3manager.MinUploadPartSize))
+	err = checkUploadChunkSize(opt.ChunkSize)
+	if err != nil {
+		return nil, errors.Wrap(err, "s3: chunk size")
 	}
 	bucket, directory, err := s3ParsePath(root)
 	if err != nil {
@@ -1240,6 +1290,15 @@ func (f *Fs) Copy(src fs.Object, remote string) (fs.Object, error) {
 		CopySource:        &source,
 		MetadataDirective: aws.String(s3.MetadataDirectiveCopy),
 	}
+	if f.opt.ServerSideEncryption != "" {
+		req.ServerSideEncryption = &f.opt.ServerSideEncryption
+	}
+	if f.opt.SSEKMSKeyID != "" {
+		req.SSEKMSKeyId = &f.opt.SSEKMSKeyID
+	}
+	if f.opt.StorageClass != "" {
+		req.StorageClass = &f.opt.StorageClass
+	}
 	err = f.pacer.Call(func() (bool, error) {
 		_, err = f.c.CopyObject(&req)
 		return shouldRetry(err)
@@ -1408,6 +1467,15 @@ func (o *Object) SetModTime(modTime time.Time) error {
 		CopySource:        aws.String(pathEscape(sourceKey)),
 		Metadata:          o.meta,
 		MetadataDirective: &directive,
+	}
+	if o.fs.opt.ServerSideEncryption != "" {
+		req.ServerSideEncryption = &o.fs.opt.ServerSideEncryption
+	}
+	if o.fs.opt.SSEKMSKeyID != "" {
+		req.SSEKMSKeyId = &o.fs.opt.SSEKMSKeyID
+	}
+	if o.fs.opt.StorageClass != "" {
+		req.StorageClass = &o.fs.opt.StorageClass
 	}
 	err = o.fs.pacer.Call(func() (bool, error) {
 		_, err := o.fs.c.CopyObject(&req)

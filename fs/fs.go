@@ -83,6 +83,11 @@ type RegInfo struct {
 	Options Options
 }
 
+// FileName returns the on disk file name for this backend
+func (ri *RegInfo) FileName() string {
+	return strings.Replace(ri.Name, " ", "", -1)
+}
+
 // Options is a slice of configuration Option for a backend
 type Options []Option
 
@@ -125,8 +130,8 @@ type Option struct {
 	Advanced   bool             // set if this is an advanced config option
 }
 
-// Gets the current current value which is the default if not set
-func (o *Option) value() interface{} {
+// GetValue gets the current current value which is the default if not set
+func (o *Option) GetValue() interface{} {
 	val := o.Value
 	if val == nil {
 		val = o.Default
@@ -136,12 +141,12 @@ func (o *Option) value() interface{} {
 
 // String turns Option into a string
 func (o *Option) String() string {
-	return fmt.Sprint(o.value())
+	return fmt.Sprint(o.GetValue())
 }
 
 // Set a Option from a string
 func (o *Option) Set(s string) (err error) {
-	newValue, err := configstruct.StringToInterface(o.value(), s)
+	newValue, err := configstruct.StringToInterface(o.GetValue(), s)
 	if err != nil {
 		return err
 	}
@@ -151,7 +156,21 @@ func (o *Option) Set(s string) (err error) {
 
 // Type of the value
 func (o *Option) Type() string {
-	return reflect.TypeOf(o.value()).Name()
+	return reflect.TypeOf(o.GetValue()).Name()
+}
+
+// FlagName for the option
+func (o *Option) FlagName(prefix string) string {
+	name := strings.Replace(o.Name, "_", "-", -1) // convert snake_case to kebab-case
+	if !o.NoPrefix {
+		name = prefix + "-" + name
+	}
+	return name
+}
+
+// EnvVarName for the option
+func (o *Option) EnvVarName(prefix string) string {
+	return OptionToEnv(prefix + "-" + o.Name)
 }
 
 // OptionExamples is a slice of examples
@@ -857,7 +876,7 @@ type ObjectPair struct {
 // Services are looked up in the config file
 func Find(name string) (*RegInfo, error) {
 	for _, item := range Registry {
-		if item.Name == name || item.Prefix == name {
+		if item.Name == name || item.Prefix == name || item.FileName() == name {
 			return item, nil
 		}
 	}

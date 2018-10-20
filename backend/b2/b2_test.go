@@ -1,10 +1,10 @@
 // Test B2 filesystem interface
-package b2_test
+package b2
 
 import (
 	"testing"
 
-	"github.com/ncw/rclone/backend/b2"
+	"github.com/ncw/rclone/fs"
 	"github.com/ncw/rclone/fstest/fstests"
 )
 
@@ -12,6 +12,23 @@ import (
 func TestIntegration(t *testing.T) {
 	fstests.Run(t, &fstests.Opt{
 		RemoteName: "TestB2:",
-		NilObject:  (*b2.Object)(nil),
+		NilObject:  (*Object)(nil),
+		ChunkedUpload: fstests.ChunkedUploadConfig{
+			MinChunkSize:       minChunkSize,
+			NeedMultipleChunks: true,
+		},
 	})
 }
+
+func (f *Fs) SetUploadChunkSize(cs fs.SizeSuffix) (fs.SizeSuffix, error) {
+	return f.setUploadChunkSize(cs)
+}
+
+func (f *Fs) SetUploadCutoff(cs fs.SizeSuffix) (fs.SizeSuffix, error) {
+	return f.setUploadCutoff(cs)
+}
+
+var (
+	_ fstests.SetUploadChunkSizer = (*Fs)(nil)
+	_ fstests.SetUploadCutoffer   = (*Fs)(nil)
+)

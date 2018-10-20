@@ -23,6 +23,7 @@ import (
 	"github.com/ncw/rclone/fs/operations"
 	"github.com/ncw/rclone/fs/walk"
 	"github.com/ncw/rclone/fstest"
+	"github.com/ncw/rclone/lib/readers"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -33,6 +34,57 @@ import (
 // This interface should be implemented in 'backend'_internal_test.go and not in 'backend'.go
 type InternalTester interface {
 	InternalTest(*testing.T)
+}
+
+// ChunkedUploadConfig contains the values used by TestFsPutChunked
+// to determine the limits of chunked uploading
+type ChunkedUploadConfig struct {
+	// Minimum allowed chunk size
+	MinChunkSize fs.SizeSuffix
+	// Maximum allowed chunk size, 0 is no limit
+	MaxChunkSize fs.SizeSuffix
+	// Rounds the given chunk size up to the next valid value
+	// nil will disable rounding
+	// e.g. the next power of 2
+	CeilChunkSize func(fs.SizeSuffix) fs.SizeSuffix
+	// More than one chunk is required on upload
+	NeedMultipleChunks bool
+}
+
+// SetUploadChunkSizer is a test only interface to change the upload chunk size at runtime
+type SetUploadChunkSizer interface {
+	// Change the configured UploadChunkSize.
+	// Will only be called while no transfer is in progress.
+	SetUploadChunkSize(fs.SizeSuffix) (fs.SizeSuffix, error)
+}
+
+// SetUploadCutoffer is a test only interface to change the upload cutoff size at runtime
+type SetUploadCutoffer interface {
+	// Change the configured UploadCutoff.
+	// Will only be called while no transfer is in progress.
+	SetUploadCutoff(fs.SizeSuffix) (fs.SizeSuffix, error)
+}
+
+// NextPowerOfTwo returns the current or next bigger power of two.
+// All values less or equal 0 will return 0
+func NextPowerOfTwo(i fs.SizeSuffix) fs.SizeSuffix {
+	return 1 << uint(64-leadingZeros64(uint64(i)-1))
+}
+
+// NextMultipleOf returns a function that can be used as a CeilChunkSize function.
+// This function will return the next multiple of m that is equal or bigger than i.
+// All values less or equal 0 will return 0.
+func NextMultipleOf(m fs.SizeSuffix) func(fs.SizeSuffix) fs.SizeSuffix {
+	if m <= 0 {
+		panic(fmt.Sprintf("invalid multiplier %s", m))
+	}
+	return func(i fs.SizeSuffix) fs.SizeSuffix {
+		if i <= 0 {
+			return 0
+		}
+
+		return (((i - 1) / m) + 1) * m
+	}
 }
 
 // dirsToNames returns a sorted list of names
@@ -59,13 +111,15 @@ func objsToNames(objs []fs.Object) []string {
 func findObject(t *testing.T, f fs.Fs, Name string) fs.Object {
 	var obj fs.Object
 	var err error
+	sleepTime := 1 * time.Second
 	for i := 1; i <= *fstest.ListRetries; i++ {
 		obj, err = f.NewObject(Name)
 		if err == nil {
 			break
 		}
-		t.Logf("Sleeping for 1 second for findObject eventual consistency: %d/%d (%v)", i, *fstest.ListRetries, err)
-		time.Sleep(1 * time.Second)
+		t.Logf("Sleeping for %v for findObject eventual consistency: %d/%d (%v)", sleepTime, i, *fstest.ListRetries, err)
+		time.Sleep(sleepTime)
+		sleepTime = (sleepTime * 3) / 2
 	}
 	require.NoError(t, err)
 	return obj
@@ -101,6 +155,49 @@ again:
 	obj = findObject(t, f, file.Path)
 	file.Check(t, obj, f.Precision())
 	return contents
+}
+
+// testPutLarge puts file to the remote, checks it and removes it on success.
+func testPutLarge(t *testing.T, f fs.Fs, file *fstest.Item) {
+	tries := 1
+	const maxTries = 10
+again:
+	r := readers.NewPatternReader(file.Size)
+	uploadHash := hash.NewMultiHasher()
+	in := io.TeeReader(r, uploadHash)
+
+	obji := object.NewStaticObjectInfo(file.Path, file.ModTime, file.Size, true, nil, nil)
+	obj, err := f.Put(in, obji)
+	if err != nil {
+		// Retry if err returned a retry error
+		if fserrors.IsRetryError(err) && tries < maxTries {
+			t.Logf("Put error: %v - low level retry %d/%d", err, tries, maxTries)
+			time.Sleep(2 * time.Second)
+
+			tries++
+			goto again
+		}
+		require.NoError(t, err, fmt.Sprintf("Put error: %v", err))
+	}
+	file.Hashes = uploadHash.Sums()
+	file.Check(t, obj, f.Precision())
+
+	// Re-read the object and check again
+	obj = findObject(t, f, file.Path)
+	file.Check(t, obj, f.Precision())
+
+	// Download the object and check it is OK
+	downloadHash := hash.NewMultiHasher()
+	download, err := obj.Open()
+	require.NoError(t, err)
+	n, err := io.Copy(downloadHash, download)
+	require.NoError(t, err)
+	assert.Equal(t, file.Size, n)
+	require.NoError(t, download.Close())
+	assert.Equal(t, file.Hashes, downloadHash.Sums())
+
+	// Remove the object
+	require.NoError(t, obj.Remove())
 }
 
 // errorReader just returne an error on Read
@@ -140,6 +237,7 @@ type Opt struct {
 	SkipBadWindowsCharacters bool     // skips unusable characters for windows if set
 	SkipFsMatch              bool     // if set skip exact matching of Fs value
 	TiersToTest              []string // List of tiers which can be tested in setTier test
+	ChunkedUpload            ChunkedUploadConfig
 }
 
 // Run runs the basic integration tests for a remote using the remote
@@ -422,6 +520,109 @@ func Run(t *testing.T, opt *Opt) {
 		skipIfNotOk(t)
 		file1Contents = testPut(t, remote, &file1)
 		// Note that the next test will check there are no duplicated file names
+	})
+
+	t.Run("TestFsPutChunked", func(t *testing.T) {
+		skipIfNotOk(t)
+
+		setUploadChunkSizer, _ := remote.(SetUploadChunkSizer)
+		if setUploadChunkSizer == nil {
+			t.Skipf("%T does not implement SetUploadChunkSizer", remote)
+		}
+
+		setUploadCutoffer, _ := remote.(SetUploadCutoffer)
+
+		minChunkSize := opt.ChunkedUpload.MinChunkSize
+		if minChunkSize < 100 {
+			minChunkSize = 100
+		}
+		if opt.ChunkedUpload.CeilChunkSize != nil {
+			minChunkSize = opt.ChunkedUpload.CeilChunkSize(minChunkSize)
+		}
+
+		maxChunkSize := 2 * fs.MebiByte
+		if maxChunkSize < 2*minChunkSize {
+			maxChunkSize = 2 * minChunkSize
+		}
+		if opt.ChunkedUpload.MaxChunkSize > 0 && maxChunkSize > opt.ChunkedUpload.MaxChunkSize {
+			maxChunkSize = opt.ChunkedUpload.MaxChunkSize
+		}
+		if opt.ChunkedUpload.CeilChunkSize != nil {
+			maxChunkSize = opt.ChunkedUpload.CeilChunkSize(maxChunkSize)
+		}
+
+		next := func(f func(fs.SizeSuffix) fs.SizeSuffix) fs.SizeSuffix {
+			s := f(minChunkSize)
+			if s > maxChunkSize {
+				s = minChunkSize
+			}
+			return s
+		}
+
+		chunkSizes := fs.SizeSuffixList{
+			minChunkSize,
+			minChunkSize + (maxChunkSize-minChunkSize)/3,
+			next(NextPowerOfTwo),
+			next(NextMultipleOf(100000)),
+			next(NextMultipleOf(100001)),
+			maxChunkSize,
+		}
+		chunkSizes.Sort()
+
+		// Set the minimum chunk size, upload cutoff and reset it at the end
+		oldChunkSize, err := setUploadChunkSizer.SetUploadChunkSize(minChunkSize)
+		require.NoError(t, err)
+		var oldUploadCutoff fs.SizeSuffix
+		if setUploadCutoffer != nil {
+			oldUploadCutoff, err = setUploadCutoffer.SetUploadCutoff(minChunkSize)
+			require.NoError(t, err)
+		}
+		defer func() {
+			_, err := setUploadChunkSizer.SetUploadChunkSize(oldChunkSize)
+			assert.NoError(t, err)
+			if setUploadCutoffer != nil {
+				_, err := setUploadCutoffer.SetUploadCutoff(oldUploadCutoff)
+				assert.NoError(t, err)
+			}
+		}()
+
+		var lastCs fs.SizeSuffix
+		for _, cs := range chunkSizes {
+			if cs <= lastCs {
+				continue
+			}
+			if opt.ChunkedUpload.CeilChunkSize != nil {
+				cs = opt.ChunkedUpload.CeilChunkSize(cs)
+			}
+			lastCs = cs
+
+			t.Run(cs.String(), func(t *testing.T) {
+				_, err := setUploadChunkSizer.SetUploadChunkSize(cs)
+				require.NoError(t, err)
+				if setUploadCutoffer != nil {
+					_, err = setUploadCutoffer.SetUploadCutoff(cs)
+					require.NoError(t, err)
+				}
+
+				var testChunks []fs.SizeSuffix
+				if opt.ChunkedUpload.NeedMultipleChunks {
+					// If NeedMultipleChunks is set then test with > cs
+					testChunks = []fs.SizeSuffix{cs + 1, 2 * cs, 2*cs + 1}
+				} else {
+					testChunks = []fs.SizeSuffix{cs - 1, cs, 2*cs + 1}
+				}
+
+				for _, fileSize := range testChunks {
+					t.Run(fmt.Sprintf("%d", fileSize), func(t *testing.T) {
+						testPutLarge(t, remote, &fstest.Item{
+							ModTime: fstest.Time("2001-02-03T04:05:06.499999999Z"),
+							Path:    fmt.Sprintf("chunked-%s-%s.bin", cs.String(), fileSize.String()),
+							Size:    int64(fileSize),
+						})
+					})
+				}
+			})
+		}
 	})
 
 	// TestFsListDirFile2 tests the files are correctly uploaded by doing
@@ -1015,6 +1216,7 @@ func Run(t *testing.T, opt *Opt) {
 	})
 
 	// TestPublicLink tests creation of sharable, public links
+	// go test -v -run 'TestIntegration/Test(Setup|Init|FsMkdir|FsPutFile1|FsPutFile2|FsUpdateFile1|PublicLink)$'
 	t.Run("TestPublicLink", func(t *testing.T) {
 		skipIfNotOk(t)
 

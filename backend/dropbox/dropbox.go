@@ -79,8 +79,8 @@ const (
 	// Choose 48MB which is 91% of Maximum speed.  rclone by
 	// default does 4 transfers so this should use 4*48MB = 192MB
 	// by default.
-	defaultChunkSize = 48 * 1024 * 1024
-	maxChunkSize     = 150 * 1024 * 1024
+	defaultChunkSize = 48 * fs.MebiByte
+	maxChunkSize     = 150 * fs.MebiByte
 )
 
 var (
@@ -120,8 +120,15 @@ func init() {
 			Name: config.ConfigClientSecret,
 			Help: "Dropbox App Client Secret\nLeave blank normally.",
 		}, {
-			Name:     "chunk_size",
-			Help:     fmt.Sprintf("Upload chunk size. Max %v.", fs.SizeSuffix(maxChunkSize)),
+			Name: "chunk_size",
+			Help: fmt.Sprintf(`Upload chunk size. (< %v).
+
+Any files larger than this will be uploaded in chunks of this size.
+
+Note that chunks are buffered in memory (one at a time) so rclone can
+deal with retries.  Setting this larger will increase the speed
+slightly (at most 10%% for 128MB in tests) at the cost of using more
+memory.  It can be set smaller if you are tight on memory.`, fs.SizeSuffix(maxChunkSize)),
 			Default:  fs.SizeSuffix(defaultChunkSize),
 			Advanced: true,
 		}},
@@ -195,6 +202,25 @@ func shouldRetry(err error) (bool, error) {
 	return fserrors.ShouldRetry(err), err
 }
 
+func checkUploadChunkSize(cs fs.SizeSuffix) error {
+	const minChunkSize = fs.Byte
+	if cs < minChunkSize {
+		return errors.Errorf("%s is less than %s", cs, minChunkSize)
+	}
+	if cs > maxChunkSize {
+		return errors.Errorf("%s is greater than %s", cs, maxChunkSize)
+	}
+	return nil
+}
+
+func (f *Fs) setUploadChunkSize(cs fs.SizeSuffix) (old fs.SizeSuffix, err error) {
+	err = checkUploadChunkSize(cs)
+	if err == nil {
+		old, f.opt.ChunkSize = f.opt.ChunkSize, cs
+	}
+	return
+}
+
 // NewFs contstructs an Fs from the path, container:path
 func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 	// Parse config into Options struct
@@ -203,8 +229,9 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 	if err != nil {
 		return nil, err
 	}
-	if opt.ChunkSize > maxChunkSize {
-		return nil, errors.Errorf("chunk size too big, must be < %v", maxChunkSize)
+	err = checkUploadChunkSize(opt.ChunkSize)
+	if err != nil {
+		return nil, errors.Wrap(err, "dropbox: chunk size")
 	}
 
 	// Convert the old token if it exists.  The old token was just

@@ -51,7 +51,7 @@ version:
 # Full suite of integration tests
 test:	rclone
 	go install github.com/ncw/rclone/fstest/test_all
-	-go test -v -count 1 $(BUILDTAGS) $(GO_FILES) 2>&1 | tee test.log
+	-go test -v -count 1 -timeout 20m $(BUILDTAGS) $(GO_FILES) 2>&1 | tee test.log
 	-test_all github.com/ncw/rclone/fs/operations github.com/ncw/rclone/fs/sync 2>&1 | tee fs/test_all.log
 	@echo "Written logs in test.log and fs/test_all.log"
 
@@ -88,7 +88,7 @@ build_dep:
 ifdef FULL_TESTS
 	go get -u github.com/kisielk/errcheck
 	go get -u golang.org/x/tools/cmd/goimports
-	go get -u github.com/golang/lint/golint
+	go get -u golang.org/x/lint/golint
 endif
 
 # Get the release dependencies
@@ -107,7 +107,7 @@ doc:	rclone.1 MANUAL.html MANUAL.txt rcdocs commanddocs
 rclone.1:	MANUAL.md
 	pandoc -s --from markdown --to man MANUAL.md -o rclone.1
 
-MANUAL.md:	bin/make_manual.py docs/content/*.md commanddocs
+MANUAL.md:	bin/make_manual.py docs/content/*.md commanddocs backenddocs
 	./bin/make_manual.py
 
 MANUAL.html:	MANUAL.md
@@ -118,6 +118,9 @@ MANUAL.txt:	MANUAL.md
 
 commanddocs: rclone
 	rclone gendocs docs/content/commands/
+
+backenddocs: rclone bin/make_backend_docs.py
+	./bin/make_backend_docs.py
 
 rcdocs: rclone
 	bin/make_rc_docs.sh
