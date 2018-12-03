@@ -66,7 +66,7 @@ Contributors
   * Marvin Watson <marvwatson@users.noreply.github.com>
   * Danny Tsai <danny8376@gmail.com>
   * Yoni Jah <yonjah+git@gmail.com> <yonjah+github@gmail.com>
-  * Stephen Harris <github@spuddy.org>
+  * Stephen Harris <github@spuddy.org> <sweharris@users.noreply.github.com>
   * Ihor Dvoretskyi <ihor.dvoretskyi@gmail.com>
   * Jon Craton <jncraton@gmail.com>
   * Hraban Luyat <hraban@0brg.net>
@@ -212,3 +212,9 @@ Contributors
   * Ralf Hemberger <10364191+rhemberger@users.noreply.github.com>
   * Scott Edlund <sedlund@users.noreply.github.com>
   * Erik Swanson <erik@retailnext.net>
+  * Jake Coggiano <jake@stripe.com>
+  * brused27 <brused27@noemailaddress>
+  * Peter Kaminski <kaminski@istori.com>
+  * Henry Ptasinski <henry@logout.com>
+  * Alexander <kharkovalexander@gmail.com>
+  * Garry McNulty <garrmcnu@gmail.com>
