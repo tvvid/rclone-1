@@ -8,6 +8,7 @@ import (
 	"os"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
@@ -61,6 +62,12 @@ type myError4 struct {
 
 func (e *myError4) Error() string { return e.e.Error() }
 
+type myError5 struct{}
+
+func (e *myError5) Error() string { return "" }
+
+func (e *myError5) Temporary() bool { return true }
+
 type errorCause struct {
 	e error
 }
@@ -72,6 +79,7 @@ func (e *errorCause) Cause() error { return e.e }
 func TestCause(t *testing.T) {
 	e3 := &myError3{3}
 	e4 := &myError4{io.EOF}
+	e5 := &myError5{}
 	eNil1 := &myError2{nil}
 	eNil2 := &myError2{Err: (*myError2)(nil)}
 	errPotato := errors.New("potato")
@@ -96,6 +104,7 @@ func TestCause(t *testing.T) {
 		{&myError2{io.EOF}, false, io.EOF},
 		{e3, false, e3},
 		{e4, false, e4},
+		{e5, true, e5},
 		{&errorCause{errPotato}, false, errPotato},
 		{nilCause1, false, nilCause1},
 		{nilCause2, false, nilCause2.e},
@@ -142,4 +151,22 @@ func TestShouldRetry(t *testing.T) {
 		got := ShouldRetry(test.err)
 		assert.Equal(t, test.want, got, fmt.Sprintf("test #%d: %v", i, test.err))
 	}
+}
+
+func TestRetryAfter(t *testing.T) {
+	e := NewErrorRetryAfter(time.Second)
+	after := e.RetryAfter()
+	dt := after.Sub(time.Now())
+	assert.True(t, dt >= 900*time.Millisecond && dt <= 1100*time.Millisecond)
+	assert.True(t, IsRetryAfterError(e))
+	assert.False(t, IsRetryAfterError(io.EOF))
+	assert.Equal(t, time.Time{}, RetryAfterErrorTime(io.EOF))
+	assert.False(t, IsRetryAfterError(nil))
+	assert.Contains(t, e.Error(), "try again after")
+
+	t0 := time.Now()
+	err := errors.Wrap(ErrorRetryAfter(t0), "potato")
+	assert.Equal(t, t0, RetryAfterErrorTime(err))
+	assert.True(t, IsRetryAfterError(err))
+	assert.Contains(t, e.Error(), "try again after")
 }

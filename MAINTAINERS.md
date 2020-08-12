@@ -1,14 +1,21 @@
 # Maintainers guide for rclone #
 
-Current active maintainers of rclone are
+Current active maintainers of rclone are:
 
-  * Nick Craig-Wood @ncw
-  * Stefan Breunig @breunigs
-  * Ishuah Kariuki @ishuah
-  * Remus Bunduc @remusb - cache subsystem maintainer
-  * Fabian Möller @B4dM4n
-  * Alex Chen @Cnly
-  * Sandeep Ummadi @sandeepkru
+| Name             | GitHub ID         | Specific Responsibilities    |
+| :--------------- | :---------------- | :--------------------------  |
+| Nick Craig-Wood  | @ncw              | overall project health       |
+| Stefan Breunig   | @breunigs         |                              |
+| Ishuah Kariuki   | @ishuah           |                              |
+| Remus Bunduc     | @remusb           | cache backend                |
+| Fabian Möller    | @B4dM4n           |                              |
+| Alex Chen        | @Cnly             | onedrive backend             |
+| Sandeep Ummadi   | @sandeepkru       | azureblob backend            |
+| Sebastian Bünger | @buengese         | jottacloud & yandex backends |
+| Ivan Andreev     | @ivandeex         | chunker & mailru backends    |
+| Max Sum          | @Max-Sum          | union backend                |
+| Fred             | @creativeprojects | seafile backend              |
+| Caleb Case       | @calebcase        | tardigrade backend           |
 
 **This is a work in progress Draft**
 
@@ -26,7 +33,7 @@ Rclone uses the labels like this:
 * `duplicate` - normally close these and ask the user to subscribe to the original
 * `enhancement: new remote` - a new rclone backend
 * `enhancement` - a new feature
-* `FUSE` - do do with `rclone mount` command
+* `FUSE` - to do with `rclone mount` command
 * `good first issue` - mark these if you find a small self contained issue - these get shown to new visitors to the project
 * `help` wanted - mark these if you find a self contained issue - these get shown to new visitors to the project
 * `IMPORTANT` - note to maintainers not to forget to fix this for the release
@@ -48,7 +55,7 @@ The milestones have these meanings:
 * Help wanted - blue sky stuff that might get moved up, or someone could help with
 * Known bugs - bugs waiting on external factors or we aren't going to fix for the moment
 
-Tickets [with no milestone](https://github.com/ncw/rclone/issues?utf8=✓&q=is%3Aissue%20is%3Aopen%20no%3Amile) are good candidates for ones that have slipped between the gaps and need following up.
+Tickets [with no milestone](https://github.com/rclone/rclone/issues?utf8=✓&q=is%3Aissue%20is%3Aopen%20no%3Amile) are good candidates for ones that have slipped between the gaps and need following up.
 
 ## Closing Tickets ##
 

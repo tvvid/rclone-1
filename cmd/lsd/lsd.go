@@ -1,12 +1,14 @@
 package lsd
 
 import (
+	"context"
 	"os"
 
-	"github.com/ncw/rclone/cmd"
-	"github.com/ncw/rclone/cmd/ls/lshelp"
-	"github.com/ncw/rclone/fs"
-	"github.com/ncw/rclone/fs/operations"
+	"github.com/rclone/rclone/cmd"
+	"github.com/rclone/rclone/cmd/ls/lshelp"
+	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/config/flags"
+	"github.com/rclone/rclone/fs/operations"
 	"github.com/spf13/cobra"
 )
 
@@ -15,11 +17,12 @@ var (
 )
 
 func init() {
-	cmd.Root.AddCommand(commandDefintion)
-	commandDefintion.Flags().BoolVarP(&recurse, "recursive", "R", false, "Recurse into the listing.")
+	cmd.Root.AddCommand(commandDefinition)
+	cmdFlags := commandDefinition.Flags()
+	flags.BoolVarP(cmdFlags, &recurse, "recursive", "R", false, "Recurse into the listing.")
 }
 
-var commandDefintion = &cobra.Command{
+var commandDefinition = &cobra.Command{
 	Use:   "lsd remote:path",
 	Short: `List all directories/containers/buckets in the path.`,
 	Long: `
@@ -52,7 +55,7 @@ If you just want the directory names use "rclone lsf --dirs-only".
 		}
 		fsrc := cmd.NewFsSrc(args)
 		cmd.Run(false, false, command, func() error {
-			return operations.ListDir(fsrc, os.Stdout)
+			return operations.ListDir(context.Background(), fsrc, os.Stdout)
 		})
 	},
 }

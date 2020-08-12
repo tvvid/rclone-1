@@ -1,17 +1,19 @@
 package moveto
 
 import (
-	"github.com/ncw/rclone/cmd"
-	"github.com/ncw/rclone/fs/operations"
-	"github.com/ncw/rclone/fs/sync"
+	"context"
+
+	"github.com/rclone/rclone/cmd"
+	"github.com/rclone/rclone/fs/operations"
+	"github.com/rclone/rclone/fs/sync"
 	"github.com/spf13/cobra"
 )
 
 func init() {
-	cmd.Root.AddCommand(commandDefintion)
+	cmd.Root.AddCommand(commandDefinition)
 }
 
-var commandDefintion = &cobra.Command{
+var commandDefinition = &cobra.Command{
 	Use:   "moveto source:path dest:path",
 	Short: `Move file or directory from source to dest.`,
 	Long: `
@@ -19,7 +21,7 @@ If source:path is a file or directory then it moves it to a file or
 directory named dest:path.
 
 This can be used to rename files or upload single files to other than
-their existing name.  If the source is a directory then it acts exacty
+their existing name.  If the source is a directory then it acts exactly
 like the move command.
 
 So
@@ -42,7 +44,7 @@ modification time or MD5SUM.  src will be deleted on successful
 transfer.
 
 **Important**: Since this can cause data loss, test first with the
---dry-run flag.
+` + "`--dry-run` or the `--interactive`/`-i`" + ` flag.
 
 **Note**: Use the ` + "`-P`" + `/` + "`--progress`" + ` flag to view real-time transfer statistics.
 `,
@@ -52,9 +54,9 @@ transfer.
 
 		cmd.Run(true, true, command, func() error {
 			if srcFileName == "" {
-				return sync.MoveDir(fdst, fsrc, false)
+				return sync.MoveDir(context.Background(), fdst, fsrc, false, false)
 			}
-			return operations.MoveFile(fdst, fsrc, dstFileName, srcFileName)
+			return operations.MoveFile(context.Background(), fdst, fsrc, dstFileName, srcFileName)
 		})
 	},
 }

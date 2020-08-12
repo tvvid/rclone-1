@@ -14,7 +14,7 @@ import (
 	"log"
 	mathrand "math/rand"
 	"os"
-	"os/user"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -25,15 +25,19 @@ import (
 	"unicode/utf8"
 
 	"github.com/Unknwon/goconfig"
-	"github.com/ncw/rclone/fs"
-	"github.com/ncw/rclone/fs/accounting"
-	"github.com/ncw/rclone/fs/config/configstruct"
-	"github.com/ncw/rclone/fs/config/obscure"
-	"github.com/ncw/rclone/fs/driveletter"
-	"github.com/ncw/rclone/fs/fshttp"
-	"github.com/ncw/rclone/fs/fspath"
-	"github.com/ncw/rclone/fs/rc"
+	homedir "github.com/mitchellh/go-homedir"
 	"github.com/pkg/errors"
+	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/accounting"
+	"github.com/rclone/rclone/fs/config/configmap"
+	"github.com/rclone/rclone/fs/config/configstruct"
+	"github.com/rclone/rclone/fs/config/obscure"
+	"github.com/rclone/rclone/fs/driveletter"
+	"github.com/rclone/rclone/fs/fshttp"
+	"github.com/rclone/rclone/fs/fspath"
+	"github.com/rclone/rclone/fs/rc"
+	"github.com/rclone/rclone/lib/random"
+	"github.com/rclone/rclone/lib/terminal"
 	"golang.org/x/crypto/nacl/secretbox"
 	"golang.org/x/text/unicode/norm"
 )
@@ -57,8 +61,17 @@ const (
 	// ConfigTokenURL is the config key used to store the token server endpoint
 	ConfigTokenURL = "token_url"
 
-	// ConfigAutomatic indicates that we want non-interactive configuration
-	ConfigAutomatic = "config_automatic"
+	// ConfigEncoding is the config key to change the encoding for a backend
+	ConfigEncoding = "encoding"
+
+	// ConfigEncodingHelp is the help for ConfigEncoding
+	ConfigEncodingHelp = "This sets the encoding for the backend.\n\nSee: the [encoding section in the overview](/overview/#encoding) for more info."
+
+	// ConfigAuthorize indicates that we just want "rclone authorize"
+	ConfigAuthorize = "config_authorize"
+
+	// ConfigAuthNoBrowser indicates that we do not want to open browser
+	ConfigAuthNoBrowser = "config_auth_no_browser"
 )
 
 // Global
@@ -87,12 +100,15 @@ var (
 	// For security reasons, the temp file is deleted once the configKey is successfully loaded.
 	// This can be used to pass the configKey to a child process.
 	PassConfigKeyForDaemonization = false
+
+	// Password can be used to configure the random password generator
+	Password = random.Password
 )
 
 func init() {
 	// Set the function pointers up in fs
 	fs.ConfigFileGet = FileGetFlag
-	fs.ConfigFileSet = FileSet
+	fs.ConfigFileSet = SetValueAndSave
 }
 
 func getConfigData() *goconfig.ConfigFile {
@@ -104,17 +120,20 @@ func getConfigData() *goconfig.ConfigFile {
 
 // Return the path to the configuration file
 func makeConfigPath() string {
-	// Find user's home directory
-	usr, err := user.Current()
-	var homedir string
+
+	// Use rclone.conf from rclone executable directory if already existing
+	exe, err := os.Executable()
 	if err == nil {
-		homedir = usr.HomeDir
-	} else {
-		// Fall back to reading $HOME - work around user.Current() not
-		// working for cross compiled binaries on OSX.
-		// https://github.com/golang/go/issues/6376
-		homedir = os.Getenv("HOME")
+		exedir := filepath.Dir(exe)
+		cfgpath := filepath.Join(exedir, configFileName)
+		_, err := os.Stat(cfgpath)
+		if err == nil {
+			return cfgpath
+		}
 	}
+
+	// Find user's home directory
+	homeDir, err := homedir.Dir()
 
 	// Find user's configuration directory.
 	// Prefer XDG config path, with fallback to $HOME/.config.
@@ -125,9 +144,9 @@ func makeConfigPath() string {
 	if xdgdir != "" {
 		// User's configuration directory for rclone is $XDG_CONFIG_HOME/rclone
 		cfgdir = filepath.Join(xdgdir, "rclone")
-	} else if homedir != "" {
+	} else if homeDir != "" {
 		// User's configuration directory for rclone is $HOME/.config/rclone
-		cfgdir = filepath.Join(homedir, ".config", "rclone")
+		cfgdir = filepath.Join(homeDir, ".config", "rclone")
 	}
 
 	// Use rclone.conf from user's configuration directory if already existing
@@ -142,8 +161,8 @@ func makeConfigPath() string {
 
 	// Use .rclone.conf from user's home directory if already existing
 	var homeconf string
-	if homedir != "" {
-		homeconf = filepath.Join(homedir, hiddenConfigFileName)
+	if homeDir != "" {
+		homeconf = filepath.Join(homeDir, hiddenConfigFileName)
 		_, err := os.Stat(homeconf)
 		if err == nil {
 			return homeconf
@@ -194,6 +213,9 @@ func makeConfigPath() string {
 
 // LoadConfig loads the config file
 func LoadConfig() {
+	// Set RCLONE_CONFIG_DIR for backend config and subprocesses
+	_ = os.Setenv("RCLONE_CONFIG_DIR", filepath.Dir(ConfigPath))
+
 	// Load configuration file.
 	var err error
 	configFile, err = loadConfigFile()
@@ -221,6 +243,8 @@ var errorConfigFileNotFound = errors.New("config file not found")
 // loadConfigFile will load a config file, and
 // automatically decrypt it.
 func loadConfigFile() (*goconfig.ConfigFile, error) {
+	var usingPasswordCommand bool
+
 	b, err := ioutil.ReadFile(ConfigPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -228,7 +252,6 @@ func loadConfigFile() (*goconfig.ConfigFile, error) {
 		}
 		return nil, err
 	}
-
 	// Find first non-empty line
 	r := bufio.NewReader(bytes.NewBuffer(b))
 	for {
@@ -253,6 +276,54 @@ func loadConfigFile() (*goconfig.ConfigFile, error) {
 		return goconfig.LoadFromReader(bytes.NewBuffer(b))
 	}
 
+	if len(configKey) == 0 {
+		if len(fs.Config.PasswordCommand) != 0 {
+			var stdout bytes.Buffer
+			var stderr bytes.Buffer
+
+			cmd := exec.Command(fs.Config.PasswordCommand[0], fs.Config.PasswordCommand[1:]...)
+
+			cmd.Stdout = &stdout
+			cmd.Stderr = &stderr
+			cmd.Stdin = os.Stdin
+
+			if err := cmd.Run(); err != nil {
+				// One does not always get the stderr returned in the wrapped error.
+				fs.Errorf(nil, "Using --password-command returned: %v", err)
+				if ers := strings.TrimSpace(stderr.String()); ers != "" {
+					fs.Errorf(nil, "--password-command stderr: %s", ers)
+				}
+				return nil, errors.Wrap(err, "password command failed")
+			}
+			if pass := strings.Trim(stdout.String(), "\r\n"); pass != "" {
+				err := setConfigPassword(pass)
+				if err != nil {
+					return nil, errors.Wrap(err, "incorrect password")
+				}
+			} else {
+				return nil, errors.New("password-command returned empty string")
+			}
+
+			if len(configKey) == 0 {
+				return nil, errors.New("unable to decrypt configuration: incorrect password")
+			}
+			usingPasswordCommand = true
+		} else {
+			usingPasswordCommand = false
+
+			envpw := os.Getenv("RCLONE_CONFIG_PASS")
+
+			if envpw != "" {
+				err := setConfigPassword(envpw)
+				if err != nil {
+					fs.Errorf(nil, "Using RCLONE_CONFIG_PASS returned: %v", err)
+				} else {
+					fs.Debugf(nil, "Using RCLONE_CONFIG_PASS password.")
+				}
+			}
+		}
+	}
+
 	// Encrypted content is base64 encoded.
 	dec := base64.NewDecoder(base64.StdEncoding, r)
 	box, err := ioutil.ReadAll(dec)
@@ -262,7 +333,6 @@ func loadConfigFile() (*goconfig.ConfigFile, error) {
 	if len(box) < 24+secretbox.Overhead {
 		return nil, errors.New("Configuration data too short")
 	}
-	envpw := os.Getenv("RCLONE_CONFIG_PASS")
 
 	var out []byte
 	for {
@@ -283,15 +353,10 @@ func loadConfigFile() (*goconfig.ConfigFile, error) {
 			configKey = []byte(obscure.MustReveal(string(obscuredKey)))
 			fs.Debugf(nil, "using _RCLONE_CONFIG_KEY_FILE for configKey")
 		} else {
-			if len(configKey) == 0 && envpw != "" {
-				err := setConfigPassword(envpw)
-				if err != nil {
-					fmt.Println("Using RCLONE_CONFIG_PASS returned:", err)
-				} else {
-					fs.Debugf(nil, "Using RCLONE_CONFIG_PASS password.")
-				}
-			}
 			if len(configKey) == 0 {
+				if usingPasswordCommand {
+					return nil, errors.New("using --password-command derived password, unable to decrypt configuration")
+				}
 				if !fs.Config.AskPassword {
 					return nil, errors.New("unable to decrypt configuration and not allowed to ask for password - set RCLONE_CONFIG_PASS to your configuration password")
 				}
@@ -315,7 +380,6 @@ func loadConfigFile() (*goconfig.ConfigFile, error) {
 		// Retry
 		fs.Errorf(nil, "Couldn't decrypt configuration, most likely wrong password.")
 		configKey = nil
-		envpw = ""
 	}
 	return goconfig.LoadFromReader(bytes.NewBuffer(out))
 }
@@ -498,6 +562,7 @@ func saveConfig() error {
 		_ = enc.Close()
 	}
 
+	_ = f.Sync()
 	err = f.Close()
 	if err != nil {
 		return errors.Errorf("Failed to close config file: %v", err)
@@ -564,7 +629,7 @@ func SetValueAndSave(name, key, value string) (err error) {
 	_, err = reloadedConfigFile.GetSection(name)
 	if err != nil {
 		// Section doesn't exist yet so ignore reload
-		return err
+		return nil
 	}
 	// Update the config file with the reloaded version
 	configFile = reloadedConfigFile
@@ -573,6 +638,17 @@ func SetValueAndSave(name, key, value string) (err error) {
 	// Save it again
 	SaveConfig()
 	return nil
+}
+
+// FileGetFresh reads the config key under section return the value or
+// an error if the config file was not found or that value couldn't be
+// read.
+func FileGetFresh(section, key string) (value string, err error) {
+	reloadedConfigFile, err := loadConfigFile()
+	if err != nil {
+		return "", err
+	}
+	return reloadedConfigFile.GetValue(section, key)
 }
 
 // ShowRemotes shows an overview of the config file
@@ -606,11 +682,26 @@ var ReadLine = func() string {
 	return strings.TrimSpace(line)
 }
 
-// Command - choose one
-func Command(commands []string) byte {
+// ReadNonEmptyLine prints prompt and calls Readline until non empty
+func ReadNonEmptyLine(prompt string) string {
+	result := ""
+	for result == "" {
+		fmt.Print(prompt)
+		result = strings.TrimSpace(ReadLine())
+	}
+	return result
+}
+
+// CommandDefault - choose one.  If return is pressed then it will
+// chose the defaultIndex if it is >= 0
+func CommandDefault(commands []string, defaultIndex int) byte {
 	opts := []string{}
-	for _, text := range commands {
-		fmt.Printf("%c) %s\n", text[0], text[1:])
+	for i, text := range commands {
+		def := ""
+		if i == defaultIndex {
+			def = " (default)"
+		}
+		fmt.Printf("%c) %s%s\n", text[0], text[1:], def)
 		opts = append(opts, text[:1])
 	}
 	optString := strings.Join(opts, "")
@@ -618,6 +709,9 @@ func Command(commands []string) byte {
 	for {
 		fmt.Printf("%s> ", optHelp)
 		result := strings.ToLower(ReadLine())
+		if len(result) == 0 && defaultIndex >= 0 {
+			return optString[defaultIndex]
+		}
 		if len(result) != 1 {
 			continue
 		}
@@ -628,30 +722,57 @@ func Command(commands []string) byte {
 	}
 }
 
-// ConfirmWithDefault asks the user for Yes or No and returns true or false.
-//
-// If AutoConfirm is set, it will return the Default value passed in
-func ConfirmWithDefault(Default bool) bool {
-	if fs.Config.AutoConfirm {
-		return Default
-	}
-	return Command([]string{"yYes", "nNo"}) == 'y'
+// Command - choose one
+func Command(commands []string) byte {
+	return CommandDefault(commands, -1)
 }
 
 // Confirm asks the user for Yes or No and returns true or false
 //
-// If AutoConfirm is set, it will return true
-func Confirm() bool {
-	return ConfirmWithDefault(true)
+// If the user presses enter then the Default will be used
+func Confirm(Default bool) bool {
+	defaultIndex := 0
+	if !Default {
+		defaultIndex = 1
+	}
+	return CommandDefault([]string{"yYes", "nNo"}, defaultIndex) == 'y'
+}
+
+// ConfirmWithConfig asks the user for Yes or No and returns true or
+// false.
+//
+// If AutoConfirm is set, it will look up the value in m and return
+// that, but if it isn't set then it will return the Default value
+// passed in
+func ConfirmWithConfig(m configmap.Getter, configName string, Default bool) bool {
+	if fs.Config.AutoConfirm {
+		configString, ok := m.Get(configName)
+		if ok {
+			configValue, err := strconv.ParseBool(configString)
+			if err != nil {
+				fs.Errorf(nil, "Failed to parse config parameter %s=%q as boolean - using default %v: %v", configName, configString, Default, err)
+			} else {
+				Default = configValue
+			}
+		}
+		answer := "No"
+		if Default {
+			answer = "Yes"
+		}
+		fmt.Printf("Auto confirm is set: answering %s, override by setting config parameter %s=%v\n", answer, configName, !Default)
+		return Default
+	}
+	return Confirm(Default)
 }
 
 // Choose one of the defaults or type a new string if newOk is set
 func Choose(what string, defaults, help []string, newOk bool) string {
-	valueDescripton := "an existing"
+	valueDescription := "an existing"
 	if newOk {
-		valueDescripton = "your own"
+		valueDescription = "your own"
 	}
-	fmt.Printf("Choose a number from below, or type in %s value\n", valueDescripton)
+	fmt.Printf("Choose a number from below, or type in %s value\n", valueDescription)
+	attributes := []string{terminal.HiRedFg, terminal.HiGreenFg}
 	for i, text := range defaults {
 		var lines []string
 		if help != nil {
@@ -660,6 +781,7 @@ func Choose(what string, defaults, help []string, newOk bool) string {
 		}
 		lines = append(lines, fmt.Sprintf("%q", text))
 		pos := i + 1
+		terminal.WriteString(attributes[i%len(attributes)])
 		if len(lines) == 1 {
 			fmt.Printf("%2d > %s\n", pos, text)
 		} else {
@@ -681,6 +803,7 @@ func Choose(what string, defaults, help []string, newOk bool) string {
 				fmt.Printf("%s %c %s\n", number, sep, line)
 			}
 		}
+		terminal.WriteString(terminal.Reset)
 	}
 	for {
 		fmt.Printf("%s> ", what)
@@ -748,7 +871,7 @@ func ShowRemote(name string) {
 // OkRemote prints the contents of the remote and ask if it is OK
 func OkRemote(name string) bool {
 	ShowRemote(name)
-	switch i := Command([]string{"yYes this is OK", "eEdit this remote", "dDelete this remote"}); i {
+	switch i := CommandDefault([]string{"yYes this is OK", "eEdit this remote", "dDelete this remote"}, 0); i {
 	case 'y':
 		return true
 	case 'e':
@@ -818,32 +941,29 @@ func ChooseOption(o *fs.Option, name string) string {
 	fmt.Println(o.Help)
 	if o.IsPassword {
 		actions := []string{"yYes type in my own password", "gGenerate random password"}
+		defaultAction := -1
 		if !o.Required {
+			defaultAction = len(actions)
 			actions = append(actions, "nNo leave this optional password blank")
 		}
 		var password string
-		switch i := Command(actions); i {
+		var err error
+		switch i := CommandDefault(actions, defaultAction); i {
 		case 'y':
 			password = ChangePassword("the")
 		case 'g':
 			for {
 				fmt.Printf("Password strength in bits.\n64 is just about memorable\n128 is secure\n1024 is the maximum\n")
 				bits := ChooseNumber("Bits", 64, 1024)
-				bytes := bits / 8
-				if bits%8 != 0 {
-					bytes++
+				password, err = Password(bits)
+				if err != nil {
+					log.Fatalf("Failed to make password: %v", err)
 				}
-				var pw = make([]byte, bytes)
-				n, _ := rand.Read(pw)
-				if n != bytes {
-					log.Fatalf("password short read: %d", n)
-				}
-				password = base64.RawURLEncoding.EncodeToString(pw)
 				fmt.Printf("Your password is: %s\n", password)
 				fmt.Printf("Use this password? Please note that an obscured version of this \npassword (and not the " +
 					"password itself) will be stored under your \nconfiguration file, so keep this generated password " +
 					"in a safe place.\n")
-				if Confirm() {
+				if Confirm(true) {
 					break
 				}
 			}
@@ -913,11 +1033,50 @@ func suppressConfirm() func() {
 
 // UpdateRemote adds the keyValues passed in to the remote of name.
 // keyValues should be key, value pairs.
-func UpdateRemote(name string, keyValues rc.Params) error {
+func UpdateRemote(name string, keyValues rc.Params, doObscure, noObscure bool) error {
+	if doObscure && noObscure {
+		return errors.New("can't use --obscure and --no-obscure together")
+	}
+	err := fspath.CheckConfigName(name)
+	if err != nil {
+		return err
+	}
 	defer suppressConfirm()()
+
+	// Work out which options need to be obscured
+	needsObscure := map[string]struct{}{}
+	if !noObscure {
+		if fsType := FileGet(name, "type"); fsType != "" {
+			if ri, err := fs.Find(fsType); err != nil {
+				fs.Debugf(nil, "Couldn't find fs for type %q", fsType)
+			} else {
+				for _, opt := range ri.Options {
+					if opt.IsPassword {
+						needsObscure[opt.Name] = struct{}{}
+					}
+				}
+			}
+		} else {
+			fs.Debugf(nil, "UpdateRemote: Couldn't find fs type")
+		}
+	}
+
 	// Set the config
 	for k, v := range keyValues {
-		getConfigData().SetValue(name, k, fmt.Sprint(v))
+		vStr := fmt.Sprint(v)
+		// Obscure parameter if necessary
+		if _, ok := needsObscure[k]; ok {
+			_, err := obscure.Reveal(vStr)
+			if err != nil || doObscure {
+				// If error => not already obscured, so obscure it
+				// or we are forced to obscure
+				vStr, err = obscure.Obscure(vStr)
+				if err != nil {
+					return errors.Wrap(err, "UpdateRemote: obscure failed")
+				}
+			}
+		}
+		getConfigData().SetValue(name, k, vStr)
 	}
 	RemoteConfig(name)
 	SaveConfig()
@@ -927,25 +1086,31 @@ func UpdateRemote(name string, keyValues rc.Params) error {
 // CreateRemote creates a new remote with name, provider and a list of
 // parameters which are key, value pairs.  If update is set then it
 // adds the new keys rather than replacing all of them.
-func CreateRemote(name string, provider string, keyValues rc.Params) error {
+func CreateRemote(name string, provider string, keyValues rc.Params, doObscure, noObscure bool) error {
+	err := fspath.CheckConfigName(name)
+	if err != nil {
+		return err
+	}
 	// Delete the old config if it exists
 	getConfigData().DeleteSection(name)
 	// Set the type
 	getConfigData().SetValue(name, "type", provider)
-	// Show this is automatically configured
-	getConfigData().SetValue(name, ConfigAutomatic, "yes")
 	// Set the remaining values
-	return UpdateRemote(name, keyValues)
+	return UpdateRemote(name, keyValues, doObscure, noObscure)
 }
 
 // PasswordRemote adds the keyValues passed in to the remote of name.
 // keyValues should be key, value pairs.
 func PasswordRemote(name string, keyValues rc.Params) error {
+	err := fspath.CheckConfigName(name)
+	if err != nil {
+		return err
+	}
 	defer suppressConfirm()()
 	for k, v := range keyValues {
 		keyValues[k] = obscure.MustObscure(fmt.Sprint(v))
 	}
-	return UpdateRemote(name, keyValues)
+	return UpdateRemote(name, keyValues, false, true)
 }
 
 // JSONListProviders prints all the providers and options in JSON format
@@ -979,19 +1144,24 @@ func fsOption() *fs.Option {
 	return o
 }
 
-// NewRemoteName asks the user for a name for a remote
+// NewRemoteName asks the user for a name for a new remote
 func NewRemoteName() (name string) {
 	for {
 		fmt.Printf("name> ")
 		name = ReadLine()
-		parts := fspath.Matcher.FindStringSubmatch(name + ":")
+		_, err := getConfigData().GetSection(name)
+		if err == nil {
+			fmt.Printf("Remote %q already exists.\n", name)
+			continue
+		}
+		err = fspath.CheckConfigName(name)
 		switch {
 		case name == "":
 			fmt.Printf("Can't use empty name.\n")
 		case driveletter.IsDriveLetter(name):
 			fmt.Printf("Can't use %q as it can be confused with a drive letter.\n", name)
-		case parts == nil:
-			fmt.Printf("Can't use %q as it has invalid characters in it.\n", name)
+		case err != nil:
+			fmt.Printf("Can't use %q as %v.\n", name, err)
 		default:
 			return name
 		}
@@ -1009,21 +1179,22 @@ func editOptions(ri *fs.RegInfo, name string, isNew bool) {
 				break
 			}
 			fmt.Printf("Edit advanced config? (y/n)\n")
-			if !Confirm() {
+			if !Confirm(false) {
 				break
 			}
 		}
 		for _, option := range ri.Options {
-			hasAdvanced = hasAdvanced || option.Advanced
+			isVisible := option.Hide&fs.OptionHideConfigurator == 0
+			hasAdvanced = hasAdvanced || (option.Advanced && isVisible)
 			if option.Advanced != advanced {
 				continue
 			}
 			subProvider := getConfigData().MustValue(name, fs.ConfigProvider, "")
-			if matchProvider(option.Provider, subProvider) {
+			if matchProvider(option.Provider, subProvider) && isVisible {
 				if !isNew {
 					fmt.Printf("Value %q = %q\n", option.Name, FileGet(name, option.Name))
 					fmt.Printf("Edit? (y/n)>\n")
-					if !Confirm() {
+					if !Confirm(false) {
 						continue
 					}
 				}
@@ -1215,7 +1386,8 @@ func SetPassword() {
 //
 //   rclone authorize "fs name"
 //   rclone authorize "fs name" "client id" "client secret"
-func Authorize(args []string) {
+func Authorize(args []string, noAutoBrowser bool) {
+	defer suppressConfirm()()
 	switch len(args) {
 	case 1, 3:
 	default:
@@ -1232,12 +1404,17 @@ func Authorize(args []string) {
 	// Make sure we delete it
 	defer DeleteRemote(name)
 
-	// Indicate that we want fully automatic configuration.
-	getConfigData().SetValue(name, ConfigAutomatic, "yes")
+	// Indicate that we are running rclone authorize
+	getConfigData().SetValue(name, ConfigAuthorize, "true")
+	if noAutoBrowser {
+		getConfigData().SetValue(name, ConfigAuthNoBrowser, "true")
+	}
+
 	if len(args) == 3 {
 		getConfigData().SetValue(name, ConfigClientID, args[1])
 		getConfigData().SetValue(name, ConfigClientSecret, args[2])
 	}
+
 	m := fs.ConfigMap(f, name)
 	f.Config(name, m)
 }
@@ -1280,6 +1457,16 @@ func FileDeleteKey(section, key string) bool {
 }
 
 var matchEnv = regexp.MustCompile(`^RCLONE_CONFIG_(.*?)_TYPE=.*$`)
+
+// FileRefresh ensures the latest configFile is loaded from disk
+func FileRefresh() error {
+	reloadedConfigFile, err := loadConfigFile()
+	if err != nil {
+		return err
+	}
+	configFile = reloadedConfigFile
+	return nil
+}
 
 // FileSections returns the sections in the config file
 // including any defined by environment variables.

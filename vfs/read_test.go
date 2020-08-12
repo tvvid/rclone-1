@@ -1,20 +1,21 @@
 package vfs
 
 import (
+	"context"
 	"io"
 	"os"
 	"testing"
 
-	"github.com/ncw/rclone/fstest"
+	"github.com/rclone/rclone/fstest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 // Open a file for write
-func readHandleCreate(t *testing.T, r *fstest.Run) (*VFS, *ReadFileHandle) {
-	vfs := New(r.Fremote, nil)
+func readHandleCreate(t *testing.T) (r *fstest.Run, vfs *VFS, fh *ReadFileHandle, cleanup func()) {
+	r, vfs, cleanup = newTestVFS(t)
 
-	file1 := r.WriteObject("dir/file1", "0123456789abcdef", t1)
+	file1 := r.WriteObject(context.Background(), "dir/file1", "0123456789abcdef", t1)
 	fstest.CheckItems(t, r.Fremote, file1)
 
 	h, err := vfs.OpenFile("dir/file1", os.O_RDONLY, 0777)
@@ -22,7 +23,7 @@ func readHandleCreate(t *testing.T, r *fstest.Run) (*VFS, *ReadFileHandle) {
 	fh, ok := h.(*ReadFileHandle)
 	require.True(t, ok)
 
-	return vfs, fh
+	return r, vfs, fh, cleanup
 }
 
 // read data from the string
@@ -36,9 +37,8 @@ func readString(t *testing.T, fh *ReadFileHandle, n int) string {
 }
 
 func TestReadFileHandleMethods(t *testing.T) {
-	r := fstest.NewRun(t)
-	defer r.Finalise()
-	_, fh := readHandleCreate(t, r)
+	_, _, fh, cleanup := readHandleCreate(t)
+	defer cleanup()
 
 	// String
 	assert.Equal(t, "dir/file1 (r)", fh.String())
@@ -80,9 +80,8 @@ func TestReadFileHandleMethods(t *testing.T) {
 }
 
 func TestReadFileHandleSeek(t *testing.T) {
-	r := fstest.NewRun(t)
-	defer r.Finalise()
-	_, fh := readHandleCreate(t, r)
+	_, _, fh, cleanup := readHandleCreate(t)
+	defer cleanup()
 
 	assert.Equal(t, "0", readString(t, fh, 1))
 
@@ -124,9 +123,8 @@ func TestReadFileHandleSeek(t *testing.T) {
 }
 
 func TestReadFileHandleReadAt(t *testing.T) {
-	r := fstest.NewRun(t)
-	defer r.Finalise()
-	_, fh := readHandleCreate(t, r)
+	_, _, fh, cleanup := readHandleCreate(t)
+	defer cleanup()
 
 	// read from start
 	buf := make([]byte, 1)
@@ -181,9 +179,8 @@ func TestReadFileHandleReadAt(t *testing.T) {
 }
 
 func TestReadFileHandleFlush(t *testing.T) {
-	r := fstest.NewRun(t)
-	defer r.Finalise()
-	_, fh := readHandleCreate(t, r)
+	_, _, fh, cleanup := readHandleCreate(t)
+	defer cleanup()
 
 	// Check Flush does nothing if read not called
 	err := fh.Flush()
@@ -211,9 +208,8 @@ func TestReadFileHandleFlush(t *testing.T) {
 }
 
 func TestReadFileHandleRelease(t *testing.T) {
-	r := fstest.NewRun(t)
-	defer r.Finalise()
-	_, fh := readHandleCreate(t, r)
+	_, _, fh, cleanup := readHandleCreate(t)
+	defer cleanup()
 
 	// Check Release does nothing if file not read from
 	err := fh.Release()

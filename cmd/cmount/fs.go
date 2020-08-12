@@ -12,12 +12,11 @@ import (
 	"time"
 
 	"github.com/billziss-gh/cgofuse/fuse"
-	"github.com/ncw/rclone/cmd/mountlib"
-	"github.com/ncw/rclone/fs"
-	"github.com/ncw/rclone/fs/log"
-	"github.com/ncw/rclone/vfs"
-	"github.com/ncw/rclone/vfs/vfsflags"
 	"github.com/pkg/errors"
+	"github.com/rclone/rclone/cmd/mountlib"
+	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/log"
+	"github.com/rclone/rclone/vfs"
 )
 
 const fhUnset = ^uint64(0)
@@ -32,10 +31,10 @@ type FS struct {
 }
 
 // NewFS makes a new FS
-func NewFS(f fs.Fs) *FS {
+func NewFS(VFS *vfs.VFS) *FS {
 	fsys := &FS{
-		VFS:   vfs.New(f, &vfsflags.Opt),
-		f:     f,
+		VFS:   VFS,
+		f:     VFS.Fs(),
 		ready: make(chan (struct{})),
 	}
 	return fsys
@@ -218,12 +217,18 @@ func (fsys *FS) Readdir(dirPath string,
 	itemsRead := -1
 	defer log.Trace(dirPath, "ofst=%d, fh=0x%X", ofst, fh)("items=%d, errc=%d", &itemsRead, &errc)
 
-	node, errc := fsys.getHandle(fh)
+	dir, errc := fsys.lookupDir(dirPath)
 	if errc != 0 {
 		return errc
 	}
 
-	items, err := node.Readdir(-1)
+	// We can't seek in directories and FUSE should know that so
+	// return an error if ofst is ever set.
+	if ofst > 0 {
+		return -fuse.ESPIPE
+	}
+
+	nodes, err := dir.ReadDirAll()
 	if err != nil {
 		return translateError(err)
 	}
@@ -232,7 +237,7 @@ func (fsys *FS) Readdir(dirPath string,
 	// for getattr (but FUSE only looks at st_ino and the
 	// file-type bits of st_mode).
 	//
-	// FIXME If you call host.SetCapReaddirPlus() then WinFsp will
+	// We have called host.SetCapReaddirPlus() so WinFsp will
 	// use the full stat information - a Useful optimization on
 	// Windows.
 	//
@@ -243,13 +248,19 @@ func (fsys *FS) Readdir(dirPath string,
 	// directory is read in a single readdir operation.
 	fill(".", nil, 0)
 	fill("..", nil, 0)
-	for _, item := range items {
-		node, ok := item.(vfs.Node)
-		if ok {
-			fill(node.Name(), nil, 0)
+	for _, node := range nodes {
+		name := node.Name()
+		if len(name) > mountlib.MaxLeafSize {
+			fs.Errorf(dirPath, "Name too long (%d bytes) for FUSE, skipping: %s", len(name), name)
+			continue
 		}
+		// We have called host.SetCapReaddirPlus() so supply the stat information
+		// It is very cheap at this point so supply it regardless of OS capabilities
+		var stat fuse.Stat_t
+		_ = fsys.stat(node, &stat) // not capable of returning an error
+		fill(name, &stat, 0)
 	}
-	itemsRead = len(items)
+	itemsRead = len(nodes)
 	return 0
 }
 
@@ -263,63 +274,80 @@ func (fsys *FS) Releasedir(path string, fh uint64) (errc int) {
 func (fsys *FS) Statfs(path string, stat *fuse.Statfs_t) (errc int) {
 	defer log.Trace(path, "")("stat=%+v, errc=%d", stat, &errc)
 	const blockSize = 4096
-	const fsBlocks = (1 << 50) / blockSize
-	stat.Blocks = fsBlocks  // Total data blocks in file system.
-	stat.Bfree = fsBlocks   // Free blocks in file system.
-	stat.Bavail = fsBlocks  // Free blocks in file system if you're not root.
-	stat.Files = 1E9        // Total files in file system.
-	stat.Ffree = 1E9        // Free files in file system.
-	stat.Bsize = blockSize  // Block size
-	stat.Namemax = 255      // Maximum file name length?
-	stat.Frsize = blockSize // Fragment size, smallest addressable data size in the file system.
-	total, used, free := fsys.VFS.Statfs()
-	if total >= 0 {
-		stat.Blocks = uint64(total) / blockSize
-	}
-	if used >= 0 {
-		stat.Bfree = stat.Blocks - uint64(used)/blockSize
-	}
-	if free >= 0 {
-		stat.Bavail = uint64(free) / blockSize
-	}
+	total, _, free := fsys.VFS.Statfs()
+	stat.Blocks = uint64(total) / blockSize // Total data blocks in file system.
+	stat.Bfree = uint64(free) / blockSize   // Free blocks in file system.
+	stat.Bavail = stat.Bfree                // Free blocks in file system if you're not root.
+	stat.Files = 1e9                        // Total files in file system.
+	stat.Ffree = 1e9                        // Free files in file system.
+	stat.Bsize = blockSize                  // Block size
+	stat.Namemax = 255                      // Maximum file name length?
+	stat.Frsize = blockSize                 // Fragment size, smallest addressable data size in the file system.
 	mountlib.ClipBlocks(&stat.Blocks)
 	mountlib.ClipBlocks(&stat.Bfree)
 	mountlib.ClipBlocks(&stat.Bavail)
 	return 0
 }
 
-// Open opens a file
-func (fsys *FS) Open(path string, flags int) (errc int, fh uint64) {
-	defer log.Trace(path, "flags=0x%X", flags)("errc=%d, fh=0x%X", &errc, &fh)
+// OpenEx opens a file
+func (fsys *FS) OpenEx(path string, fi *fuse.FileInfo_t) (errc int) {
+	defer log.Trace(path, "flags=0x%X", fi.Flags)("errc=%d, fh=0x%X", &errc, &fi.Fh)
+	fi.Fh = fhUnset
 
 	// translate the fuse flags to os flags
-	flags = translateOpenFlags(flags)
+	flags := translateOpenFlags(fi.Flags)
 	handle, err := fsys.VFS.OpenFile(path, flags, 0777)
 	if err != nil {
-		return translateError(err), fhUnset
+		return translateError(err)
 	}
 
-	return 0, fsys.openHandle(handle)
+	// If size unknown then use direct io to read
+	if entry := handle.Node().DirEntry(); entry != nil && entry.Size() < 0 {
+		fi.DirectIo = true
+	}
+
+	fi.Fh = fsys.openHandle(handle)
+	return 0
+}
+
+// Open opens a file
+func (fsys *FS) Open(path string, flags int) (errc int, fh uint64) {
+	var fi = fuse.FileInfo_t{
+		Flags: flags,
+	}
+	errc = fsys.OpenEx(path, &fi)
+	return errc, fi.Fh
+}
+
+// CreateEx creates and opens a file.
+func (fsys *FS) CreateEx(filePath string, mode uint32, fi *fuse.FileInfo_t) (errc int) {
+	defer log.Trace(filePath, "flags=0x%X, mode=0%o", fi.Flags, mode)("errc=%d, fh=0x%X", &errc, &fi.Fh)
+	fi.Fh = fhUnset
+	leaf, parentDir, errc := fsys.lookupParentDir(filePath)
+	if errc != 0 {
+		return errc
+	}
+	file, err := parentDir.Create(leaf, fi.Flags)
+	if err != nil {
+		return translateError(err)
+	}
+	// translate the fuse flags to os flags
+	flags := translateOpenFlags(fi.Flags) | os.O_CREATE
+	handle, err := file.Open(flags)
+	if err != nil {
+		return translateError(err)
+	}
+	fi.Fh = fsys.openHandle(handle)
+	return 0
 }
 
 // Create creates and opens a file.
 func (fsys *FS) Create(filePath string, flags int, mode uint32) (errc int, fh uint64) {
-	defer log.Trace(filePath, "flags=0x%X, mode=0%o", flags, mode)("errc=%d, fh=0x%X", &errc, &fh)
-	leaf, parentDir, errc := fsys.lookupParentDir(filePath)
-	if errc != 0 {
-		return errc, fhUnset
+	var fi = fuse.FileInfo_t{
+		Flags: flags,
 	}
-	file, err := parentDir.Create(leaf, flags)
-	if err != nil {
-		return translateError(err), fhUnset
-	}
-	// translate the fuse flags to os flags
-	flags = translateOpenFlags(flags) | os.O_CREATE
-	handle, err := file.Open(flags)
-	if err != nil {
-		return translateError(err), fhUnset
-	}
-	return 0, fsys.openHandle(handle)
+	errc = fsys.CreateEx(filePath, mode, &fi)
+	return errc, fi.Fh
 }
 
 // Truncate truncates a file to size
@@ -428,6 +456,11 @@ func (fsys *FS) Rename(oldPath string, newPath string) (errc int) {
 	return translateError(fsys.VFS.Rename(oldPath, newPath))
 }
 
+// Windows sometimes seems to send times that are the epoch which is
+// 1601-01-01 +/- timezone so filter out times that are earlier than
+// this.
+var invalidDateCutoff = time.Date(1601, 1, 2, 0, 0, 0, 0, time.UTC)
+
 // Utimens changes the access and modification times of a file.
 func (fsys *FS) Utimens(path string, tmsp []fuse.Timespec) (errc int) {
 	defer log.Trace(path, "tmsp=%+v", tmsp)("errc=%d", &errc)
@@ -435,12 +468,16 @@ func (fsys *FS) Utimens(path string, tmsp []fuse.Timespec) (errc int) {
 	if errc != 0 {
 		return errc
 	}
-	var t time.Time
 	if tmsp == nil || len(tmsp) < 2 {
-		t = time.Now()
-	} else {
-		t = tmsp[1].Time()
+		fs.Debugf(path, "Utimens: Not setting time as timespec isn't complete: %v", tmsp)
+		return 0
 	}
+	t := tmsp[1].Time()
+	if t.Before(invalidDateCutoff) {
+		fs.Debugf(path, "Utimens: Not setting out of range time: %v", t)
+		return 0
+	}
+	fs.Debugf(path, "Utimens: SetModTime: %v", t)
 	return translateError(node.SetModTime(t))
 }
 
@@ -531,11 +568,11 @@ func translateError(err error) (errc int) {
 	switch errors.Cause(err) {
 	case vfs.OK:
 		return 0
-	case vfs.ENOENT:
+	case vfs.ENOENT, fs.ErrorDirNotFound, fs.ErrorObjectNotFound:
 		return -fuse.ENOENT
-	case vfs.EEXIST:
+	case vfs.EEXIST, fs.ErrorDirExists:
 		return -fuse.EEXIST
-	case vfs.EPERM:
+	case vfs.EPERM, fs.ErrorPermissionDenied:
 		return -fuse.EPERM
 	case vfs.ECLOSED:
 		return -fuse.EBADF
@@ -547,7 +584,7 @@ func translateError(err error) (errc int) {
 		return -fuse.EBADF
 	case vfs.EROFS:
 		return -fuse.EROFS
-	case vfs.ENOSYS:
+	case vfs.ENOSYS, fs.ErrorNotImplemented:
 		return -fuse.ENOSYS
 	case vfs.EINVAL:
 		return -fuse.EINVAL
@@ -581,3 +618,12 @@ func translateOpenFlags(inFlags int) (outFlags int) {
 	// NB O_SYNC isn't defined by fuse
 	return outFlags
 }
+
+// Make sure interfaces are satisfied
+var (
+	_ fuse.FileSystemInterface = (*FS)(nil)
+	_ fuse.FileSystemOpenEx    = (*FS)(nil)
+	//_ fuse.FileSystemChflags    = (*FS)(nil)
+	//_ fuse.FileSystemSetcrtime  = (*FS)(nil)
+	//_ fuse.FileSystemSetchgtime = (*FS)(nil)
+)

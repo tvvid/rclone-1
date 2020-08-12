@@ -120,7 +120,7 @@ func (x *SizeSuffix) Set(s string) error {
 
 // Type of the value
 func (x *SizeSuffix) Type() string {
-	return "int64"
+	return "SizeSuffix"
 }
 
 // Scan implements the fmt.Scanner interface
@@ -132,7 +132,7 @@ func (x *SizeSuffix) Scan(s fmt.ScanState, ch rune) error {
 	return x.Set(string(token))
 }
 
-// SizeSuffixList is a sclice SizeSuffix values
+// SizeSuffixList is a slice SizeSuffix values
 type SizeSuffixList []SizeSuffix
 
 func (l SizeSuffixList) Len() int           { return len(l) }

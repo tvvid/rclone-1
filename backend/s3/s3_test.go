@@ -4,15 +4,16 @@ package s3
 import (
 	"testing"
 
-	"github.com/ncw/rclone/fs"
-	"github.com/ncw/rclone/fstest/fstests"
+	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fstest/fstests"
 )
 
 // TestIntegration runs integration tests against the remote
 func TestIntegration(t *testing.T) {
 	fstests.Run(t, &fstests.Opt{
-		RemoteName: "TestS3:",
-		NilObject:  (*Object)(nil),
+		RemoteName:  "TestS3:",
+		NilObject:   (*Object)(nil),
+		TiersToTest: []string{"STANDARD", "STANDARD_IA"},
 		ChunkedUpload: fstests.ChunkedUploadConfig{
 			MinChunkSize: minChunkSize,
 		},

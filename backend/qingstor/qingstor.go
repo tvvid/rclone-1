@@ -1,11 +1,12 @@
 // Package qingstor provides an interface to QingStor object storage
 // Home: https://www.qingcloud.com/
 
-// +build !plan9
+// +build !plan9,!js
 
 package qingstor
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,19 +14,21 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
-	"github.com/ncw/rclone/fs"
-	"github.com/ncw/rclone/fs/config/configmap"
-	"github.com/ncw/rclone/fs/config/configstruct"
-	"github.com/ncw/rclone/fs/fshttp"
-	"github.com/ncw/rclone/fs/hash"
-	"github.com/ncw/rclone/fs/walk"
 	"github.com/pkg/errors"
-	qsConfig "github.com/yunify/qingstor-sdk-go/config"
-	qsErr "github.com/yunify/qingstor-sdk-go/request/errors"
-	qs "github.com/yunify/qingstor-sdk-go/service"
+	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/config"
+	"github.com/rclone/rclone/fs/config/configmap"
+	"github.com/rclone/rclone/fs/config/configstruct"
+	"github.com/rclone/rclone/fs/fshttp"
+	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/fs/walk"
+	"github.com/rclone/rclone/lib/bucket"
+	"github.com/rclone/rclone/lib/encoder"
+	qsConfig "github.com/yunify/qingstor-sdk-go/v3/config"
+	qsErr "github.com/yunify/qingstor-sdk-go/v3/request/errors"
+	qs "github.com/yunify/qingstor-sdk-go/v3/service"
 )
 
 // Register with Fs
@@ -53,7 +56,7 @@ func init() {
 			Help: "QingStor Secret Access Key (password)\nLeave blank for anonymous access or runtime credentials.",
 		}, {
 			Name: "endpoint",
-			Help: "Enter a endpoint URL to connection QingStor API.\nLeave blank will use the default value \"https://qingstor.com:443\"",
+			Help: "Enter an endpoint URL to connection QingStor API.\nLeave blank will use the default value \"https://qingstor.com:443\"",
 		}, {
 			Name: "zone",
 			Help: "Zone to connect to.\nDefault is \"pek3a\".",
@@ -72,14 +75,61 @@ func init() {
 			Help:     "Number of connection retries.",
 			Default:  3,
 			Advanced: true,
+		}, {
+			Name: "upload_cutoff",
+			Help: `Cutoff for switching to chunked upload
+
+Any files larger than this will be uploaded in chunks of chunk_size.
+The minimum is 0 and the maximum is 5GB.`,
+			Default:  defaultUploadCutoff,
+			Advanced: true,
+		}, {
+			Name: "chunk_size",
+			Help: `Chunk size to use for uploading.
+
+When uploading files larger than upload_cutoff they will be uploaded
+as multipart uploads using this chunk size.
+
+Note that "--qingstor-upload-concurrency" chunks of this size are buffered
+in memory per transfer.
+
+If you are transferring large files over high speed links and you have
+enough memory, then increasing this will speed up the transfers.`,
+			Default:  minChunkSize,
+			Advanced: true,
+		}, {
+			Name: "upload_concurrency",
+			Help: `Concurrency for multipart uploads.
+
+This is the number of chunks of the same file that are uploaded
+concurrently.
+
+NB if you set this to > 1 then the checksums of multpart uploads
+become corrupted (the uploads themselves are not corrupted though).
+
+If you are uploading small numbers of large file over high speed link
+and these uploads do not fully utilize your bandwidth, then increasing
+this may help to speed up the transfers.`,
+			Default:  1,
+			Advanced: true,
+		}, {
+			Name:     config.ConfigEncoding,
+			Help:     config.ConfigEncodingHelp,
+			Advanced: true,
+			Default: (encoder.EncodeInvalidUtf8 |
+				encoder.EncodeCtl |
+				encoder.EncodeSlash),
 		}},
 	})
 }
 
 // Constants
 const (
-	listLimitSize  = 1000                   // Number of items to read at once
-	maxSizeForCopy = 1024 * 1024 * 1024 * 5 // The maximum size of object we can COPY
+	listLimitSize       = 1000                   // Number of items to read at once
+	maxSizeForCopy      = 1024 * 1024 * 1024 * 5 // The maximum size of object we can COPY
+	minChunkSize        = fs.SizeSuffix(minMultiPartSize)
+	defaultUploadCutoff = fs.SizeSuffix(200 * 1024 * 1024)
+	maxUploadCutoff     = fs.SizeSuffix(5 * 1024 * 1024 * 1024)
 )
 
 // Globals
@@ -92,26 +142,29 @@ func timestampToTime(tp int64) time.Time {
 
 // Options defines the configuration for this backend
 type Options struct {
-	EnvAuth           bool   `config:"env_auth"`
-	AccessKeyID       string `config:"access_key_id"`
-	SecretAccessKey   string `config:"secret_access_key"`
-	Endpoint          string `config:"endpoint"`
-	Zone              string `config:"zone"`
-	ConnectionRetries int    `config:"connection_retries"`
+	EnvAuth           bool                 `config:"env_auth"`
+	AccessKeyID       string               `config:"access_key_id"`
+	SecretAccessKey   string               `config:"secret_access_key"`
+	Endpoint          string               `config:"endpoint"`
+	Zone              string               `config:"zone"`
+	ConnectionRetries int                  `config:"connection_retries"`
+	UploadCutoff      fs.SizeSuffix        `config:"upload_cutoff"`
+	ChunkSize         fs.SizeSuffix        `config:"chunk_size"`
+	UploadConcurrency int                  `config:"upload_concurrency"`
+	Enc               encoder.MultiEncoder `config:"encoding"`
 }
 
 // Fs represents a remote qingstor server
 type Fs struct {
-	name          string       // The name of the remote
-	root          string       // The root is a subdir, is a special object
-	opt           Options      // parsed options
-	features      *fs.Features // optional features
-	svc           *qs.Service  // The connection to the qingstor server
-	zone          string       // The zone we are working on
-	bucket        string       // The bucket we are working on
-	bucketOKMu    sync.Mutex   // mutex to protect bucketOK and bucketDeleted
-	bucketOK      bool         // true if we have created the bucket
-	bucketDeleted bool         // true if we have deleted the bucket
+	name          string        // The name of the remote
+	root          string        // The root is a subdir, is a special object
+	opt           Options       // parsed options
+	features      *fs.Features  // optional features
+	svc           *qs.Service   // The connection to the qingstor server
+	zone          string        // The zone we are working on
+	rootBucket    string        // bucket part of root (if any)
+	rootDirectory string        // directory part of root (if any)
+	cache         *bucket.Cache // cache for bucket creation status
 }
 
 // Object describes a qingstor object
@@ -132,26 +185,28 @@ type Object struct {
 
 // ------------------------------------------------------------
 
-// Pattern to match a qingstor path
-var matcher = regexp.MustCompile(`^/*([^/]*)(.*)$`)
-
-// parseParse parses a qingstor 'url'
-func qsParsePath(path string) (bucket, key string, err error) {
-	// Pattern to match a qingstor path
-	parts := matcher.FindStringSubmatch(path)
-	if parts == nil {
-		err = errors.Errorf("Couldn't parse bucket out of qingstor path %q", path)
-	} else {
-		bucket, key = parts[1], parts[2]
-		key = strings.Trim(key, "/")
-	}
+// parsePath parses a remote 'url'
+func parsePath(path string) (root string) {
+	root = strings.Trim(path, "/")
 	return
 }
 
-// Split an URL into three parts: protocol host and port
+// split returns bucket and bucketPath from the rootRelativePath
+// relative to f.root
+func (f *Fs) split(rootRelativePath string) (bucketName, bucketPath string) {
+	bucketName, bucketPath = bucket.Split(path.Join(f.root, rootRelativePath))
+	return f.opt.Enc.FromStandardName(bucketName), f.opt.Enc.FromStandardPath(bucketPath)
+}
+
+// split returns bucket and bucketPath from the object
+func (o *Object) split() (bucket, bucketPath string) {
+	return o.fs.split(o.remote)
+}
+
+// Split a URL into three parts: protocol host and port
 func qsParseEndpoint(endpoint string) (protocol, host, port string, err error) {
 	/*
-	  Pattern to match a endpoint,
+	  Pattern to match an endpoint,
 	  eg: "http(s)://qingstor.com:443" --> "http(s)", "qingstor.com", 443
 	      "http(s)//qingstor.com"      --> "http(s)", "qingstor.com", ""
 	      "qingstor.com"               --> "", "qingstor.com", ""
@@ -221,10 +276,46 @@ func qsServiceConnection(opt *Options) (*qs.Service, error) {
 	cf.Protocol = protocol
 	cf.Host = host
 	cf.Port = port
-	cf.ConnectionRetries = opt.ConnectionRetries
+	// unsupported in v3.1: cf.ConnectionRetries = opt.ConnectionRetries
 	cf.Connection = fshttp.NewClient(fs.Config)
 
 	return qs.Init(cf)
+}
+
+func checkUploadChunkSize(cs fs.SizeSuffix) error {
+	if cs < minChunkSize {
+		return errors.Errorf("%s is less than %s", cs, minChunkSize)
+	}
+	return nil
+}
+
+func (f *Fs) setUploadChunkSize(cs fs.SizeSuffix) (old fs.SizeSuffix, err error) {
+	err = checkUploadChunkSize(cs)
+	if err == nil {
+		old, f.opt.ChunkSize = f.opt.ChunkSize, cs
+	}
+	return
+}
+
+func checkUploadCutoff(cs fs.SizeSuffix) error {
+	if cs > maxUploadCutoff {
+		return errors.Errorf("%s is greater than %s", cs, maxUploadCutoff)
+	}
+	return nil
+}
+
+func (f *Fs) setUploadCutoff(cs fs.SizeSuffix) (old fs.SizeSuffix, err error) {
+	err = checkUploadCutoff(cs)
+	if err == nil {
+		old, f.opt.UploadCutoff = f.opt.UploadCutoff, cs
+	}
+	return
+}
+
+// setRoot changes the root of the Fs
+func (f *Fs) setRoot(root string) {
+	f.root = parsePath(root)
+	f.rootBucket, f.rootDirectory = bucket.Split(f.root)
 }
 
 // NewFs constructs an Fs from the path, bucket:path
@@ -235,9 +326,13 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 	if err != nil {
 		return nil, err
 	}
-	bucket, key, err := qsParsePath(root)
+	err = checkUploadChunkSize(opt.ChunkSize)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "qingstor: chunk size")
+	}
+	err = checkUploadCutoff(opt.UploadCutoff)
+	if err != nil {
+		return nil, errors.Wrap(err, "qingstor: upload cutoff")
 	}
 	svc, err := qsServiceConnection(opt)
 	if err != nil {
@@ -249,36 +344,35 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 	}
 
 	f := &Fs{
-		name:   name,
-		root:   key,
-		opt:    *opt,
-		svc:    svc,
-		zone:   opt.Zone,
-		bucket: bucket,
+		name:  name,
+		opt:   *opt,
+		svc:   svc,
+		zone:  opt.Zone,
+		cache: bucket.NewCache(),
 	}
+	f.setRoot(root)
 	f.features = (&fs.Features{
-		ReadMimeType:  true,
-		WriteMimeType: true,
-		BucketBased:   true,
+		ReadMimeType:      true,
+		WriteMimeType:     true,
+		BucketBased:       true,
+		BucketBasedRootOK: true,
+		SlowModTime:       true,
 	}).Fill(f)
 
-	if f.root != "" {
-		if !strings.HasSuffix(f.root, "/") {
-			f.root += "/"
-		}
-		//Check to see if the object exists
-		bucketInit, err := svc.Bucket(bucket, opt.Zone)
+	if f.rootBucket != "" && f.rootDirectory != "" {
+		// Check to see if the object exists
+		bucketInit, err := svc.Bucket(f.rootBucket, opt.Zone)
 		if err != nil {
 			return nil, err
 		}
-		_, err = bucketInit.HeadObject(key, &qs.HeadObjectInput{})
+		encodedDirectory := f.opt.Enc.FromStandardPath(f.rootDirectory)
+		_, err = bucketInit.HeadObject(encodedDirectory, &qs.HeadObjectInput{})
 		if err == nil {
-			f.root = path.Dir(key)
-			if f.root == "." {
-				f.root = ""
-			} else {
-				f.root += "/"
+			newRoot := path.Dir(f.root)
+			if newRoot == "." {
+				newRoot = ""
 			}
+			f.setRoot(newRoot)
 			// return an error with an fs which points to the parent
 			return f, fs.ErrorIsFile
 		}
@@ -293,18 +387,18 @@ func (f *Fs) Name() string {
 
 // Root of the remote (as passed into NewFs)
 func (f *Fs) Root() string {
-	if f.root == "" {
-		return f.bucket
-	}
-	return f.bucket + "/" + f.root
+	return f.root
 }
 
 // String converts this Fs to a string
 func (f *Fs) String() string {
-	if f.root == "" {
-		return fmt.Sprintf("QingStor bucket %s", f.bucket)
+	if f.rootBucket == "" {
+		return "QingStor root"
 	}
-	return fmt.Sprintf("QingStor bucket %s root %s", f.bucket, f.root)
+	if f.rootDirectory == "" {
+		return fmt.Sprintf("QingStor bucket %s", f.rootBucket)
+	}
+	return fmt.Sprintf("QingStor bucket %s path %s", f.rootBucket, f.rootDirectory)
 }
 
 // Precision of the remote
@@ -326,12 +420,12 @@ func (f *Fs) Features() *fs.Features {
 }
 
 // Put created a new object
-func (f *Fs) Put(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
 	fsObj := &Object{
 		fs:     f,
 		remote: src.Remote(),
 	}
-	return fsObj, fsObj.Update(in, src, options...)
+	return fsObj, fsObj.Update(ctx, in, src, options...)
 }
 
 // Copy src to this remote using server side copy operations.
@@ -343,8 +437,9 @@ func (f *Fs) Put(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.
 // Will only be called if src.Fs().Name() == f.Name()
 //
 // If it isn't possible then return fs.ErrorCantCopy
-func (f *Fs) Copy(src fs.Object, remote string) (fs.Object, error) {
-	err := f.Mkdir("")
+func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+	dstBucket, dstPath := f.split(remote)
+	err := f.makeBucket(ctx, dstBucket)
 	if err != nil {
 		return nil, err
 	}
@@ -353,30 +448,29 @@ func (f *Fs) Copy(src fs.Object, remote string) (fs.Object, error) {
 		fs.Debugf(src, "Can't copy - not same remote type")
 		return nil, fs.ErrorCantCopy
 	}
-	srcFs := srcObj.fs
-	key := f.root + remote
-	source := path.Join("/"+srcFs.bucket, srcFs.root+srcObj.remote)
+	srcBucket, srcPath := srcObj.split()
+	source := path.Join("/", srcBucket, srcPath)
 
-	fs.Debugf(f, "Copied, source key is: %s, and dst key is: %s", source, key)
+	// fs.Debugf(f, "Copied, source key is: %s, and dst key is: %s", source, key)
 	req := qs.PutObjectInput{
 		XQSCopySource: &source,
 	}
-	bucketInit, err := f.svc.Bucket(f.bucket, f.zone)
+	bucketInit, err := f.svc.Bucket(dstBucket, f.zone)
 
 	if err != nil {
 		return nil, err
 	}
-	_, err = bucketInit.PutObject(key, &req)
+	_, err = bucketInit.PutObject(dstPath, &req)
 	if err != nil {
-		fs.Debugf(f, "Copied Faild, API Error: %v", err)
+		// fs.Debugf(f, "Copy Failed, API Error: %v", err)
 		return nil, err
 	}
-	return f.NewObject(remote)
+	return f.NewObject(ctx, remote)
 }
 
 // NewObject finds the Object at remote.  If it can't be found
 // it returns the error fs.ErrorObjectNotFound.
-func (f *Fs) NewObject(remote string) (fs.Object, error) {
+func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	return f.newObjectWithInfo(remote, nil)
 }
 
@@ -429,29 +523,27 @@ type listFn func(remote string, object *qs.KeyType, isDirectory bool) error
 // dir is the starting directory, "" for root
 //
 // Set recurse to read sub directories
-func (f *Fs) list(dir string, recurse bool, fn listFn) error {
-	prefix := f.root
-	if dir != "" {
-		prefix += dir + "/"
+func (f *Fs) list(ctx context.Context, bucket, directory, prefix string, addBucket bool, recurse bool, fn listFn) error {
+	if prefix != "" {
+		prefix += "/"
 	}
-
+	if directory != "" {
+		directory += "/"
+	}
 	delimiter := ""
 	if !recurse {
 		delimiter = "/"
 	}
-
 	maxLimit := int(listLimitSize)
 	var marker *string
-
 	for {
-		bucketInit, err := f.svc.Bucket(f.bucket, f.zone)
+		bucketInit, err := f.svc.Bucket(bucket, f.zone)
 		if err != nil {
 			return err
 		}
-		// FIXME need to implement ALL loop
 		req := qs.ListObjectsInput{
 			Delimiter: &delimiter,
-			Prefix:    &prefix,
+			Prefix:    &directory,
 			Limit:     &maxLimit,
 			Marker:    marker,
 		}
@@ -464,7 +556,6 @@ func (f *Fs) list(dir string, recurse bool, fn listFn) error {
 			}
 			return err
 		}
-		rootLength := len(f.root)
 		if !recurse {
 			for _, commonPrefix := range resp.CommonPrefixes {
 				if commonPrefix == nil {
@@ -472,15 +563,18 @@ func (f *Fs) list(dir string, recurse bool, fn listFn) error {
 					continue
 				}
 				remote := *commonPrefix
-				if !strings.HasPrefix(remote, f.root) {
+				remote = f.opt.Enc.ToStandardPath(remote)
+				if !strings.HasPrefix(remote, prefix) {
 					fs.Logf(f, "Odd name received %q", remote)
 					continue
 				}
-				remote = remote[rootLength:]
+				remote = remote[len(prefix):]
+				if addBucket {
+					remote = path.Join(bucket, remote)
+				}
 				if strings.HasSuffix(remote, "/") {
 					remote = remote[:len(remote)-1]
 				}
-
 				err = fn(remote, &qs.KeyType{Key: &remote}, true)
 				if err != nil {
 					return err
@@ -489,20 +583,27 @@ func (f *Fs) list(dir string, recurse bool, fn listFn) error {
 		}
 
 		for _, object := range resp.Keys {
-			key := qs.StringValue(object.Key)
-			if !strings.HasPrefix(key, f.root) {
-				fs.Logf(f, "Odd name received %q", key)
+			remote := qs.StringValue(object.Key)
+			remote = f.opt.Enc.ToStandardPath(remote)
+			if !strings.HasPrefix(remote, prefix) {
+				fs.Logf(f, "Odd name received %q", remote)
 				continue
 			}
-			remote := key[rootLength:]
+			remote = remote[len(prefix):]
+			if addBucket {
+				remote = path.Join(bucket, remote)
+			}
 			err = fn(remote, object, false)
 			if err != nil {
 				return err
 			}
 		}
+		if resp.HasMore != nil && !*resp.HasMore {
+			break
+		}
 		// Use NextMarker if set, otherwise use last Key
 		if resp.NextMarker == nil || *resp.NextMarker == "" {
-			//marker = resp.Keys[len(resp.Keys)-1].Key
+			fs.Errorf(f, "Expecting NextMarker but didn't find one")
 			break
 		} else {
 			marker = resp.NextMarker
@@ -528,20 +629,10 @@ func (f *Fs) itemToDirEntry(remote string, object *qs.KeyType, isDirectory bool)
 	return o, nil
 }
 
-// mark the bucket as being OK
-func (f *Fs) markBucketOK() {
-	if f.bucket != "" {
-		f.bucketOKMu.Lock()
-		f.bucketOK = true
-		f.bucketDeleted = false
-		f.bucketOKMu.Unlock()
-	}
-}
-
 // listDir lists files and directories to out
-func (f *Fs) listDir(dir string) (entries fs.DirEntries, err error) {
+func (f *Fs) listDir(ctx context.Context, bucket, directory, prefix string, addBucket bool) (entries fs.DirEntries, err error) {
 	// List the objects and directories
-	err = f.list(dir, false, func(remote string, object *qs.KeyType, isDirectory bool) error {
+	err = f.list(ctx, bucket, directory, prefix, addBucket, false, func(remote string, object *qs.KeyType, isDirectory bool) error {
 		entry, err := f.itemToDirEntry(remote, object, isDirectory)
 		if err != nil {
 			return err
@@ -555,16 +646,12 @@ func (f *Fs) listDir(dir string) (entries fs.DirEntries, err error) {
 		return nil, err
 	}
 	// bucket must be present if listing succeeded
-	f.markBucketOK()
+	f.cache.MarkOK(bucket)
 	return entries, nil
 }
 
 // listBuckets lists the buckets to out
-func (f *Fs) listBuckets(dir string) (entries fs.DirEntries, err error) {
-	if dir != "" {
-		return nil, fs.ErrorListBucketRequired
-	}
-
+func (f *Fs) listBuckets(ctx context.Context) (entries fs.DirEntries, err error) {
 	req := qs.ListBucketsInput{
 		Location: &f.zone,
 	}
@@ -574,7 +661,7 @@ func (f *Fs) listBuckets(dir string) (entries fs.DirEntries, err error) {
 	}
 
 	for _, bucket := range resp.Buckets {
-		d := fs.NewDir(qs.StringValue(bucket.Name), qs.TimeValue(bucket.Created))
+		d := fs.NewDir(f.opt.Enc.ToStandardName(qs.StringValue(bucket.Name)), qs.TimeValue(bucket.Created))
 		entries = append(entries, d)
 	}
 	return entries, nil
@@ -589,11 +676,15 @@ func (f *Fs) listBuckets(dir string) (entries fs.DirEntries, err error) {
 //
 // This should return ErrDirNotFound if the directory isn't
 // found.
-func (f *Fs) List(dir string) (entries fs.DirEntries, err error) {
-	if f.bucket == "" {
-		return f.listBuckets(dir)
+func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
+	bucket, directory := f.split(dir)
+	if bucket == "" {
+		if directory != "" {
+			return nil, fs.ErrorListBucketRequired
+		}
+		return f.listBuckets(ctx)
 	}
-	return f.listDir(dir)
+	return f.listDir(ctx, bucket, directory, f.rootDirectory, f.rootBucket == "")
 }
 
 // ListR lists the objects and directories of the Fs starting
@@ -612,107 +703,106 @@ func (f *Fs) List(dir string) (entries fs.DirEntries, err error) {
 //
 // Don't implement this unless you have a more efficient way
 // of listing recursively that doing a directory traversal.
-func (f *Fs) ListR(dir string, callback fs.ListRCallback) (err error) {
-	if f.bucket == "" {
-		return fs.ErrorListBucketRequired
-	}
+func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) (err error) {
+	bucket, directory := f.split(dir)
 	list := walk.NewListRHelper(callback)
-	err = f.list(dir, true, func(remote string, object *qs.KeyType, isDirectory bool) error {
-		entry, err := f.itemToDirEntry(remote, object, isDirectory)
+	listR := func(bucket, directory, prefix string, addBucket bool) error {
+		return f.list(ctx, bucket, directory, prefix, addBucket, true, func(remote string, object *qs.KeyType, isDirectory bool) error {
+			entry, err := f.itemToDirEntry(remote, object, isDirectory)
+			if err != nil {
+				return err
+			}
+			return list.Add(entry)
+		})
+	}
+	if bucket == "" {
+		entries, err := f.listBuckets(ctx)
 		if err != nil {
 			return err
 		}
-		return list.Add(entry)
-	})
-	if err != nil {
-		return err
+		for _, entry := range entries {
+			err = list.Add(entry)
+			if err != nil {
+				return err
+			}
+			bucket := entry.Remote()
+			err = listR(bucket, "", f.rootDirectory, true)
+			if err != nil {
+				return err
+			}
+			// bucket must be present if listing succeeded
+			f.cache.MarkOK(bucket)
+		}
+	} else {
+		err = listR(bucket, directory, f.rootDirectory, f.rootBucket == "")
+		if err != nil {
+			return err
+		}
+		// bucket must be present if listing succeeded
+		f.cache.MarkOK(bucket)
 	}
-	// bucket must be present if listing succeeded
-	f.markBucketOK()
 	return list.Flush()
 }
 
-// Check if the bucket exists
-func (f *Fs) dirExists() (bool, error) {
-	bucketInit, err := f.svc.Bucket(f.bucket, f.zone)
-	if err != nil {
-		return false, err
-	}
-
-	_, err = bucketInit.Head()
-	if err == nil {
-		return true, nil
-	}
-
-	if e, ok := err.(*qsErr.QingStorError); ok {
-		if e.StatusCode == http.StatusNotFound {
-			err = nil
-		}
-	}
-	return false, err
+// Mkdir creates the bucket if it doesn't exist
+func (f *Fs) Mkdir(ctx context.Context, dir string) error {
+	bucket, _ := f.split(dir)
+	return f.makeBucket(ctx, bucket)
 }
 
-// Mkdir creates the bucket if it doesn't exist
-func (f *Fs) Mkdir(dir string) error {
-	f.bucketOKMu.Lock()
-	defer f.bucketOKMu.Unlock()
-	if f.bucketOK {
-		return nil
-	}
-
-	bucketInit, err := f.svc.Bucket(f.bucket, f.zone)
-	if err != nil {
-		return err
-	}
-	/* When delete a bucket, qingstor need about 60 second to sync status;
-	So, need wait for it sync end if we try to operation a just deleted bucket
-	*/
-	retries := 0
-	for retries <= 120 {
-		statistics, err := bucketInit.GetStatistics()
-		if statistics == nil || err != nil {
-			break
-		}
-		switch *statistics.Status {
-		case "deleted":
-			fs.Debugf(f, "Wiat for qingstor sync bucket status, retries: %d", retries)
-			time.Sleep(time.Second * 1)
-			retries++
-			continue
-		default:
-			break
-		}
-		break
-	}
-
-	if !f.bucketDeleted {
-		exists, err := f.dirExists()
-		if err == nil {
-			f.bucketOK = exists
-		}
-		if err != nil || exists {
+// makeBucket creates the bucket if it doesn't exist
+func (f *Fs) makeBucket(ctx context.Context, bucket string) error {
+	return f.cache.Create(bucket, func() error {
+		bucketInit, err := f.svc.Bucket(bucket, f.zone)
+		if err != nil {
 			return err
 		}
-	}
-
-	_, err = bucketInit.Put()
-	if e, ok := err.(*qsErr.QingStorError); ok {
-		if e.StatusCode == http.StatusConflict {
-			err = nil
+		/* When delete a bucket, qingstor need about 60 second to sync status;
+		So, need wait for it sync end if we try to operation a just deleted bucket
+		*/
+		wasDeleted := false
+		retries := 0
+		for retries <= 120 {
+			statistics, err := bucketInit.GetStatistics()
+			if statistics == nil || err != nil {
+				break
+			}
+			switch *statistics.Status {
+			case "deleted":
+				fs.Debugf(f, "Wait for qingstor bucket to be deleted, retries: %d", retries)
+				time.Sleep(time.Second * 1)
+				retries++
+				wasDeleted = true
+				continue
+			default:
+				break
+			}
+			break
 		}
-	}
 
-	if err == nil {
-		f.bucketOK = true
-		f.bucketDeleted = false
-	}
-
-	return err
+		retries = 0
+		for retries <= 120 {
+			_, err = bucketInit.Put()
+			if e, ok := err.(*qsErr.QingStorError); ok {
+				if e.StatusCode == http.StatusConflict {
+					if wasDeleted {
+						fs.Debugf(f, "Wait for qingstor bucket to be creatable, retries: %d", retries)
+						time.Sleep(time.Second * 1)
+						retries++
+						continue
+					}
+					err = nil
+				}
+			}
+			break
+		}
+		return err
+	}, nil)
 }
 
-// dirIsEmpty check if the bucket empty
-func (f *Fs) dirIsEmpty() (bool, error) {
-	bucketInit, err := f.svc.Bucket(f.bucket, f.zone)
+// bucketIsEmpty check if the bucket empty
+func (f *Fs) bucketIsEmpty(bucket string) (bool, error) {
+	bucketInit, err := f.svc.Bucket(bucket, f.zone)
 	if err != nil {
 		return true, err
 	}
@@ -729,54 +819,118 @@ func (f *Fs) dirIsEmpty() (bool, error) {
 }
 
 // Rmdir delete a bucket
-func (f *Fs) Rmdir(dir string) error {
-	f.bucketOKMu.Lock()
-	defer f.bucketOKMu.Unlock()
-	if f.root != "" || dir != "" {
+func (f *Fs) Rmdir(ctx context.Context, dir string) error {
+	bucket, directory := f.split(dir)
+	if bucket == "" || directory != "" {
 		return nil
 	}
-
-	isEmpty, err := f.dirIsEmpty()
+	isEmpty, err := f.bucketIsEmpty(bucket)
 	if err != nil {
 		return err
 	}
 	if !isEmpty {
-		fs.Debugf(f, "The bucket %s you tried to delete not empty.", f.bucket)
+		// fs.Debugf(f, "The bucket %s you tried to delete not empty.", bucket)
 		return errors.New("BucketNotEmpty: The bucket you tried to delete is not empty")
 	}
+	return f.cache.Remove(bucket, func() error {
+		// fs.Debugf(f, "Deleting the bucket %s", bucket)
+		bucketInit, err := f.svc.Bucket(bucket, f.zone)
+		if err != nil {
+			return err
+		}
+		retries := 0
+		for retries <= 10 {
+			_, delErr := bucketInit.Delete()
+			if delErr != nil {
+				if e, ok := delErr.(*qsErr.QingStorError); ok {
+					switch e.Code {
+					// The status of "lease" takes a few seconds to "ready" when creating a new bucket
+					// wait for lease status ready
+					case "lease_not_ready":
+						fs.Debugf(f, "QingStor bucket lease not ready, retries: %d", retries)
+						retries++
+						time.Sleep(time.Second * 1)
+						continue
+					default:
+						err = e
+						break
+					}
+				}
+			} else {
+				err = delErr
+			}
+			break
+		}
+		return err
+	})
+}
 
-	fs.Debugf(f, "Tried to delete the bucket %s", f.bucket)
-	bucketInit, err := f.svc.Bucket(f.bucket, f.zone)
+// cleanUpBucket removes all pending multipart uploads for a given bucket
+func (f *Fs) cleanUpBucket(ctx context.Context, bucket string) (err error) {
+	fs.Infof(f, "cleaning bucket %q of pending multipart uploads older than 24 hours", bucket)
+	bucketInit, err := f.svc.Bucket(bucket, f.zone)
 	if err != nil {
 		return err
 	}
-	retries := 0
-	for retries <= 10 {
-		_, delErr := bucketInit.Delete()
-		if delErr != nil {
-			if e, ok := delErr.(*qsErr.QingStorError); ok {
-				switch e.Code {
-				// The status of "lease" takes a few seconds to "ready" when creating a new bucket
-				// wait for lease status ready
-				case "lease_not_ready":
-					fs.Debugf(f, "QingStor bucket lease not ready, retries: %d", retries)
-					retries++
-					time.Sleep(time.Second * 1)
-					continue
-				default:
-					err = e
-					break
+	maxLimit := int(listLimitSize)
+	var marker *string
+	for {
+		req := qs.ListMultipartUploadsInput{
+			Limit:     &maxLimit,
+			KeyMarker: marker,
+		}
+		var resp *qs.ListMultipartUploadsOutput
+		resp, err = bucketInit.ListMultipartUploads(&req)
+		if err != nil {
+			return errors.Wrap(err, "clean up bucket list multipart uploads")
+		}
+		for _, upload := range resp.Uploads {
+			if upload.Created != nil && upload.Key != nil && upload.UploadID != nil {
+				age := time.Since(*upload.Created)
+				if age > 24*time.Hour {
+					fs.Infof(f, "removing pending multipart upload for %q dated %v (%v ago)", *upload.Key, upload.Created, age)
+					req := qs.AbortMultipartUploadInput{
+						UploadID: upload.UploadID,
+					}
+					_, abortErr := bucketInit.AbortMultipartUpload(*upload.Key, &req)
+					if abortErr != nil {
+						err = errors.Wrapf(abortErr, "failed to remove multipart upload for %q", *upload.Key)
+						fs.Errorf(f, "%v", err)
+					}
+				} else {
+					fs.Debugf(f, "ignoring pending multipart upload for %q dated %v (%v ago)", *upload.Key, upload.Created, age)
 				}
 			}
-		} else {
-			err = delErr
 		}
-		break
+		if resp.HasMore != nil && !*resp.HasMore {
+			break
+		}
+		// Use NextMarker if set, otherwise use last Key
+		if resp.NextKeyMarker == nil || *resp.NextKeyMarker == "" {
+			fs.Errorf(f, "Expecting NextKeyMarker but didn't find one")
+			break
+		} else {
+			marker = resp.NextKeyMarker
+		}
 	}
+	return err
+}
 
-	if err == nil {
-		f.bucketOK = false
-		f.bucketDeleted = true
+// CleanUp removes all pending multipart uploads
+func (f *Fs) CleanUp(ctx context.Context) (err error) {
+	if f.rootBucket != "" {
+		return f.cleanUpBucket(ctx, f.rootBucket)
+	}
+	entries, err := f.listBuckets(ctx)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		cleanErr := f.cleanUpBucket(ctx, f.opt.Enc.FromStandardName(entry.Remote()))
+		if err != nil {
+			fs.Errorf(f, "Failed to cleanup bucket: %q", cleanErr)
+			err = cleanErr
+		}
 	}
 	return err
 }
@@ -785,16 +939,15 @@ func (f *Fs) Rmdir(dir string) error {
 //
 // it also sets the info
 func (o *Object) readMetaData() (err error) {
-	bucketInit, err := o.fs.svc.Bucket(o.fs.bucket, o.fs.zone)
+	bucket, bucketPath := o.split()
+	bucketInit, err := o.fs.svc.Bucket(bucket, o.fs.zone)
 	if err != nil {
 		return err
 	}
-
-	key := o.fs.root + o.remote
-	fs.Debugf(o, "Read metadata of key: %s", key)
-	resp, err := bucketInit.HeadObject(key, &qs.HeadObjectInput{})
+	// fs.Debugf(o, "Read metadata of key: %s", key)
+	resp, err := bucketInit.HeadObject(bucketPath, &qs.HeadObjectInput{})
 	if err != nil {
-		fs.Debugf(o, "Read metadata faild, API Error: %v", err)
+		// fs.Debugf(o, "Read metadata failed, API Error: %v", err)
 		if e, ok := err.(*qsErr.QingStorError); ok {
 			if e.StatusCode == http.StatusNotFound {
 				return fs.ErrorObjectNotFound
@@ -832,7 +985,7 @@ func (o *Object) readMetaData() (err error) {
 
 // ModTime returns the modification date of the file
 // It should return a best guess if one isn't available
-func (o *Object) ModTime() time.Time {
+func (o *Object) ModTime(ctx context.Context) time.Time {
 	err := o.readMetaData()
 	if err != nil {
 		fs.Logf(o, "Failed to read metadata, %v", err)
@@ -843,23 +996,23 @@ func (o *Object) ModTime() time.Time {
 }
 
 // SetModTime sets the modification time of the local fs object
-func (o *Object) SetModTime(modTime time.Time) error {
+func (o *Object) SetModTime(ctx context.Context, modTime time.Time) error {
 	err := o.readMetaData()
 	if err != nil {
 		return err
 	}
 	o.lastModified = modTime
-	mimeType := fs.MimeType(o)
+	mimeType := fs.MimeType(ctx, o)
 
 	if o.size >= maxSizeForCopy {
 		fs.Debugf(o, "SetModTime is unsupported for objects bigger than %v bytes", fs.SizeSuffix(maxSizeForCopy))
 		return nil
 	}
 	// Copy the object to itself to update the metadata
-	key := o.fs.root + o.remote
-	sourceKey := path.Join("/", o.fs.bucket, key)
+	bucket, bucketPath := o.split()
+	sourceKey := path.Join("/", bucket, bucketPath)
 
-	bucketInit, err := o.fs.svc.Bucket(o.fs.bucket, o.fs.zone)
+	bucketInit, err := o.fs.svc.Bucket(bucket, o.fs.zone)
 	if err != nil {
 		return err
 	}
@@ -868,20 +1021,21 @@ func (o *Object) SetModTime(modTime time.Time) error {
 		XQSCopySource: &sourceKey,
 		ContentType:   &mimeType,
 	}
-	_, err = bucketInit.PutObject(key, &req)
+	_, err = bucketInit.PutObject(bucketPath, &req)
 
 	return err
 }
 
 // Open opens the file for read.  Call Close() on the returned io.ReadCloser
-func (o *Object) Open(options ...fs.OpenOption) (io.ReadCloser, error) {
-	bucketInit, err := o.fs.svc.Bucket(o.fs.bucket, o.fs.zone)
+func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
+	bucket, bucketPath := o.split()
+	bucketInit, err := o.fs.svc.Bucket(bucket, o.fs.zone)
 	if err != nil {
 		return nil, err
 	}
 
-	key := o.fs.root + o.remote
 	req := qs.GetObjectInput{}
+	fs.FixRangeOption(options, o.size)
 	for _, option := range options {
 		switch option.(type) {
 		case *fs.RangeOption, *fs.SeekOption:
@@ -893,7 +1047,7 @@ func (o *Object) Open(options ...fs.OpenOption) (io.ReadCloser, error) {
 			}
 		}
 	}
-	resp, err := bucketInit.GetObject(key, &req)
+	resp, err := bucketInit.GetObject(bucketPath, &req)
 	if err != nil {
 		return nil, err
 	}
@@ -901,28 +1055,36 @@ func (o *Object) Open(options ...fs.OpenOption) (io.ReadCloser, error) {
 }
 
 // Update in to the object
-func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
+func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
 	// The maximum size of upload object is multipartUploadSize * MaxMultipleParts
-	err := o.fs.Mkdir("")
+	bucket, bucketPath := o.split()
+	err := o.fs.makeBucket(ctx, bucket)
 	if err != nil {
 		return err
 	}
 
-	key := o.fs.root + o.remote
 	// Guess the content type
-	mimeType := fs.MimeType(src)
+	mimeType := fs.MimeType(ctx, src)
 
 	req := uploadInput{
-		body:     in,
-		qsSvc:    o.fs.svc,
-		bucket:   o.fs.bucket,
-		zone:     o.fs.zone,
-		key:      key,
-		mimeType: mimeType,
+		body:        in,
+		qsSvc:       o.fs.svc,
+		bucket:      bucket,
+		zone:        o.fs.zone,
+		key:         bucketPath,
+		mimeType:    mimeType,
+		partSize:    int64(o.fs.opt.ChunkSize),
+		concurrency: o.fs.opt.UploadConcurrency,
 	}
 	uploader := newUploader(&req)
 
-	err = uploader.upload()
+	size := src.Size()
+	multipart := size < 0 || size >= int64(o.fs.opt.UploadCutoff)
+	if multipart {
+		err = uploader.upload()
+	} else {
+		err = uploader.singlePartUpload(in, size)
+	}
 	if err != nil {
 		return err
 	}
@@ -932,14 +1094,13 @@ func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOptio
 }
 
 // Remove this object
-func (o *Object) Remove() error {
-	bucketInit, err := o.fs.svc.Bucket(o.fs.bucket, o.fs.zone)
+func (o *Object) Remove(ctx context.Context) error {
+	bucket, bucketPath := o.split()
+	bucketInit, err := o.fs.svc.Bucket(bucket, o.fs.zone)
 	if err != nil {
 		return err
 	}
-
-	key := o.fs.root + o.remote
-	_, err = bucketInit.DeleteObject(key)
+	_, err = bucketInit.DeleteObject(bucketPath)
 	return err
 }
 
@@ -952,7 +1113,7 @@ var matchMd5 = regexp.MustCompile(`^[0-9a-f]{32}$`)
 
 // Hash returns the selected checksum of the file
 // If no checksum is available it returns ""
-func (o *Object) Hash(t hash.Type) (string, error) {
+func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
 	if t != hash.MD5 {
 		return "", hash.ErrUnsupported
 	}
@@ -989,7 +1150,7 @@ func (o *Object) Size() int64 {
 }
 
 // MimeType of an Object if known, "" otherwise
-func (o *Object) MimeType() string {
+func (o *Object) MimeType(ctx context.Context) string {
 	err := o.readMetaData()
 	if err != nil {
 		fs.Logf(o, "Failed to read metadata: %v", err)
@@ -1000,9 +1161,10 @@ func (o *Object) MimeType() string {
 
 // Check the interfaces are satisfied
 var (
-	_ fs.Fs        = &Fs{}
-	_ fs.Copier    = &Fs{}
-	_ fs.Object    = &Object{}
-	_ fs.ListRer   = &Fs{}
-	_ fs.MimeTyper = &Object{}
+	_ fs.Fs         = &Fs{}
+	_ fs.CleanUpper = &Fs{}
+	_ fs.Copier     = &Fs{}
+	_ fs.Object     = &Object{}
+	_ fs.ListRer    = &Fs{}
+	_ fs.MimeTyper  = &Object{}
 )

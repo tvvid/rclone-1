@@ -3,6 +3,7 @@ package filter
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -11,8 +12,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ncw/rclone/fs"
 	"github.com/pkg/errors"
+	"github.com/rclone/rclone/fs"
+	"golang.org/x/sync/errgroup"
 )
 
 // Active is the globally active filter
@@ -75,7 +77,7 @@ func (rs *rules) len() int {
 // FilesMap describes the map of files to transfer
 type FilesMap map[string]struct{}
 
-// Opt configues the filter
+// Opt configures the filter
 type Opt struct {
 	DeleteExcluded bool
 	FilterRule     []string
@@ -86,6 +88,7 @@ type Opt struct {
 	IncludeRule    []string
 	IncludeFrom    []string
 	FilesFrom      []string
+	FilesFromRaw   []string
 	MinAge         fs.Duration
 	MaxAge         fs.Duration
 	MinSize        fs.SizeSuffix
@@ -148,7 +151,7 @@ func NewFilter(opt *Opt) (f *Filter, err error) {
 		addImplicitExclude = true
 	}
 	for _, rule := range f.Opt.IncludeFrom {
-		err := forEachLine(rule, func(line string) error {
+		err := forEachLine(rule, false, func(line string) error {
 			return f.Add(true, line)
 		})
 		if err != nil {
@@ -164,7 +167,7 @@ func NewFilter(opt *Opt) (f *Filter, err error) {
 		foundExcludeRule = true
 	}
 	for _, rule := range f.Opt.ExcludeFrom {
-		err := forEachLine(rule, func(line string) error {
+		err := forEachLine(rule, false, func(line string) error {
 			return f.Add(false, line)
 		})
 		if err != nil {
@@ -184,20 +187,42 @@ func NewFilter(opt *Opt) (f *Filter, err error) {
 		}
 	}
 	for _, rule := range f.Opt.FilterFrom {
-		err := forEachLine(rule, f.AddRule)
+		err := forEachLine(rule, false, f.AddRule)
 		if err != nil {
 			return nil, err
 		}
 	}
+
+	inActive := f.InActive()
+
 	for _, rule := range f.Opt.FilesFrom {
+		if !inActive {
+			return nil, fmt.Errorf("The usage of --files-from overrides all other filters, it should be used alone or with --files-from-raw")
+		}
 		f.initAddFile() // init to show --files-from set even if no files within
-		err := forEachLine(rule, func(line string) error {
+		err := forEachLine(rule, false, func(line string) error {
 			return f.AddFile(line)
 		})
 		if err != nil {
 			return nil, err
 		}
 	}
+
+	for _, rule := range f.Opt.FilesFromRaw {
+		// --files-from-raw can be used with --files-from, hence we do
+		// not need to get the value of f.InActive again
+		if !inActive {
+			return nil, fmt.Errorf("The usage of --files-from-raw overrides all other filters, it should be used alone or with --files-from")
+		}
+		f.initAddFile() // init to show --files-from set even if no files within
+		err := forEachLine(rule, true, func(line string) error {
+			return f.AddFile(line)
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	if addImplicitExclude {
 		err = f.Add(false, "/**")
 		if err != nil {
@@ -371,12 +396,12 @@ func (f *Filter) ListContainsExcludeFile(entries fs.DirEntries) bool {
 
 // IncludeDirectory returns a function which checks whether this
 // directory should be included in the sync or not.
-func (f *Filter) IncludeDirectory(fs fs.Fs) func(string) (bool, error) {
+func (f *Filter) IncludeDirectory(ctx context.Context, fs fs.Fs) func(string) (bool, error) {
 	return func(remote string) (bool, error) {
 		remote = strings.Trim(remote, "/")
 		// first check if we need to remove directory based on
 		// the exclude file
-		excl, err := f.DirContainsExcludeFile(fs, remote)
+		excl, err := f.DirContainsExcludeFile(ctx, fs, remote)
 		if err != nil {
 			return false, err
 		}
@@ -401,11 +426,11 @@ func (f *Filter) IncludeDirectory(fs fs.Fs) func(string) (bool, error) {
 }
 
 // DirContainsExcludeFile checks if exclude file is present in a
-// directroy. If fs is nil, it works properly if ExcludeFile is an
+// directory. If fs is nil, it works properly if ExcludeFile is an
 // empty string (for testing).
-func (f *Filter) DirContainsExcludeFile(fremote fs.Fs, remote string) (bool, error) {
+func (f *Filter) DirContainsExcludeFile(ctx context.Context, fremote fs.Fs, remote string) (bool, error) {
 	if len(f.Opt.ExcludeFile) > 0 {
-		exists, err := fs.FileExists(fremote, path.Join(remote, f.Opt.ExcludeFile))
+		exists, err := fs.FileExists(ctx, fremote, path.Join(remote, f.Opt.ExcludeFile))
 		if err != nil {
 			return false, err
 		}
@@ -442,11 +467,11 @@ func (f *Filter) Include(remote string, size int64, modTime time.Time) bool {
 // IncludeObject returns whether this object should be included into
 // the sync or not. This is a convenience function to avoid calling
 // o.ModTime(), which is an expensive operation.
-func (f *Filter) IncludeObject(o fs.Object) bool {
+func (f *Filter) IncludeObject(ctx context.Context, o fs.Object) bool {
 	var modTime time.Time
 
 	if !f.ModTimeFrom.IsZero() || !f.ModTimeTo.IsZero() {
-		modTime = o.ModTime()
+		modTime = o.ModTime(ctx)
 	} else {
 		modTime = time.Unix(0, 0)
 	}
@@ -456,19 +481,26 @@ func (f *Filter) IncludeObject(o fs.Object) bool {
 
 // forEachLine calls fn on every line in the file pointed to by path
 //
-// It ignores empty lines and lines starting with '#' or ';'
-func forEachLine(path string, fn func(string) error) (err error) {
-	in, err := os.Open(path)
-	if err != nil {
-		return err
+// It ignores empty lines and lines starting with '#' or ';' if raw is false
+func forEachLine(path string, raw bool, fn func(string) error) (err error) {
+	var scanner *bufio.Scanner
+	if path == "-" {
+		scanner = bufio.NewScanner(os.Stdin)
+	} else {
+		in, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		scanner = bufio.NewScanner(in)
+		defer fs.CheckClose(in, &err)
 	}
-	defer fs.CheckClose(in, &err)
-	scanner := bufio.NewScanner(in)
 	for scanner.Scan() {
 		line := scanner.Text()
-		line = strings.TrimSpace(line)
-		if len(line) == 0 || line[0] == '#' || line[0] == ';' {
-			continue
+		if !raw {
+			line = strings.TrimSpace(line)
+			if len(line) == 0 || line[0] == '#' || line[0] == ';' {
+				continue
+			}
 		}
 		err := fn(line)
 		if err != nil {
@@ -506,22 +538,54 @@ func (f *Filter) HaveFilesFrom() bool {
 var errFilesFromNotSet = errors.New("--files-from not set so can't use Filter.ListR")
 
 // MakeListR makes function to return all the files set using --files-from
-func (f *Filter) MakeListR(NewObject func(remote string) (fs.Object, error)) fs.ListRFn {
-	return func(dir string, callback fs.ListRCallback) error {
+func (f *Filter) MakeListR(ctx context.Context, NewObject func(ctx context.Context, remote string) (fs.Object, error)) fs.ListRFn {
+	return func(ctx context.Context, dir string, callback fs.ListRCallback) error {
 		if !f.HaveFilesFrom() {
 			return errFilesFromNotSet
 		}
-		var entries fs.DirEntries
-		for remote := range f.files {
-			entry, err := NewObject(remote)
-			if err == fs.ErrorObjectNotFound {
-				// Skip files that are not found
-			} else if err != nil {
-				return err
-			} else {
-				entries = append(entries, entry)
-			}
+		var (
+			remotes = make(chan string, fs.Config.Checkers)
+			g       errgroup.Group
+		)
+		for i := 0; i < fs.Config.Checkers; i++ {
+			g.Go(func() (err error) {
+				var entries = make(fs.DirEntries, 1)
+				for remote := range remotes {
+					entries[0], err = NewObject(ctx, remote)
+					if err == fs.ErrorObjectNotFound {
+						// Skip files that are not found
+					} else if err != nil {
+						return err
+					} else {
+						err = callback(entries)
+						if err != nil {
+							return err
+						}
+					}
+				}
+				return nil
+			})
 		}
-		return callback(entries)
+		for remote := range f.files {
+			remotes <- remote
+		}
+		close(remotes)
+		return g.Wait()
 	}
+}
+
+// UsesDirectoryFilters returns true if the filter uses directory
+// filters and false if it doesn't.
+//
+// This is used in deciding whether to walk directories or use ListR
+func (f *Filter) UsesDirectoryFilters() bool {
+	if len(f.dirRules.rules) == 0 {
+		return false
+	}
+	rule := f.dirRules.rules[0]
+	re := rule.Regexp.String()
+	if rule.Include == true && re == "^.*$" {
+		return false
+	}
+	return true
 }

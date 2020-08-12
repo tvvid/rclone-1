@@ -5,14 +5,26 @@
 package rc
 
 import (
+	"context"
+
 	"github.com/pkg/errors"
 )
 
-var optionBlock = map[string]interface{}{}
+var (
+	optionBlock  = map[string]interface{}{}
+	optionReload = map[string]func() error{}
+)
 
 // AddOption adds an option set
 func AddOption(name string, option interface{}) {
 	optionBlock[name] = option
+}
+
+// AddOptionReload adds an option set with a reload function to be
+// called when options are changed
+func AddOptionReload(name string, option interface{}, reload func() error) {
+	optionBlock[name] = option
+	optionReload[name] = reload
 }
 
 func init() {
@@ -26,7 +38,7 @@ func init() {
 }
 
 // Show the list of all the option blocks
-func rcOptionsBlocks(in Params) (out Params, err error) {
+func rcOptionsBlocks(ctx context.Context, in Params) (out Params, err error) {
 	options := []string{}
 	for name := range optionBlock {
 		options = append(options, name)
@@ -51,7 +63,7 @@ map to the external options very easily with a few exceptions.
 }
 
 // Show the list of all the option blocks
-func rcOptionsGet(in Params) (out Params, err error) {
+func rcOptionsGet(ctx context.Context, in Params) (out Params, err error) {
 	out = make(Params)
 	for name, options := range optionBlock {
 		out[name] = options
@@ -74,12 +86,26 @@ Repeated as often as required.
 Only supply the options you wish to change.  If an option is unknown
 it will be silently ignored.  Not all options will have an effect when
 changed like this.
+
+For example:
+
+This sets DEBUG level logs (-vv)
+
+    rclone rc options/set --json '{"main": {"LogLevel": 8}}'
+
+And this sets INFO level logs (-v)
+
+    rclone rc options/set --json '{"main": {"LogLevel": 7}}'
+
+And this sets NOTICE level logs (normal without -v)
+
+    rclone rc options/set --json '{"main": {"LogLevel": 6}}'
 `,
 	})
 }
 
 // Set an option in an option block
-func rcOptionsSet(in Params) (out Params, err error) {
+func rcOptionsSet(ctx context.Context, in Params) (out Params, err error) {
 	for name, options := range in {
 		current := optionBlock[name]
 		if current == nil {
@@ -89,7 +115,12 @@ func rcOptionsSet(in Params) (out Params, err error) {
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to write options from block %q", name)
 		}
-
+		if reload := optionReload[name]; reload != nil {
+			err = reload()
+			if err != nil {
+				return nil, errors.Wrapf(err, "failed to reload options from block %q", name)
+			}
+		}
 	}
 	return out, nil
 }

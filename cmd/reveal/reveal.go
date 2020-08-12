@@ -3,16 +3,16 @@ package reveal
 import (
 	"fmt"
 
-	"github.com/ncw/rclone/cmd"
-	"github.com/ncw/rclone/fs/config/obscure"
+	"github.com/rclone/rclone/cmd"
+	"github.com/rclone/rclone/fs/config/obscure"
 	"github.com/spf13/cobra"
 )
 
 func init() {
-	cmd.Root.AddCommand(commandDefintion)
+	cmd.Root.AddCommand(commandDefinition)
 }
 
-var commandDefintion = &cobra.Command{
+var commandDefinition = &cobra.Command{
 	Use:   "reveal password",
 	Short: `Reveal obscured password from rclone.conf`,
 	Run: func(command *cobra.Command, args []string) {

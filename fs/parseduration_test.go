@@ -2,6 +2,7 @@ package fs
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -36,6 +37,10 @@ func TestParseDuration(t *testing.T) {
 		{"1x", 0, true},
 		{"off", time.Duration(DurationOff), false},
 		{"1h2m3s", time.Hour + 2*time.Minute + 3*time.Second, false},
+		{"2001-02-03", time.Since(time.Date(2001, 2, 3, 0, 0, 0, 0, time.Local)), false},
+		{"2001-02-03 10:11:12", time.Since(time.Date(2001, 2, 3, 10, 11, 12, 0, time.Local)), false},
+		{"2001-02-03T10:11:12", time.Since(time.Date(2001, 2, 3, 10, 11, 12, 0, time.Local)), false},
+		{"2001-02-03T10:11:12.123Z", time.Since(time.Date(2001, 2, 3, 10, 11, 12, 123, time.UTC)), false},
 	} {
 		duration, err := ParseDuration(test.in)
 		if test.err {
@@ -43,7 +48,12 @@ func TestParseDuration(t *testing.T) {
 		} else {
 			require.NoError(t, err)
 		}
-		assert.Equal(t, test.want, duration)
+		if strings.HasPrefix(test.in, "2001-") {
+			ok := duration > test.want-time.Second && duration < test.want+time.Second
+			assert.True(t, ok, test.in)
+		} else {
+			assert.Equal(t, test.want, duration)
+		}
 	}
 }
 
@@ -81,6 +91,44 @@ func TestDurationString(t *testing.T) {
 		reverse, err := ParseDuration(test.want)
 		assert.NoError(t, err)
 		assert.Equal(t, test.in, reverse)
+	}
+}
+
+func TestDurationReadableString(t *testing.T) {
+	for _, test := range []struct {
+		negative bool
+		in       time.Duration
+		want     string
+	}{
+		// Edge Cases
+		{false, time.Duration(DurationOff), "off"},
+		// Base Cases
+		{false, time.Duration(0), "0s"},
+		{true, time.Millisecond, "1ms"},
+		{true, time.Second, "1s"},
+		{true, time.Minute, "1m"},
+		{true, (3 * time.Minute) / 2, "1m30s"},
+		{true, time.Hour, "1h"},
+		{true, time.Hour * 24, "1d"},
+		{true, time.Hour * 24 * 7, "1w"},
+		{true, time.Hour * 24 * 365, "1y"},
+		// Composite Cases
+		{true, time.Hour + 2*time.Minute + 3*time.Second, "1h2m3s"},
+		{true, time.Hour * 24 * (365 + 14), "1y2w"},
+		{true, time.Hour*24*4 + time.Hour*3 + time.Minute*2 + time.Second, "4d3h2m1s"},
+		{true, time.Hour * 24 * (365*3 + 7*2 + 1), "3y2w1d"},
+		{true, time.Hour*24*(365*3+7*2+1) + time.Hour*2 + time.Second, "3y2w1d2h1s"},
+		{true, time.Hour*24*(365*3+7*2+1) + time.Second, "3y2w1d1s"},
+		{true, time.Hour*24*(365+7*2+3) + time.Hour*4 + time.Minute*5 + time.Second*6 + time.Millisecond*7, "1y2w3d4h5m6s7ms"},
+	} {
+		got := Duration(test.in).ReadableString()
+		assert.Equal(t, test.want, got)
+
+		// Test Negative Case
+		if test.negative {
+			got = Duration(-test.in).ReadableString()
+			assert.Equal(t, "-"+test.want, got)
+		}
 	}
 }
 

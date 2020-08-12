@@ -1,13 +1,15 @@
 package about
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 
-	"github.com/ncw/rclone/cmd"
-	"github.com/ncw/rclone/fs"
 	"github.com/pkg/errors"
+	"github.com/rclone/rclone/cmd"
+	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/config/flags"
 	"github.com/spf13/cobra"
 )
 
@@ -18,8 +20,9 @@ var (
 
 func init() {
 	cmd.Root.AddCommand(commandDefinition)
-	commandDefinition.Flags().BoolVar(&jsonOutput, "json", false, "Format output as JSON")
-	commandDefinition.Flags().BoolVar(&fullOutput, "full", false, "Full numbers instead of SI units")
+	cmdFlags := commandDefinition.Flags()
+	flags.BoolVarP(cmdFlags, &jsonOutput, "json", "", false, "Format output as JSON")
+	flags.BoolVarP(cmdFlags, &fullOutput, "full", "", false, "Full numbers instead of SI units")
 }
 
 // printValue formats uv to be output
@@ -91,9 +94,12 @@ Use the --json flag for a computer readable output, eg
 			if doAbout == nil {
 				return errors.Errorf("%v doesn't support about", f)
 			}
-			u, err := doAbout()
+			u, err := doAbout(context.Background())
 			if err != nil {
 				return errors.Wrap(err, "About call failed")
+			}
+			if u == nil {
+				return errors.New("nil usage returned")
 			}
 			if jsonOutput {
 				out := json.NewEncoder(os.Stdout)

@@ -1,7 +1,6 @@
 ---
 title: "Remote Setup"
 description: "Configuring rclone up on a remote / headless machine"
-date: "2016-01-07"
 ---
 
 # Configuring rclone on a remote / headless machine #
@@ -16,7 +15,8 @@ two ways of doing it, described below.
 
 ## Configuring using rclone authorize ##
 
-On the headless box
+On the headless box run `rclone` config but answer `N` to the `Use
+auto config?` question.
 
 ```
 ...
@@ -24,12 +24,19 @@ Remote config
 Use auto config?
  * Say Y if not sure
  * Say N if you are working on a remote or headless machine
-y) Yes
+y) Yes (default)
 n) No
 y/n> n
-For this to work, you will need rclone available on a machine that has a web browser available.
-Execute the following on your machine:
+For this to work, you will need rclone available on a machine that has
+a web browser available.
+
+For more help and alternate methods see: https://rclone.org/remote_setup/
+
+Execute the following on the machine with the web browser (same rclone
+version recommended):
+
 	rclone authorize "amazon cloud drive"
+
 Then paste the result below:
 result>
 ```
@@ -68,21 +75,20 @@ y/e/d>
 Rclone stores all of its config in a single configuration file.  This
 can easily be copied to configure a remote rclone.
 
-So first configure rclone on your desktop machine
+So first configure rclone on your desktop machine with
 
     rclone config
 
 to set up the config file.
 
-Find the config file by running `rclone -h` and looking for the help for the `--config` option
+Find the config file by running `rclone config file`, for example
 
 ```
-$ rclone -h
-[snip]
-      --config="/home/user/.rclone.conf": Config file.
-[snip]
+$ rclone config file
+Configuration file is stored at:
+/home/user/.rclone.conf
 ```
 
 Now transfer it to the remote box (scp, cut paste, ftp, sftp etc) and
-place it in the correct place (use `rclone -h` on the remote box to
-find out where).
+place it in the correct place (use `rclone config file` on the remote
+box to find out where).

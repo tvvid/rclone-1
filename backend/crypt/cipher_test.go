@@ -2,6 +2,7 @@ package crypt
 
 import (
 	"bytes"
+	"context"
 	"encoding/base32"
 	"fmt"
 	"io"
@@ -9,8 +10,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ncw/rclone/backend/crypt/pkcs7"
 	"github.com/pkg/errors"
+	"github.com/rclone/rclone/backend/crypt/pkcs7"
+	"github.com/rclone/rclone/lib/readers"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -41,69 +43,6 @@ func TestNewNameEncryptionModeString(t *testing.T) {
 	assert.Equal(t, NameEncryptionStandard.String(), "standard")
 	assert.Equal(t, NameEncryptionObfuscated.String(), "obfuscate")
 	assert.Equal(t, NameEncryptionMode(3).String(), "Unknown mode #3")
-}
-
-func TestValidString(t *testing.T) {
-	for _, test := range []struct {
-		in       string
-		expected error
-	}{
-		{"", nil},
-		{"\x01", ErrorBadDecryptControlChar},
-		{"a\x02", ErrorBadDecryptControlChar},
-		{"abc\x03", ErrorBadDecryptControlChar},
-		{"abc\x04def", ErrorBadDecryptControlChar},
-		{"\x05d", ErrorBadDecryptControlChar},
-		{"\x06def", ErrorBadDecryptControlChar},
-		{"\x07", ErrorBadDecryptControlChar},
-		{"\x08", ErrorBadDecryptControlChar},
-		{"\x09", ErrorBadDecryptControlChar},
-		{"\x0A", ErrorBadDecryptControlChar},
-		{"\x0B", ErrorBadDecryptControlChar},
-		{"\x0C", ErrorBadDecryptControlChar},
-		{"\x0D", ErrorBadDecryptControlChar},
-		{"\x0E", ErrorBadDecryptControlChar},
-		{"\x0F", ErrorBadDecryptControlChar},
-		{"\x10", ErrorBadDecryptControlChar},
-		{"\x11", ErrorBadDecryptControlChar},
-		{"\x12", ErrorBadDecryptControlChar},
-		{"\x13", ErrorBadDecryptControlChar},
-		{"\x14", ErrorBadDecryptControlChar},
-		{"\x15", ErrorBadDecryptControlChar},
-		{"\x16", ErrorBadDecryptControlChar},
-		{"\x17", ErrorBadDecryptControlChar},
-		{"\x18", ErrorBadDecryptControlChar},
-		{"\x19", ErrorBadDecryptControlChar},
-		{"\x1A", ErrorBadDecryptControlChar},
-		{"\x1B", ErrorBadDecryptControlChar},
-		{"\x1C", ErrorBadDecryptControlChar},
-		{"\x1D", ErrorBadDecryptControlChar},
-		{"\x1E", ErrorBadDecryptControlChar},
-		{"\x1F", ErrorBadDecryptControlChar},
-		{"\x20", nil},
-		{"\x7E", nil},
-		{"\x7F", ErrorBadDecryptControlChar},
-		{"£100", nil},
-		{`hello? sausage/êé/Hello, 世界/ " ' @ < > & ?/z.txt`, nil},
-		{"£100", nil},
-		// Following tests from https://secure.php.net/manual/en/reference.pcre.pattern.modifiers.php#54805
-		{"a", nil},                                        // Valid ASCII
-		{"\xc3\xb1", nil},                                 // Valid 2 Octet Sequence
-		{"\xc3\x28", ErrorBadDecryptUTF8},                 // Invalid 2 Octet Sequence
-		{"\xa0\xa1", ErrorBadDecryptUTF8},                 // Invalid Sequence Identifier
-		{"\xe2\x82\xa1", nil},                             // Valid 3 Octet Sequence
-		{"\xe2\x28\xa1", ErrorBadDecryptUTF8},             // Invalid 3 Octet Sequence (in 2nd Octet)
-		{"\xe2\x82\x28", ErrorBadDecryptUTF8},             // Invalid 3 Octet Sequence (in 3rd Octet)
-		{"\xf0\x90\x8c\xbc", nil},                         // Valid 4 Octet Sequence
-		{"\xf0\x28\x8c\xbc", ErrorBadDecryptUTF8},         // Invalid 4 Octet Sequence (in 2nd Octet)
-		{"\xf0\x90\x28\xbc", ErrorBadDecryptUTF8},         // Invalid 4 Octet Sequence (in 3rd Octet)
-		{"\xf0\x28\x8c\x28", ErrorBadDecryptUTF8},         // Invalid 4 Octet Sequence (in 4th Octet)
-		{"\xf8\xa1\xa1\xa1\xa1", ErrorBadDecryptUTF8},     // Valid 5 Octet Sequence (but not Unicode!)
-		{"\xfc\xa1\xa1\xa1\xa1\xa1", ErrorBadDecryptUTF8}, // Valid 6 Octet Sequence (but not Unicode!)
-	} {
-		actual := checkValidString([]byte(test.in))
-		assert.Equal(t, actual, test.expected, fmt.Sprintf("in=%q", test.in))
-	}
 }
 
 func TestEncodeFileName(t *testing.T) {
@@ -194,6 +133,10 @@ func TestEncryptSegment(t *testing.T) {
 
 func TestDecryptSegment(t *testing.T) {
 	// We've tested the forwards above, now concentrate on the errors
+	longName := make([]byte, 3328)
+	for i := range longName {
+		longName[i] = 'a'
+	}
 	c, _ := newCipher(NameEncryptionStandard, "", "", true)
 	for _, test := range []struct {
 		in          string
@@ -201,11 +144,10 @@ func TestDecryptSegment(t *testing.T) {
 	}{
 		{"64=", ErrorBadBase32Encoding},
 		{"!", base32.CorruptInputError(0)},
+		{string(longName), ErrorTooLongAfterDecode},
 		{encodeFileName([]byte("a")), ErrorNotAMultipleOfBlocksize},
 		{encodeFileName([]byte("123456789abcdef")), ErrorNotAMultipleOfBlocksize},
 		{encodeFileName([]byte("123456789abcdef0")), pkcs7.ErrorPaddingTooLong},
-		{c.encryptSegment("\x01"), ErrorBadDecryptControlChar},
-		{c.encryptSegment("\xc3\x28"), ErrorBadDecryptUTF8},
 	} {
 		actual, actualErr := c.decryptSegment(test.in)
 		assert.Equal(t, test.expectedErr, actualErr, fmt.Sprintf("in=%q got actual=%q, err = %v %T", test.in, actual, actualErr, actualErr))
@@ -699,16 +641,16 @@ var (
 
 // Test test infrastructure first!
 func TestRandomSource(t *testing.T) {
-	source := newRandomSource(1E8)
-	sink := newRandomSource(1E8)
+	source := newRandomSource(1e8)
+	sink := newRandomSource(1e8)
 	n, err := io.Copy(sink, source)
 	assert.NoError(t, err)
-	assert.Equal(t, int64(1E8), n)
+	assert.Equal(t, int64(1e8), n)
 
-	source = newRandomSource(1E8)
+	source = newRandomSource(1e8)
 	buf := make([]byte, 16)
 	_, _ = source.Read(buf)
-	sink = newRandomSource(1E8)
+	sink = newRandomSource(1e8)
 	_, err = io.Copy(sink, source)
 	assert.Error(t, err, "Error in stream")
 }
@@ -748,23 +690,23 @@ func testEncryptDecrypt(t *testing.T, bufSize int, copySize int64) {
 }
 
 func TestEncryptDecrypt1(t *testing.T) {
-	testEncryptDecrypt(t, 1, 1E7)
+	testEncryptDecrypt(t, 1, 1e7)
 }
 
 func TestEncryptDecrypt32(t *testing.T) {
-	testEncryptDecrypt(t, 32, 1E8)
+	testEncryptDecrypt(t, 32, 1e8)
 }
 
 func TestEncryptDecrypt4096(t *testing.T) {
-	testEncryptDecrypt(t, 4096, 1E8)
+	testEncryptDecrypt(t, 4096, 1e8)
 }
 
 func TestEncryptDecrypt65536(t *testing.T) {
-	testEncryptDecrypt(t, 65536, 1E8)
+	testEncryptDecrypt(t, 65536, 1e8)
 }
 
 func TestEncryptDecrypt65537(t *testing.T) {
-	testEncryptDecrypt(t, 65537, 1E8)
+	testEncryptDecrypt(t, 65537, 1e8)
 }
 
 var (
@@ -797,7 +739,7 @@ func TestEncryptData(t *testing.T) {
 	} {
 		c, err := newCipher(NameEncryptionStandard, "", "", true)
 		assert.NoError(t, err)
-		c.cryptoRand = newRandomSource(1E8) // nodge the crypto rand generator
+		c.cryptoRand = newRandomSource(1e8) // nodge the crypto rand generator
 
 		// Check encode works
 		buf := bytes.NewBuffer(test.in)
@@ -820,7 +762,7 @@ func TestEncryptData(t *testing.T) {
 func TestNewEncrypter(t *testing.T) {
 	c, err := newCipher(NameEncryptionStandard, "", "", true)
 	assert.NoError(t, err)
-	c.cryptoRand = newRandomSource(1E8) // nodge the crypto rand generator
+	c.cryptoRand = newRandomSource(1e8) // nodge the crypto rand generator
 
 	z := &zeroes{}
 
@@ -843,21 +785,13 @@ func TestNewEncrypterErrUnexpectedEOF(t *testing.T) {
 	c, err := newCipher(NameEncryptionStandard, "", "", true)
 	assert.NoError(t, err)
 
-	in := &errorReader{io.ErrUnexpectedEOF}
+	in := &readers.ErrorReader{Err: io.ErrUnexpectedEOF}
 	fh, err := c.newEncrypter(in, nil)
 	assert.NoError(t, err)
 
-	n, err := io.CopyN(ioutil.Discard, fh, 1E6)
+	n, err := io.CopyN(ioutil.Discard, fh, 1e6)
 	assert.Equal(t, io.ErrUnexpectedEOF, err)
 	assert.Equal(t, int64(32), n)
-}
-
-type errorReader struct {
-	err error
-}
-
-func (er errorReader) Read(p []byte) (n int, err error) {
-	return 0, er.err
 }
 
 type closeDetector struct {
@@ -879,7 +813,7 @@ func (c *closeDetector) Close() error {
 func TestNewDecrypter(t *testing.T) {
 	c, err := newCipher(NameEncryptionStandard, "", "", true)
 	assert.NoError(t, err)
-	c.cryptoRand = newRandomSource(1E8) // nodge the crypto rand generator
+	c.cryptoRand = newRandomSource(1e8) // nodge the crypto rand generator
 
 	cd := newCloseDetector(bytes.NewBuffer(file0))
 	fh, err := c.newDecrypter(cd)
@@ -897,7 +831,7 @@ func TestNewDecrypter(t *testing.T) {
 		assert.Equal(t, 1, cd.closed)
 	}
 
-	er := &errorReader{errors.New("potato")}
+	er := &readers.ErrorReader{Err: errors.New("potato")}
 	cd = newCloseDetector(er)
 	fh, err = c.newDecrypter(cd)
 	assert.Nil(t, fh)
@@ -923,14 +857,14 @@ func TestNewDecrypterErrUnexpectedEOF(t *testing.T) {
 	c, err := newCipher(NameEncryptionStandard, "", "", true)
 	assert.NoError(t, err)
 
-	in2 := &errorReader{io.ErrUnexpectedEOF}
+	in2 := &readers.ErrorReader{Err: io.ErrUnexpectedEOF}
 	in1 := bytes.NewBuffer(file16)
 	in := ioutil.NopCloser(io.MultiReader(in1, in2))
 
 	fh, err := c.newDecrypter(in)
 	assert.NoError(t, err)
 
-	n, err := io.CopyN(ioutil.Discard, fh, 1E6)
+	n, err := io.CopyN(ioutil.Discard, fh, 1e6)
 	assert.Equal(t, io.ErrUnexpectedEOF, err)
 	assert.Equal(t, int64(16), n)
 }
@@ -960,7 +894,7 @@ func TestNewDecrypterSeekLimit(t *testing.T) {
 
 	// Open stream with a seek of underlyingOffset
 	var reader io.ReadCloser
-	open := func(underlyingOffset, underlyingLimit int64) (io.ReadCloser, error) {
+	open := func(ctx context.Context, underlyingOffset, underlyingLimit int64) (io.ReadCloser, error) {
 		end := len(ciphertext)
 		if underlyingLimit >= 0 {
 			end = int(underlyingOffset + underlyingLimit)
@@ -995,13 +929,13 @@ func TestNewDecrypterSeekLimit(t *testing.T) {
 		assert.Equal(t, 0, n)
 	}
 
-	// Now try decoding it with a open/seek
+	// Now try decoding it with an open/seek
 	for _, offset := range trials {
 		for _, limit := range limits {
 			if offset+limit > len(plaintext) {
 				continue
 			}
-			rc, err := c.DecryptDataSeek(open, int64(offset), int64(limit))
+			rc, err := c.DecryptDataSeek(context.Background(), open, int64(offset), int64(limit))
 			assert.NoError(t, err)
 
 			check(rc, offset, limit)
@@ -1009,14 +943,14 @@ func TestNewDecrypterSeekLimit(t *testing.T) {
 	}
 
 	// Try decoding it with a single open and lots of seeks
-	fh, err := c.DecryptDataSeek(open, 0, -1)
+	fh, err := c.DecryptDataSeek(context.Background(), open, 0, -1)
 	assert.NoError(t, err)
 	for _, offset := range trials {
 		for _, limit := range limits {
 			if offset+limit > len(plaintext) {
 				continue
 			}
-			_, err := fh.RangeSeek(int64(offset), io.SeekStart, int64(limit))
+			_, err := fh.RangeSeek(context.Background(), int64(offset), io.SeekStart, int64(limit))
 			assert.NoError(t, err)
 
 			check(fh, offset, limit)
@@ -1067,7 +1001,7 @@ func TestNewDecrypterSeekLimit(t *testing.T) {
 	} {
 		what := fmt.Sprintf("offset = %d, limit = %d", test.offset, test.limit)
 		callCount := 0
-		testOpen := func(underlyingOffset, underlyingLimit int64) (io.ReadCloser, error) {
+		testOpen := func(ctx context.Context, underlyingOffset, underlyingLimit int64) (io.ReadCloser, error) {
 			switch callCount {
 			case 0:
 				assert.Equal(t, int64(0), underlyingOffset, what)
@@ -1079,11 +1013,11 @@ func TestNewDecrypterSeekLimit(t *testing.T) {
 				t.Errorf("Too many calls %d for %s", callCount+1, what)
 			}
 			callCount++
-			return open(underlyingOffset, underlyingLimit)
+			return open(ctx, underlyingOffset, underlyingLimit)
 		}
-		fh, err := c.DecryptDataSeek(testOpen, 0, -1)
+		fh, err := c.DecryptDataSeek(context.Background(), testOpen, 0, -1)
 		assert.NoError(t, err)
-		gotOffset, err := fh.RangeSeek(test.offset, io.SeekStart, test.limit)
+		gotOffset, err := fh.RangeSeek(context.Background(), test.offset, io.SeekStart, test.limit)
 		assert.NoError(t, err)
 		assert.Equal(t, gotOffset, test.offset)
 	}
@@ -1177,7 +1111,7 @@ func TestDecrypterRead(t *testing.T) {
 
 	// Test producing an error on the file on Read the underlying file
 	in1 := bytes.NewBuffer(file1)
-	in2 := &errorReader{errors.New("potato")}
+	in2 := &readers.ErrorReader{Err: errors.New("potato")}
 	in := io.MultiReader(in1, in2)
 	cd := newCloseDetector(in)
 	fh, err := c.newDecrypter(cd)

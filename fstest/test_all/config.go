@@ -1,7 +1,5 @@
 // Config handling
 
-// +build go1.11
-
 package main
 
 import (
@@ -10,60 +8,92 @@ import (
 	"path"
 
 	"github.com/pkg/errors"
-	"gopkg.in/yaml.v2"
+	"github.com/rclone/rclone/fs"
+	yaml "gopkg.in/yaml.v2"
 )
 
 // Test describes an integration test to run with `go test`
 type Test struct {
 	Path       string // path to the source directory
-	SubDir     bool   // if it is possible to add -sub-dir to tests
 	FastList   bool   // if it is possible to add -fast-list to tests
+	Short      bool   // if it is possible to run the test with -short
 	AddBackend bool   // set if Path needs the current backend appending
 	NoRetries  bool   // set if no retries should be performed
 	NoBinary   bool   // set to not build a binary in advance
+	LocalOnly  bool   // if set only run with the local backend
 }
 
 // Backend describes a backend test
 //
 // FIXME make bucket based remotes set sub-dir automatically???
 type Backend struct {
-	Backend  string // name of the backend directory
-	Remote   string // name of the test remote
-	SubDir   bool   // set to test with -sub-dir
-	FastList bool   // set to test with -fast-list
-	OneOnly  bool   // set to run only one backend test at once
+	Backend  string   // name of the backend directory
+	Remote   string   // name of the test remote
+	FastList bool     // set to test with -fast-list
+	Short    bool     // set to test with -short
+	OneOnly  bool     // set to run only one backend test at once
+	MaxFile  string   // file size limit
+	CleanUp  bool     // when running clean, run cleanup first
+	Ignore   []string // test names to ignore the failure of
+	Tests    []string // paths of tests to run, blank for all
+}
+
+// includeTest returns true if this backend should be included in this
+// test
+func (b *Backend) includeTest(t *Test) bool {
+	if len(b.Tests) == 0 {
+		return true
+	}
+	for _, testPath := range b.Tests {
+		if testPath == t.Path {
+			return true
+		}
+	}
+	return false
 }
 
 // MakeRuns creates Run objects the Backend and Test
 //
-// There can be several created, one for each combination of SubDir
-// and FastList
+// There can be several created, one for each combination of optionl
+// flags (eg FastList)
 func (b *Backend) MakeRuns(t *Test) (runs []*Run) {
-	subdirs := []bool{false}
-	if b.SubDir && t.SubDir {
-		subdirs = append(subdirs, true)
+	if !b.includeTest(t) {
+		return runs
+	}
+	maxSize := fs.SizeSuffix(0)
+	if b.MaxFile != "" {
+		if err := maxSize.Set(b.MaxFile); err != nil {
+			log.Printf("Invalid maxfile value %q: %v", b.MaxFile, err)
+		}
 	}
 	fastlists := []bool{false}
 	if b.FastList && t.FastList {
 		fastlists = append(fastlists, true)
 	}
-	for _, subdir := range subdirs {
-		for _, fastlist := range fastlists {
-			run := &Run{
-				Remote:    b.Remote,
-				Backend:   b.Backend,
-				Path:      t.Path,
-				SubDir:    subdir,
-				FastList:  fastlist,
-				NoRetries: t.NoRetries,
-				OneOnly:   b.OneOnly,
-				NoBinary:  t.NoBinary,
-			}
-			if t.AddBackend {
-				run.Path = path.Join(run.Path, b.Backend)
-			}
-			runs = append(runs, run)
+	ignore := make(map[string]struct{}, len(b.Ignore))
+	for _, item := range b.Ignore {
+		ignore[item] = struct{}{}
+	}
+	for _, fastlist := range fastlists {
+		if t.LocalOnly && b.Backend != "local" {
+			continue
 		}
+		run := &Run{
+			Remote:    b.Remote,
+			Backend:   b.Backend,
+			Path:      t.Path,
+			FastList:  fastlist,
+			Short:     (b.Short && t.Short),
+			NoRetries: t.NoRetries,
+			OneOnly:   b.OneOnly,
+			NoBinary:  t.NoBinary,
+			SizeLimit: int64(maxSize),
+			Ignore:    ignore,
+		}
+		if t.AddBackend {
+			run.Path = path.Join(run.Path, b.Backend)
+		}
+		runs = append(runs, run)
 	}
 	return runs
 }
@@ -119,7 +149,12 @@ func (c *Config) filterBackendsByRemotes(remotes []string) {
 		}
 		if !found {
 			log.Printf("Remote %q not found - inserting with default flags", name)
-			newBackends = append(newBackends, Backend{Remote: name})
+			// Lookup which backend
+			fsInfo, _, _, _, err := fs.ConfigFs(name)
+			if err != nil {
+				log.Fatalf("couldn't find remote %q: %v", name, err)
+			}
+			newBackends = append(newBackends, Backend{Backend: fsInfo.FileName(), Remote: name})
 		}
 	}
 	c.Backends = newBackends
@@ -149,17 +184,4 @@ func (c *Config) filterTests(paths []string) {
 		}
 	}
 	c.Tests = newTests
-}
-
-// Remotes returns the unique remotes
-func (c *Config) Remotes() (remotes []string) {
-	found := map[string]struct{}{}
-	for _, backend := range c.Backends {
-		if _, ok := found[backend.Remote]; ok {
-			continue
-		}
-		remotes = append(remotes, backend.Remote)
-		found[backend.Remote] = struct{}{}
-	}
-	return remotes
 }

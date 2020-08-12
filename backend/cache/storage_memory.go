@@ -1,4 +1,4 @@
-// +build !plan9
+// +build !plan9,!js
 
 package cache
 
@@ -7,9 +7,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ncw/rclone/fs"
-	"github.com/patrickmn/go-cache"
+	cache "github.com/patrickmn/go-cache"
 	"github.com/pkg/errors"
+	"github.com/rclone/rclone/fs"
 )
 
 // Memory is a wrapper of transient storage for a go-cache store

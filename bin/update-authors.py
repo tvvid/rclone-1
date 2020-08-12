@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """
 Update the authors.md file with the authors from the git log
 """
@@ -7,31 +7,32 @@ import re
 import subprocess
 
 AUTHORS = "docs/content/authors.md"
-IGNORE = [ "nick@raig-wood.com" ]
+IGNORE = "bin/.ignore-emails"
 
-def load():
+def load(filename):
     """
-    returns a set of emails already in authors.md
+    returns a set of emails already in the file
     """
-    with open(AUTHORS) as fd:
+    with open(filename) as fd:
         authors = fd.read()
-    emails = set(re.findall(r"<(.*?)>", authors))
-    emails.update(IGNORE)
-    return emails
+    return set(re.findall(r"<(.*?)>", authors))
 
 def add_email(name, email):
     """
     adds the email passed in to the end of authors.md
     """
-    print "Adding %s <%s>" % (name, email)
+    print("Adding %s <%s>" % (name, email))
     with open(AUTHORS, "a+") as fd:
-        print >>fd, "  * %s <%s>" % (name, email)
+        print("  * %s <%s>" % (name, email), file=fd)
     subprocess.check_call(["git", "commit", "-m", "Add %s to contributors" % name, AUTHORS])
     
 def main():
     out = subprocess.check_output(["git", "log", '--reverse', '--format=%an|%ae', "master"])
+    out = out.decode("utf-8")
 
-    previous = load()
+    ignored = load(IGNORE)
+    previous = load(AUTHORS)
+    previous.update(ignored)
     for line in out.split("\n"):
         line = line.strip()
         if line == "":

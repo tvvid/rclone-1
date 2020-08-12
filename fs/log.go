@@ -5,6 +5,7 @@ import (
 	"log"
 
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 )
 
 // LogLevel describes rclone's logs.  These are a subset of the syslog log levels.
@@ -73,13 +74,64 @@ var LogPrint = func(level LogLevel, text string) {
 	_ = log.Output(4, text)
 }
 
+// LogValueItem describes keyed item for a JSON log entry
+type LogValueItem struct {
+	key   string
+	value interface{}
+}
+
+// LogValue should be used as an argument to any logging calls to
+// augment the JSON output with more structured information.
+//
+// key is the dictionary parameter used to store value.
+func LogValue(key string, value interface{}) LogValueItem {
+	return LogValueItem{key: key, value: value}
+}
+
+// String returns an empty string so LogValueItem entries won't show
+// in the textual representation of logs. They need to be put in so
+// the number of parameters of the log call matches.
+func (j LogValueItem) String() string {
+	return ""
+}
+
 // LogPrintf produces a log string from the arguments passed in
 func LogPrintf(level LogLevel, o interface{}, text string, args ...interface{}) {
 	out := fmt.Sprintf(text, args...)
-	if o != nil {
-		out = fmt.Sprintf("%v: %s", o, out)
+
+	if Config.UseJSONLog {
+		fields := logrus.Fields{}
+		if o != nil {
+			fields = logrus.Fields{
+				"object":     fmt.Sprintf("%+v", o),
+				"objectType": fmt.Sprintf("%T", o),
+			}
+		}
+		for _, arg := range args {
+			if item, ok := arg.(LogValueItem); ok {
+				fields[item.key] = item.value
+			}
+		}
+		switch level {
+		case LogLevelDebug:
+			logrus.WithFields(fields).Debug(out)
+		case LogLevelInfo:
+			logrus.WithFields(fields).Info(out)
+		case LogLevelNotice, LogLevelWarning:
+			logrus.WithFields(fields).Warn(out)
+		case LogLevelError:
+			logrus.WithFields(fields).Error(out)
+		case LogLevelCritical:
+			logrus.WithFields(fields).Fatal(out)
+		case LogLevelEmergency, LogLevelAlert:
+			logrus.WithFields(fields).Panic(out)
+		}
+	} else {
+		if o != nil {
+			out = fmt.Sprintf("%v: %s", o, out)
+		}
+		LogPrint(level, out)
 	}
-	LogPrint(level, out)
 }
 
 // LogLevelPrintf writes logs at the given level

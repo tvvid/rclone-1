@@ -5,22 +5,24 @@ package asyncreader
 import (
 	"io"
 	"sync"
+	"time"
 
-	"github.com/ncw/rclone/lib/readers"
 	"github.com/pkg/errors"
+	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/lib/pool"
+	"github.com/rclone/rclone/lib/readers"
 )
 
 const (
 	// BufferSize is the default size of the async buffer
-	BufferSize       = 1024 * 1024
-	softStartInitial = 4 * 1024
+	BufferSize           = 1024 * 1024
+	softStartInitial     = 4 * 1024
+	bufferCacheSize      = 64              // max number of buffers to keep in cache
+	bufferCacheFlushTime = 5 * time.Second // flush the cached buffers after this long
 )
 
-var asyncBufferPool = sync.Pool{
-	New: func() interface{} { return newBuffer() },
-}
-
-var errorStreamAbandoned = errors.New("stream abandoned")
+// ErrorStreamAbandoned is returned when the input is closed before the end of the stream
+var ErrorStreamAbandoned = errors.New("stream abandoned")
 
 // AsyncReader will do async read-ahead from the input reader
 // and make the data available as an io.Reader.
@@ -98,16 +100,25 @@ func (a *AsyncReader) init(rd io.ReadCloser, buffers int) {
 	}()
 }
 
+// bufferPool is a global pool of buffers
+var bufferPool *pool.Pool
+var bufferPoolOnce sync.Once
+
 // return the buffer to the pool (clearing it)
 func (a *AsyncReader) putBuffer(b *buffer) {
-	b.clear()
-	asyncBufferPool.Put(b)
+	bufferPool.Put(b.buf)
+	b.buf = nil
 }
 
 // get a buffer from the pool
 func (a *AsyncReader) getBuffer() *buffer {
-	b := asyncBufferPool.Get().(*buffer)
-	return b
+	bufferPoolOnce.Do(func() {
+		// Initialise the buffer pool when used
+		bufferPool = pool.New(bufferCacheFlushTime, BufferSize, bufferCacheSize, fs.Config.UseMmap)
+	})
+	return &buffer{
+		buf: bufferPool.Get(),
+	}
 }
 
 // Read will return the next available data.
@@ -122,7 +133,7 @@ func (a *AsyncReader) fill() (err error) {
 		if !ok {
 			// Return an error to show fill failed
 			if a.err == nil {
-				return errorStreamAbandoned
+				return ErrorStreamAbandoned
 			}
 			return a.err
 		}
@@ -164,6 +175,9 @@ func (a *AsyncReader) WriteTo(w io.Writer) (n int64, err error) {
 	n = 0
 	for {
 		err = a.fill()
+		if err == io.EOF {
+			return n, nil
+		}
 		if err != nil {
 			return n, err
 		}
@@ -171,6 +185,10 @@ func (a *AsyncReader) WriteTo(w io.Writer) (n int64, err error) {
 		a.cur.increment(n2)
 		n += int64(n2)
 		if err != nil {
+			return n, err
+		}
+		if a.cur.err == io.EOF {
+			a.err = a.cur.err
 			return n, err
 		}
 		if a.cur.err != nil {
@@ -250,9 +268,15 @@ func (a *AsyncReader) SkipBytes(skip int) (ok bool) {
 	}
 }
 
-// Abandon will ensure that the underlying async reader is shut down.
-// It will NOT close the input supplied on New.
-func (a *AsyncReader) Abandon() {
+// StopBuffering will ensure that the underlying async reader is shut
+// down so no more is read from the input.
+//
+// This does not free the memory so Abandon() or Close() need to be
+// called on the input.
+//
+// This does not wait for Read/WriteTo to complete so can be called
+// concurrently to those.
+func (a *AsyncReader) StopBuffering() {
 	select {
 	case <-a.exit:
 		// Do nothing if reader routine already exited
@@ -262,6 +286,14 @@ func (a *AsyncReader) Abandon() {
 	// Close and wait for go routine
 	close(a.exit)
 	<-a.exited
+}
+
+// Abandon will ensure that the underlying async reader is shut down
+// and memory is returned. It does everything but close the input.
+//
+// It will NOT close the input supplied on New.
+func (a *AsyncReader) Abandon() {
+	a.StopBuffering()
 	// take the lock to wait for Read/WriteTo to complete
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -293,20 +325,6 @@ type buffer struct {
 	buf    []byte
 	err    error
 	offset int
-}
-
-func newBuffer() *buffer {
-	return &buffer{
-		buf: make([]byte, BufferSize),
-		err: nil,
-	}
-}
-
-// clear returns the buffer to its full size and clears the members
-func (b *buffer) clear() {
-	b.buf = b.buf[:cap(b.buf)]
-	b.err = nil
-	b.offset = 0
 }
 
 // isEmpty returns true is offset is at end of

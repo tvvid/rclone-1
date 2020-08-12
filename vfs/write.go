@@ -1,20 +1,22 @@
 package vfs
 
 import (
+	"context"
 	"io"
 	"os"
 	"sync"
 	"time"
 
-	"github.com/ncw/rclone/fs"
-	"github.com/ncw/rclone/fs/operations"
+	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/operations"
 )
 
 // WriteFileHandle is an open for write handle on a File
 type WriteFileHandle struct {
 	baseHandle
 	mu          sync.Mutex
-	closed      bool // set if handle has been closed
+	cond        *sync.Cond // cond lock for out of sequence writes
+	closed      bool       // set if handle has been closed
 	remote      string
 	pipeWriter  *io.PipeWriter
 	o           fs.Object
@@ -41,6 +43,7 @@ func newWriteFileHandle(d *Dir, f *File, remote string, flags int) (*WriteFileHa
 		result: make(chan error, 1),
 		file:   f,
 	}
+	fh.cond = sync.NewCond(&fh.mu)
 	fh.file.addWriter(fh)
 	return fh, nil
 }
@@ -65,7 +68,7 @@ func (fh *WriteFileHandle) openPending() (err error) {
 	pipeReader, fh.pipeWriter = io.Pipe()
 	go func() {
 		// NB Rcat deals with Stats.Transferring etc
-		o, err := operations.Rcat(fh.file.d.f, fh.remote, pipeReader, time.Now())
+		o, err := operations.Rcat(context.TODO(), fh.file.Fs(), fh.remote, pipeReader, time.Now())
 		if err != nil {
 			fs.Errorf(fh.remote, "WriteFileHandle.New Rcat failed: %v", err)
 		}
@@ -76,7 +79,7 @@ func (fh *WriteFileHandle) openPending() (err error) {
 	}()
 	fh.file.setSize(0)
 	fh.truncated = true
-	fh.file.d.addObject(fh.file) // make sure the directory has this object in it now
+	fh.file.Dir().addObject(fh.file) // make sure the directory has this object in it now
 	fh.opened = true
 	return nil
 }
@@ -121,10 +124,13 @@ func (fh *WriteFileHandle) WriteAt(p []byte, off int64) (n int, err error) {
 
 // Implementatino of WriteAt - call with lock held
 func (fh *WriteFileHandle) writeAt(p []byte, off int64) (n int, err error) {
-	// fs.Debugf(fh.remote, "WriteFileHandle.Write len=%d", len(p))
+	// defer log.Trace(fh.remote, "len=%d off=%d", len(p), off)("n=%d, fh.off=%d, err=%v", &n, &fh.offset, &err)
 	if fh.closed {
 		fs.Errorf(fh.remote, "WriteFileHandle.Write: error: %v", EBADF)
 		return 0, ECLOSED
+	}
+	if fh.offset != off {
+		waitSequential("write", fh.remote, fh.cond, fh.file.VFS().Opt.WriteWait, &fh.offset, off)
 	}
 	if fh.offset != off {
 		fs.Errorf(fh.remote, "WriteFileHandle.Write: can't seek in file without --vfs-cache-mode >= writes")
@@ -142,6 +148,7 @@ func (fh *WriteFileHandle) writeAt(p []byte, off int64) (n int, err error) {
 		return 0, err
 	}
 	// fs.Debugf(fh.remote, "WriteFileHandle.Write OK (%d bytes written)", n)
+	fh.cond.Broadcast() // wake everyone up waiting for an in-sequence read
 	return n, nil
 }
 
@@ -182,10 +189,9 @@ func (fh *WriteFileHandle) close() (err error) {
 	fh.closed = true
 	// leave writer open until file is transferred
 	defer func() {
-		fh.file.delWriter(fh, false)
-		fh.file.finishWriterClose()
+		fh.file.delWriter(fh)
 	}()
-	// If file not opened and not safe to truncate then then leave file intact
+	// If file not opened and not safe to truncate then leave file intact
 	if !fh.opened && !fh.safeToTruncate() {
 		return nil
 	}
@@ -277,11 +283,9 @@ func (fh *WriteFileHandle) Stat() (os.FileInfo, error) {
 
 // Truncate file to given size
 func (fh *WriteFileHandle) Truncate(size int64) (err error) {
+	// defer log.Trace(fh.remote, "size=%d", size)("err=%v", &err)
 	fh.mu.Lock()
 	defer fh.mu.Unlock()
-	if fh.closed {
-		return ECLOSED
-	}
 	if size != fh.offset {
 		fs.Errorf(fh.remote, "WriteFileHandle: Truncate: Can't change size without --vfs-cache-mode >= writes")
 		return EPERM

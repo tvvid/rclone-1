@@ -1,14 +1,14 @@
 // Test AzureBlob filesystem interface
 
-// +build !plan9,!solaris,go1.8
+// +build !plan9,!solaris,!js,go1.13
 
 package azureblob
 
 import (
 	"testing"
 
-	"github.com/ncw/rclone/fs"
-	"github.com/ncw/rclone/fstest/fstests"
+	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fstest/fstests"
 )
 
 // TestIntegration runs integration tests against the remote

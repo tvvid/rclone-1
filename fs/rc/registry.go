@@ -3,15 +3,16 @@
 package rc
 
 import (
+	"context"
 	"sort"
 	"strings"
 	"sync"
 
-	"github.com/ncw/rclone/fs"
+	"github.com/rclone/rclone/fs"
 )
 
 // Func defines a type for a remote control function
-type Func func(in Params) (out Params, err error)
+type Func func(ctx context.Context, in Params) (out Params, err error)
 
 // Call defines info about a remote control function and is used in
 // the Add function to create new entry points.
@@ -21,6 +22,7 @@ type Call struct {
 	Title        string // help for the function
 	AuthRequired bool   // if set then this call requires authorisation to be set
 	Help         string // multi-line markdown formatted help
+	NeedsRequest bool   // if set then this call will be passed the original request object as _request
 }
 
 // Registry holds the list of all the registered remote control functions

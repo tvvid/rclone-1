@@ -48,19 +48,9 @@ var ageSuffixes = []struct {
 	{Suffix: "", Multiplier: time.Second},
 }
 
-// ParseDuration parses a duration string. Accept ms|s|m|h|d|w|M|y suffixes. Defaults to second if not provided
-func ParseDuration(age string) (time.Duration, error) {
+// parse the age as suffixed ages
+func parseDurationSuffixes(age string) (time.Duration, error) {
 	var period float64
-
-	if age == "off" {
-		return time.Duration(DurationOff), nil
-	}
-
-	// Attempt to parse as a time.Duration first
-	d, err := time.ParseDuration(age)
-	if err == nil {
-		return d, nil
-	}
 
 	for _, ageSuffix := range ageSuffixes {
 		if strings.HasSuffix(age, ageSuffix.Suffix) {
@@ -78,6 +68,113 @@ func ParseDuration(age string) (time.Duration, error) {
 	return time.Duration(period), nil
 }
 
+// time formats to try parsing ages as - in order
+var timeFormats = []string{
+	time.RFC3339,
+	"2006-01-02T15:04:05",
+	"2006-01-02 15:04:05",
+	"2006-01-02",
+}
+
+// parse the age as time before the epoch in various date formats
+func parseDurationDates(age string, epoch time.Time) (t time.Duration, err error) {
+	var instant time.Time
+	for _, timeFormat := range timeFormats {
+		instant, err = time.Parse(timeFormat, age)
+		if err == nil {
+			return epoch.Sub(instant), nil
+		}
+	}
+	return t, err
+}
+
+// ParseDuration parses a duration string. Accept ms|s|m|h|d|w|M|y suffixes. Defaults to second if not provided
+func ParseDuration(age string) (d time.Duration, err error) {
+	if age == "off" {
+		return time.Duration(DurationOff), nil
+	}
+
+	// Attempt to parse as a time.Duration first
+	d, err = time.ParseDuration(age)
+	if err == nil {
+		return d, nil
+	}
+
+	d, err = parseDurationSuffixes(age)
+	if err == nil {
+		return d, nil
+	}
+
+	d, err = parseDurationDates(age, time.Now())
+	if err == nil {
+		return d, nil
+	}
+
+	return d, err
+}
+
+// ReadableString parses d into a human readable duration.
+// Based on https://github.com/hako/durafmt
+func (d Duration) ReadableString() string {
+	switch d {
+	case DurationOff:
+		return "off"
+	case 0:
+		return "0s"
+	}
+
+	readableString := ""
+
+	// Check for minus durations.
+	if d < 0 {
+		readableString += "-"
+	}
+
+	duration := time.Duration(math.Abs(float64(d)))
+
+	// Convert duration.
+	seconds := int64(duration.Seconds()) % 60
+	minutes := int64(duration.Minutes()) % 60
+	hours := int64(duration.Hours()) % 24
+	days := int64(duration/(24*time.Hour)) % 365 % 7
+
+	// Edge case between 364 and 365 days.
+	// We need to calculate weeks from what is left from years
+	leftYearDays := int64(duration/(24*time.Hour)) % 365
+	weeks := leftYearDays / 7
+	if leftYearDays >= 364 && leftYearDays < 365 {
+		weeks = 52
+	}
+
+	years := int64(duration/(24*time.Hour)) / 365
+	milliseconds := int64(duration/time.Millisecond) -
+		(seconds * 1000) - (minutes * 60000) - (hours * 3600000) -
+		(days * 86400000) - (weeks * 604800000) - (years * 31536000000)
+
+	// Create a map of the converted duration time.
+	durationMap := map[string]int64{
+		"ms": milliseconds,
+		"s":  seconds,
+		"m":  minutes,
+		"h":  hours,
+		"d":  days,
+		"w":  weeks,
+		"y":  years,
+	}
+
+	// Construct duration string.
+	for _, u := range [...]string{"y", "w", "d", "h", "m", "s", "ms"} {
+		v := durationMap[u]
+		strval := strconv.FormatInt(v, 10)
+		if v == 0 {
+			continue
+		}
+		readableString += strval + u
+	}
+
+	return readableString
+}
+
 // Set a Duration
 func (d *Duration) Set(s string) error {
 	duration, err := ParseDuration(s)
@@ -90,7 +187,7 @@ func (d *Duration) Set(s string) error {
 
 // Type of the value
 func (d Duration) Type() string {
-	return "duration"
+	return "Duration"
 }
 
 // Scan implements the fmt.Scanner interface

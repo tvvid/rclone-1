@@ -2,74 +2,105 @@
 package accounting
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"sync"
 	"time"
+	"unicode/utf8"
 
-	"github.com/ncw/rclone/fs"
-	"github.com/ncw/rclone/fs/asyncreader"
-	"github.com/ncw/rclone/fs/fserrors"
+	"github.com/rclone/rclone/fs/rc"
+	"golang.org/x/time/rate"
+
 	"github.com/pkg/errors"
+	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/asyncreader"
+	"github.com/rclone/rclone/fs/fserrors"
 )
 
-// ErrorMaxTransferLimitReached is returned from Read when the max
+// ErrorMaxTransferLimitReached defines error when transfer limit is reached.
+// Used for checking on exit and matching to correct exit code.
+var ErrorMaxTransferLimitReached = errors.New("Max transfer limit reached as set by --max-transfer")
+
+// ErrorMaxTransferLimitReachedFatal is returned from Read when the max
 // transfer limit is reached.
-var ErrorMaxTransferLimitReached = fserrors.FatalError(errors.New("Max transfer limit reached as set by --max-transfer"))
+var ErrorMaxTransferLimitReachedFatal = fserrors.FatalError(ErrorMaxTransferLimitReached)
 
 // Account limits and accounts for one transfer
 type Account struct {
+	stats *StatsInfo
 	// The mutex is to make sure Read() and Close() aren't called
 	// concurrently.  Unfortunately the persistent connection loop
 	// in http transport calls Read() after Do() returns on
 	// CancelRequest so this race can happen when it apparently
 	// shouldn't.
-	mu      sync.Mutex
+	mu      sync.Mutex // mutex protects these values
 	in      io.Reader
+	ctx     context.Context // current context for transfer - may change
 	origIn  io.ReadCloser
 	close   io.Closer
 	size    int64
 	name    string
-	statmu  sync.Mutex    // Separate mutex for stat values.
-	bytes   int64         // Total number of bytes read
-	max     int64         // if >=0 the max number of bytes to transfer
-	start   time.Time     // Start time of first read
-	lpTime  time.Time     // Time of last average measurement
-	lpBytes int           // Number of bytes read since last measurement
-	avg     float64       // Moving average of last few measurements in bytes/s
 	closed  bool          // set if the file is closed
 	exit    chan struct{} // channel that will be closed when transfer is finished
 	withBuf bool          // is using a buffered in
+
+	tokenBucket *rate.Limiter // per file bandwidth limiter (may be nil)
+
+	values accountValues
+}
+
+// accountValues holds statistics for this Account
+type accountValues struct {
+	mu      sync.Mutex // Mutex for stat values.
+	bytes   int64      // Total number of bytes read
+	max     int64      // if >=0 the max number of bytes to transfer
+	start   time.Time  // Start time of first read
+	lpTime  time.Time  // Time of last average measurement
+	lpBytes int        // Number of bytes read since last measurement
+	avg     float64    // Moving average of last few measurements in bytes/s
 }
 
 const averagePeriod = 16 // period to do exponentially weighted averages over
 
-// NewAccountSizeName makes a Account reader for an io.ReadCloser of
+// newAccountSizeName makes an Account reader for an io.ReadCloser of
 // the given size and name
-func NewAccountSizeName(in io.ReadCloser, size int64, name string) *Account {
+func newAccountSizeName(ctx context.Context, stats *StatsInfo, in io.ReadCloser, size int64, name string) *Account {
 	acc := &Account{
+		stats:  stats,
 		in:     in,
+		ctx:    ctx,
 		close:  in,
 		origIn: in,
 		size:   size,
 		name:   name,
 		exit:   make(chan struct{}),
-		avg:    0,
-		lpTime: time.Now(),
-		max:    int64(fs.Config.MaxTransfer),
+		values: accountValues{
+			avg:    0,
+			lpTime: time.Now(),
+			max:    -1,
+		},
 	}
-	go acc.averageLoop()
-	Stats.inProgress.set(acc.name, acc)
-	return acc
-}
+	if fs.Config.CutoffMode == fs.CutoffModeHard {
+		acc.values.max = int64((fs.Config.MaxTransfer))
+	}
+	currLimit := fs.Config.BwLimitFile.LimitAt(time.Now())
+	if currLimit.Bandwidth > 0 {
+		fs.Debugf(acc.name, "Limiting file transfer to %v", currLimit.Bandwidth)
+		acc.tokenBucket = newTokenBucket(currLimit.Bandwidth)
+	}
 
-// NewAccount makes a Account reader for an object
-func NewAccount(in io.ReadCloser, obj fs.Object) *Account {
-	return NewAccountSizeName(in, obj.Size(), obj.Remote())
+	go acc.averageLoop()
+	stats.inProgress.set(acc.name, acc)
+	return acc
 }
 
 // WithBuffer - If the file is above a certain size it adds an Async reader
 func (acc *Account) WithBuffer() *Account {
+	// if already have a buffer then just return
+	if acc.withBuf {
+		return acc
+	}
 	acc.withBuf = true
 	var buffers int
 	if acc.size >= int64(fs.Config.BufferSize) || acc.size == -1 {
@@ -88,6 +119,14 @@ func (acc *Account) WithBuffer() *Account {
 		}
 	}
 	return acc
+}
+
+// HasBuffer - returns true if this Account has an AsyncReader with a buffer
+func (acc *Account) HasBuffer() bool {
+	acc.mu.Lock()
+	defer acc.mu.Unlock()
+	_, ok := acc.in.(*asyncreader.AsyncReader)
+	return ok
 }
 
 // GetReader returns the underlying io.ReadCloser under any Buffer
@@ -110,20 +149,41 @@ func (acc *Account) GetAsyncReader() *asyncreader.AsyncReader {
 // StopBuffering stops the async buffer doing any more buffering
 func (acc *Account) StopBuffering() {
 	if asyncIn, ok := acc.in.(*asyncreader.AsyncReader); ok {
+		asyncIn.StopBuffering()
+	}
+}
+
+// Abandon stops the async buffer doing any more buffering
+func (acc *Account) Abandon() {
+	if asyncIn, ok := acc.in.(*asyncreader.AsyncReader); ok {
 		asyncIn.Abandon()
 	}
 }
 
 // UpdateReader updates the underlying io.ReadCloser stopping the
-// asynb buffer (if any) and re-adding it
-func (acc *Account) UpdateReader(in io.ReadCloser) {
+// async buffer (if any) and re-adding it
+func (acc *Account) UpdateReader(ctx context.Context, in io.ReadCloser) {
 	acc.mu.Lock()
-	acc.StopBuffering()
+	withBuf := acc.withBuf
+	if withBuf {
+		acc.Abandon()
+		acc.withBuf = false
+	}
 	acc.in = in
+	acc.ctx = ctx
 	acc.close = in
 	acc.origIn = in
-	acc.WithBuffer()
+	acc.closed = false
+	if withBuf {
+		acc.WithBuffer()
+	}
 	acc.mu.Unlock()
+
+	// Reset counter to stop percentage going over 100%
+	acc.values.mu.Lock()
+	acc.values.lpBytes = 0
+	acc.values.bytes = 0
+	acc.values.mu.Unlock()
 }
 
 // averageLoop calculates averages for the stats in the background
@@ -134,50 +194,123 @@ func (acc *Account) averageLoop() {
 	for {
 		select {
 		case now := <-tick.C:
-			acc.statmu.Lock()
+			acc.values.mu.Lock()
 			// Add average of last second.
-			elapsed := now.Sub(acc.lpTime).Seconds()
-			avg := float64(acc.lpBytes) / elapsed
+			elapsed := now.Sub(acc.values.lpTime).Seconds()
+			avg := float64(acc.values.lpBytes) / elapsed
 			// Soft start the moving average
 			if period < averagePeriod {
 				period++
 			}
-			acc.avg = (avg + (period-1)*acc.avg) / period
-			acc.lpBytes = 0
-			acc.lpTime = now
+			acc.values.avg = (avg + (period-1)*acc.values.avg) / period
+			acc.values.lpBytes = 0
+			acc.values.lpTime = now
 			// Unlock stats
-			acc.statmu.Unlock()
+			acc.values.mu.Unlock()
 		case <-acc.exit:
 			return
 		}
 	}
 }
 
-// read bytes from the io.Reader passed in and account them
-func (acc *Account) read(in io.Reader, p []byte) (n int, err error) {
-	acc.statmu.Lock()
-	if acc.max >= 0 && Stats.GetBytes() >= acc.max {
-		acc.statmu.Unlock()
-		return 0, ErrorMaxTransferLimitReached
+// Check the read before it has happened is valid returning the number
+// of bytes remaining to read.
+func (acc *Account) checkReadBefore() (bytesUntilLimit int64, err error) {
+	// Check to see if context is cancelled
+	if err = acc.ctx.Err(); err != nil {
+		return 0, err
+	}
+	acc.values.mu.Lock()
+	if acc.values.max >= 0 {
+		bytesUntilLimit = acc.values.max - acc.stats.GetBytes()
+		if bytesUntilLimit < 0 {
+			acc.values.mu.Unlock()
+			return bytesUntilLimit, ErrorMaxTransferLimitReachedFatal
+		}
+	} else {
+		bytesUntilLimit = 1 << 62
 	}
 	// Set start time.
-	if acc.start.IsZero() {
-		acc.start = time.Now()
+	if acc.values.start.IsZero() {
+		acc.values.start = time.Now()
 	}
-	acc.statmu.Unlock()
+	acc.values.mu.Unlock()
+	return bytesUntilLimit, nil
+}
 
-	n, err = in.Read(p)
+// Check the read call after the read has happened
+func (acc *Account) checkReadAfter(bytesUntilLimit int64, n int, err error) (outN int, outErr error) {
+	bytesUntilLimit -= int64(n)
+	if bytesUntilLimit < 0 {
+		// chop the overage off
+		n += int(bytesUntilLimit)
+		if n < 0 {
+			n = 0
+		}
+		err = ErrorMaxTransferLimitReachedFatal
+	}
+	return n, err
+}
 
+// ServerSideCopyStart should be called at the start of a server side copy
+//
+// This pretends a transfer has started
+func (acc *Account) ServerSideCopyStart() {
+	acc.values.mu.Lock()
+	// Set start time.
+	if acc.values.start.IsZero() {
+		acc.values.start = time.Now()
+	}
+	acc.values.mu.Unlock()
+}
+
+// ServerSideCopyEnd accounts for a read of n bytes in a sever side copy
+func (acc *Account) ServerSideCopyEnd(n int64) {
 	// Update Stats
-	acc.statmu.Lock()
-	acc.lpBytes += n
-	acc.bytes += int64(n)
-	acc.statmu.Unlock()
+	acc.values.mu.Lock()
+	acc.values.bytes += n
+	acc.values.mu.Unlock()
 
-	Stats.Bytes(int64(n))
+	acc.stats.Bytes(n)
+}
+
+// Account for n bytes from the current file bandwidth limit (if any)
+func (acc *Account) limitPerFileBandwidth(n int) {
+	acc.values.mu.Lock()
+	tokenBucket := acc.tokenBucket
+	acc.values.mu.Unlock()
+
+	if tokenBucket != nil {
+		err := tokenBucket.WaitN(context.Background(), n)
+		if err != nil {
+			fs.Errorf(nil, "Token bucket error: %v", err)
+		}
+	}
+}
+
+// Account the read and limit bandwidth
+func (acc *Account) accountRead(n int) {
+	// Update Stats
+	acc.values.mu.Lock()
+	acc.values.lpBytes += n
+	acc.values.bytes += int64(n)
+	acc.values.mu.Unlock()
+
+	acc.stats.Bytes(int64(n))
 
 	limitBandwidth(n)
-	return
+	acc.limitPerFileBandwidth(n)
+}
+
+// read bytes from the io.Reader passed in and account them
+func (acc *Account) read(in io.Reader, p []byte) (n int, err error) {
+	bytesUntilLimit, err := acc.checkReadBefore()
+	if err == nil {
+		n, err = in.Read(p)
+		acc.accountRead(n)
+		n, err = acc.checkReadAfter(bytesUntilLimit, n, err)
+	}
+	return n, err
 }
 
 // Read bytes from the object - see io.Reader
@@ -185,6 +318,57 @@ func (acc *Account) Read(p []byte) (n int, err error) {
 	acc.mu.Lock()
 	defer acc.mu.Unlock()
 	return acc.read(acc.in, p)
+}
+
+// Thin wrapper for w
+type accountWriteTo struct {
+	w   io.Writer
+	acc *Account
+}
+
+// Write writes len(p) bytes from p to the underlying data stream. It
+// returns the number of bytes written from p (0 <= n <= len(p)) and
+// any error encountered that caused the write to stop early. Write
+// must return a non-nil error if it returns n < len(p). Write must
+// not modify the slice data, even temporarily.
+//
+// Implementations must not retain p.
+func (awt *accountWriteTo) Write(p []byte) (n int, err error) {
+	bytesUntilLimit, err := awt.acc.checkReadBefore()
+	if err == nil {
+		n, err = awt.w.Write(p)
+		n, err = awt.acc.checkReadAfter(bytesUntilLimit, n, err)
+		awt.acc.accountRead(n)
+	}
+	return n, err
+}
+
+// WriteTo writes data to w until there's no more data to write or
+// when an error occurs. The return value n is the number of bytes
+// written. Any error encountered during the write is also returned.
+func (acc *Account) WriteTo(w io.Writer) (n int64, err error) {
+	acc.mu.Lock()
+	in := acc.in
+	acc.mu.Unlock()
+	wrappedWriter := accountWriteTo{w: w, acc: acc}
+	if do, ok := in.(io.WriterTo); ok {
+		n, err = do.WriteTo(&wrappedWriter)
+	} else {
+		n, err = io.Copy(&wrappedWriter, in)
+	}
+	return
+}
+
+// AccountRead account having read n bytes
+func (acc *Account) AccountRead(n int) (err error) {
+	acc.mu.Lock()
+	defer acc.mu.Unlock()
+	bytesUntilLimit, err := acc.checkReadBefore()
+	if err == nil {
+		n, err = acc.checkReadAfter(bytesUntilLimit, n, err)
+		acc.accountRead(n)
+	}
+	return err
 }
 
 // Close the object
@@ -195,9 +379,18 @@ func (acc *Account) Close() error {
 		return nil
 	}
 	acc.closed = true
-	close(acc.exit)
-	Stats.inProgress.clear(acc.name)
+	if acc.close == nil {
+		return nil
+	}
 	return acc.close.Close()
+}
+
+// Done with accounting - must be called to free accounting goroutine
+func (acc *Account) Done() {
+	acc.mu.Lock()
+	defer acc.mu.Unlock()
+	close(acc.exit)
+	acc.stats.inProgress.clear(acc.name)
 }
 
 // progress returns bytes read as well as the size.
@@ -206,28 +399,28 @@ func (acc *Account) progress() (bytes, size int64) {
 	if acc == nil {
 		return 0, 0
 	}
-	acc.statmu.Lock()
-	bytes, size = acc.bytes, acc.size
-	acc.statmu.Unlock()
+	acc.values.mu.Lock()
+	bytes, size = acc.values.bytes, acc.size
+	acc.values.mu.Unlock()
 	return bytes, size
 }
 
 // speed returns the speed of the current file transfer
-// in bytes per second, as well a an exponentially weighted moving average
+// in bytes per second, as well an exponentially weighted moving average
 // If no read has completed yet, 0 is returned for both values.
 func (acc *Account) speed() (bps, current float64) {
 	if acc == nil {
 		return 0, 0
 	}
-	acc.statmu.Lock()
-	defer acc.statmu.Unlock()
-	if acc.bytes == 0 {
+	acc.values.mu.Lock()
+	defer acc.values.mu.Unlock()
+	if acc.values.bytes == 0 {
 		return 0, 0
 	}
 	// Calculate speed from first read.
-	total := float64(time.Now().Sub(acc.start)) / float64(time.Second)
-	bps = float64(acc.bytes) / total
-	current = acc.avg
+	total := float64(time.Now().Sub(acc.values.start)) / float64(time.Second)
+	bps = float64(acc.values.bytes) / total
+	current = acc.values.avg
 	return
 }
 
@@ -238,9 +431,27 @@ func (acc *Account) eta() (etaDuration time.Duration, ok bool) {
 	if acc == nil {
 		return 0, false
 	}
-	acc.statmu.Lock()
-	defer acc.statmu.Unlock()
-	return eta(acc.bytes, acc.size, acc.avg)
+	acc.values.mu.Lock()
+	defer acc.values.mu.Unlock()
+	return eta(acc.values.bytes, acc.size, acc.values.avg)
+}
+
+// shortenName shortens in to size runes long
+// If size <= 0 then in is left untouched
+func shortenName(in string, size int) string {
+	if size <= 0 {
+		return in
+	}
+	if utf8.RuneCountInString(in) <= size {
+		return in
+	}
+	name := []rune(in)
+	size-- // don't count elipsis rune
+	suffixLength := size / 2
+	prefixLength := size - suffixLength
+	suffixStart := len(name) - suffixLength
+	name = append(append(name[:prefixLength], '…'), name[suffixStart:]...)
+	return string(name)
 }
 
 // String produces stats for this file
@@ -257,16 +468,6 @@ func (acc *Account) String() string {
 		}
 	}
 
-	name := []rune(acc.name)
-	if fs.Config.StatsFileNameLength > 0 {
-		if len(name) > fs.Config.StatsFileNameLength {
-			suffixLength := fs.Config.StatsFileNameLength / 2
-			prefixLength := fs.Config.StatsFileNameLength - suffixLength
-			suffixStart := len(name) - suffixLength
-			name = append(append(name[:prefixLength], '…'), name[suffixStart:]...)
-		}
-	}
-
 	if fs.Config.DataRateUnit == "bits" {
 		cur = cur * 8
 	}
@@ -276,19 +477,19 @@ func (acc *Account) String() string {
 		percentageDone = int(100 * float64(a) / float64(b))
 	}
 
-	done := fmt.Sprintf("%2d%% /%s", percentageDone, fs.SizeSuffix(b))
-
-	return fmt.Sprintf("%45s: %s, %s/s, %s",
-		string(name),
-		done,
+	return fmt.Sprintf("%*s:%3d%% /%s, %s/s, %s",
+		fs.Config.StatsFileNameLength,
+		shortenName(acc.name, fs.Config.StatsFileNameLength),
+		percentageDone,
+		fs.SizeSuffix(b),
 		fs.SizeSuffix(cur),
 		etas,
 	)
 }
 
-// RemoteStats produces stats for this file
-func (acc *Account) RemoteStats() (out map[string]interface{}) {
-	out = make(map[string]interface{})
+// rcStats produces remote control stats for this file
+func (acc *Account) rcStats() (out rc.Params) {
+	out = make(rc.Params)
 	a, b := acc.progress()
 	out["bytes"] = a
 	out["size"] = b
@@ -312,6 +513,7 @@ func (acc *Account) RemoteStats() (out map[string]interface{}) {
 		percentageDone = int(100 * float64(a) / float64(b))
 	}
 	out["percentage"] = percentageDone
+	out["group"] = acc.stats.group
 
 	return out
 }

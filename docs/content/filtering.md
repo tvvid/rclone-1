@@ -1,7 +1,6 @@
 ---
 title: "Filtering"
 description: "Filtering, includes and excludes"
-date: "2016-02-09"
 ---
 
 # Filtering, includes and excludes #
@@ -17,7 +16,9 @@ Each path as it passes through rclone is matched against the include
 and exclude rules like `--include`, `--exclude`, `--include-from`,
 `--exclude-from`, `--filter`, or `--filter-from`. The simplest way to
 try them out is using the `ls` command, or `--dry-run` together with
-`-v`.
+`-v`. `--filter-from`, `--exclude-from`, `--include-from`, `--files-from`,
+`--files-from-raw` understand `-` as a file name to mean read from standard
+input.
 
 ## Patterns ##
 
@@ -60,7 +61,7 @@ A `?` matches any character except a slash `/`.
           - matches "lass"
           - doesn't match "floss"
 
-A `[` and `]` together make a a character class, such as `[a-z]` or
+A `[` and `]` together make a character class, such as `[a-z]` or
 `[aeiou]` or `[[:alpha:]]`.  See the [go regexp
 docs](https://golang.org/pkg/regexp/syntax/) for more info on these.
 
@@ -178,6 +179,7 @@ type.
   * `--exclude-from`
   * `--filter`
   * `--filter-from`
+  * `--filter-from-raw`
 
 **Important** You should not use `--include*` together with `--exclude*`. 
 It may produce different results than you expected. In that case try to use: `--filter*`.
@@ -305,16 +307,26 @@ This reads a list of file names from the file passed in and **only**
 these files are transferred.  The **filtering rules are ignored**
 completely if you use this option.
 
-Rclone will not scan any directories if you use `--files-from` it will
-just look at the files specified.  Rclone will not error if any of the
-files are missing from the source.
+`--files-from` expects a list of files as its input. Leading / trailing
+whitespace is stripped from the input lines and lines starting with `#`
+and `;` are ignored.
+
+Rclone will traverse the file system if you use `--files-from`,
+effectively using the files in `--files-from` as a set of filters.
+Rclone will not error if any of the files are missing.
+
+If you use `--no-traverse` as well as `--files-from` then rclone will
+not traverse the destination file system, it will find each file
+individually using approximately 1 API call. This can be more
+efficient for small lists of files.
 
 This option can be repeated to read from more than one file.  These
 are read in the order that they are placed on the command line.
 
 Paths within the `--files-from` file will be interpreted as starting
 with the root specified in the command.  Leading `/` characters are
-ignored.
+ignored. See [--files-from-raw](#files-from-raw-read-list-of-source-file-names-without-any-processing)
+if you need the input to be processed in a raw manner.
 
 For example, suppose you had `files-from.txt` with this content:
 
@@ -329,7 +341,7 @@ You could then use it like this:
 This will transfer these files only (if they exist)
 
     /home/me/pics/file1.jpg        → remote:pics/file1.jpg
-    /home/me/pics/subdir/file2.jpg → remote:pics/subdirfile1.jpg
+    /home/me/pics/subdir/file2.jpg → remote:pics/subdir/file2.jpg
 
 To take a more complicated example, let's say you had a few files you
 want to back up regularly with these absolute paths:
@@ -355,7 +367,7 @@ The 3 files will arrive in `remote:backup` with the paths as in the
 
     /home/user1/important → remote:backup/user1/important
     /home/user1/dir/file  → remote:backup/user1/dir/file
-    /home/user2/stuff     → remote:backup/stuff
+    /home/user2/stuff     → remote:backup/user2/stuff
 
 You could of course choose `/` as the root too in which case your
 `files-from.txt` might look like this.
@@ -370,9 +382,16 @@ And you would transfer it like this
 
 In this case there will be an extra `home` directory on the remote:
 
-    /home/user1/important → remote:home/backup/user1/important
-    /home/user1/dir/file  → remote:home/backup/user1/dir/file
-    /home/user2/stuff     → remote:home/backup/stuff
+    /home/user1/important → remote:backup/home/user1/important
+    /home/user1/dir/file  → remote:backup/home/user1/dir/file
+    /home/user2/stuff     → remote:backup/home/user2/stuff
+
+### `--files-from-raw` - Read list of source-file names without any processing ###
+This option is same as `--files-from` with the only difference being that the input
+is read in a raw manner. This means that lines with leading/trailing whitespace and
+lines starting with `;` or `#` are read without any processing. [rclone lsf](/commands/rclone_lsf/)
+has a compatible format that can be used to export file lists from remotes, which
+can then be used as an input to `--files-from-raw`.
 
 ### `--min-size` - Don't transfer any file smaller than this ###
 
@@ -409,6 +428,13 @@ seconds or with a suffix of:
 For example `--max-age 2d` means no files older than 2 days will be
 transferred.
 
+This can also be an absolute time in one of these formats
+
+- RFC3339 - eg "2006-01-02T15:04:05Z07:00"
+- ISO8601 Date and time, local timezone - "2006-01-02T15:04:05"
+- ISO8601 Date and time, local timezone - "2006-01-02 15:04:05"
+- ISO8601 Date - "2006-01-02" (YYYY-MM-DD)
+
 ### `--min-age` - Don't transfer any file younger than this ###
 
 This option controls the minimum age of files to transfer.  Give in
@@ -426,7 +452,7 @@ from the sync on the destination.
 
 If for example you did a sync from `A` to `B` without the `--min-size 50k` flag
 
-    rclone sync A: B:
+    rclone sync -i A: B:
 
 Then you repeated it like this with the `--delete-excluded`
 
@@ -484,7 +510,7 @@ Imagine, you have the following directory structure:
 
 You can exclude `dir3` from sync by running the following command:
 
-    rclone sync --exclude-if-present .ignore dir1 remote:backup
+    rclone sync -i --exclude-if-present .ignore dir1 remote:backup
 
 Currently only one filename is supported, i.e. `--exclude-if-present`
 should not be used multiple times.

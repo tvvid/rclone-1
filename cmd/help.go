@@ -7,11 +7,12 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/ncw/rclone/fs"
-	"github.com/ncw/rclone/fs/config/configflags"
-	"github.com/ncw/rclone/fs/filter/filterflags"
-	"github.com/ncw/rclone/fs/rc/rcflags"
-	"github.com/ncw/rclone/lib/atexit"
+	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/config/configflags"
+	"github.com/rclone/rclone/fs/filter/filterflags"
+	"github.com/rclone/rclone/fs/log/logflags"
+	"github.com/rclone/rclone/fs/rc/rcflags"
+	"github.com/rclone/rclone/lib/atexit"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
@@ -32,7 +33,61 @@ documentation, changelog and configuration walkthroughs.
 		fs.Debugf("rclone", "Version %q finishing with parameters %q", fs.Version, os.Args)
 		atexit.Run()
 	},
+	BashCompletionFunction: bashCompletionFunc,
+	DisableAutoGenTag:      true,
 }
+
+const (
+	bashCompletionFunc = `
+__rclone_custom_func() {
+    if [[ ${#COMPREPLY[@]} -eq 0 ]]; then
+        local cur cword prev words
+        if declare -F _init_completion > /dev/null; then
+            _init_completion -n : || return
+        else
+            __rclone_init_completion -n : || return
+        fi
+	local rclone=(command rclone --ask-password=false)
+        if [[ $cur != *:* ]]; then
+            local ifs=$IFS
+            IFS=$'\n'
+            local remotes=($("${rclone[@]}" listremotes 2> /dev/null))
+            IFS=$ifs
+            local remote
+            for remote in "${remotes[@]}"; do
+                [[ $remote != $cur* ]] || COMPREPLY+=("$remote")
+            done
+            if [[ ${COMPREPLY[@]} ]]; then
+                local paths=("$cur"*)
+                [[ ! -f ${paths[0]} ]] || COMPREPLY+=("${paths[@]}")
+            fi
+        else
+            local path=${cur#*:}
+            if [[ $path == */* ]]; then
+                local prefix=$(eval printf '%s' "${path%/*}")
+            else
+                local prefix=
+            fi
+            local ifs=$IFS
+            IFS=$'\n'
+            local lines=($("${rclone[@]}" lsf "${cur%%:*}:$prefix" 2> /dev/null))
+            IFS=$ifs
+            local line
+            for line in "${lines[@]}"; do
+                local reply=${prefix:+$prefix/}$line
+                [[ $reply != $path* ]] || COMPREPLY+=("$reply")
+            done
+	    [[ ! ${COMPREPLY[@]} || $(type -t compopt) != builtin ]] || compopt -o filenames
+        fi
+        [[ ! ${COMPREPLY[@]} || $(type -t compopt) != builtin ]] || compopt -o nospace
+    fi
+}
+`
+)
+
+// GeneratingDocs is set by rclone gendocs to alter the format of the
+// output suitable for the documentation.
+var GeneratingDocs = false
 
 // root help command
 var helpCommand = &cobra.Command{
@@ -60,7 +115,11 @@ var helpFlags = &cobra.Command{
 			}
 			flagsRe = re
 		}
-		Root.SetOutput(os.Stdout)
+		if GeneratingDocs {
+			Root.SetUsageTemplate(docFlagsTemplate)
+		} else {
+			Root.SetOutput(os.Stdout)
+		}
 		_ = command.Usage()
 	},
 }
@@ -111,6 +170,7 @@ func setupRootCommand(rootCmd *cobra.Command) {
 	configflags.AddFlags(pflag.CommandLine)
 	filterflags.AddFlags(pflag.CommandLine)
 	rcflags.AddFlags(pflag.CommandLine)
+	logflags.AddFlags(pflag.CommandLine)
 
 	Root.Run = runRoot
 	Root.Flags().BoolVarP(&version, "version", "V", false, "Print the version number")
@@ -182,6 +242,34 @@ Use "rclone help flags" for to see the global flags.
 Use "rclone help backends" for a list of supported services.
 `
 
+var docFlagsTemplate = `---
+title: "Global Flags"
+description: "Rclone Global Flags"
+---
+
+# Global Flags
+
+This describes the global flags available to every rclone command
+split into two groups, non backend and backend flags.
+
+## Non Backend Flags
+
+These flags are available for every command.
+
+` + "```" + `
+{{(backendFlags . false).FlagUsages | trimTrailingWhitespaces}}
+` + "```" + `
+
+## Backend Flags
+
+These flags are available for every command. They control the backends
+and may be set in the config file.
+
+` + "```" + `
+{{(backendFlags . true).FlagUsages | trimTrailingWhitespaces}}
+` + "```" + `
+`
+
 // show all the backends
 func showBackends() {
 	fmt.Printf("All rclone backends:\n\n")
@@ -222,6 +310,7 @@ func showBackend(name string) {
 	optionsType := "standard"
 	for _, opts := range []fs.Options{standardOptions, advancedOptions} {
 		if len(opts) == 0 {
+			optionsType = "advanced"
 			continue
 		}
 		fmt.Printf("### %s Options\n\n", strings.Title(optionsType))
@@ -229,8 +318,15 @@ func showBackend(name string) {
 		optionsType = "advanced"
 		for _, opt := range opts {
 			done[opt.Name] = struct{}{}
-			fmt.Printf("#### --%s\n\n", opt.FlagName(backend.Prefix))
+			shortOpt := ""
+			if opt.ShortOpt != "" {
+				shortOpt = fmt.Sprintf(" / -%s", opt.ShortOpt)
+			}
+			fmt.Printf("#### --%s%s\n\n", opt.FlagName(backend.Prefix), shortOpt)
 			fmt.Printf("%s\n\n", opt.Help)
+			if opt.IsPassword {
+				fmt.Printf("**NB** Input to this must be obscured - see [rclone obscure](/commands/rclone_obscure/).\n\n")
+			}
 			fmt.Printf("- Config:      %s\n", opt.Name)
 			fmt.Printf("- Env Var:     %s\n", opt.EnvVarName(backend.Prefix))
 			fmt.Printf("- Type:        %s\n", opt.Type())

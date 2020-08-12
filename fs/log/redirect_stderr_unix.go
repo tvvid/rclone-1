@@ -1,6 +1,6 @@
 // Log the panic under unix to the log file
 
-// +build !windows,!solaris,!plan9
+// +build !windows,!solaris,!plan9,!js
 
 package log
 
@@ -8,7 +8,7 @@ import (
 	"log"
 	"os"
 
-	"github.com/ncw/rclone/fs/config"
+	"github.com/rclone/rclone/fs/config"
 	"golang.org/x/sys/unix"
 )
 

@@ -1,4 +1,4 @@
-// +build !plan9
+// +build !plan9,!js
 
 package cache
 
@@ -14,8 +14,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ncw/rclone/fs"
-	"github.com/patrickmn/go-cache"
+	cache "github.com/patrickmn/go-cache"
+	"github.com/rclone/rclone/fs"
 	"golang.org/x/net/websocket"
 )
 

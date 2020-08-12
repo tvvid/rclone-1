@@ -1,19 +1,20 @@
 package lsl
 
 import (
+	"context"
 	"os"
 
-	"github.com/ncw/rclone/cmd"
-	"github.com/ncw/rclone/cmd/ls/lshelp"
-	"github.com/ncw/rclone/fs/operations"
+	"github.com/rclone/rclone/cmd"
+	"github.com/rclone/rclone/cmd/ls/lshelp"
+	"github.com/rclone/rclone/fs/operations"
 	"github.com/spf13/cobra"
 )
 
 func init() {
-	cmd.Root.AddCommand(commandDefintion)
+	cmd.Root.AddCommand(commandDefinition)
 }
 
-var commandDefintion = &cobra.Command{
+var commandDefinition = &cobra.Command{
 	Use:   "lsl remote:path",
 	Short: `List the objects in path with modification time, size and path.`,
 	Long: `
@@ -33,7 +34,7 @@ Eg
 		cmd.CheckArgs(1, 1, command, args)
 		fsrc := cmd.NewFsSrc(args)
 		cmd.Run(false, false, command, func() error {
-			return operations.ListLong(fsrc, os.Stdout)
+			return operations.ListLong(context.Background(), fsrc, os.Stdout)
 		})
 	},
 }

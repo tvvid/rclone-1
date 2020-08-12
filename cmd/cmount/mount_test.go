@@ -11,9 +11,9 @@ package cmount
 import (
 	"testing"
 
-	"github.com/ncw/rclone/cmd/mountlib/mounttest"
+	"github.com/rclone/rclone/vfs/vfstest"
 )
 
 func TestMount(t *testing.T) {
-	mounttest.RunTests(t, mount)
+	vfstest.RunTests(t, false, mount)
 }

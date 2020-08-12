@@ -1,9 +1,11 @@
-// +build !plan9
+// +build !plan9,!js
+// +build !race
 
 package cache_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	goflag "flag"
 	"fmt"
@@ -14,27 +16,24 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"runtime"
 	"runtime/debug"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/ncw/rclone/backend/cache"
-	"github.com/ncw/rclone/backend/crypt"
-	_ "github.com/ncw/rclone/backend/drive"
-	"github.com/ncw/rclone/backend/local"
-	"github.com/ncw/rclone/fs"
-	"github.com/ncw/rclone/fs/config"
-	"github.com/ncw/rclone/fs/config/configmap"
-	"github.com/ncw/rclone/fs/object"
-	"github.com/ncw/rclone/fs/rc"
-	"github.com/ncw/rclone/fstest"
-	"github.com/ncw/rclone/vfs"
-	"github.com/ncw/rclone/vfs/vfsflags"
 	"github.com/pkg/errors"
-	"github.com/stretchr/testify/assert"
+	"github.com/rclone/rclone/backend/cache"
+	"github.com/rclone/rclone/backend/crypt"
+	_ "github.com/rclone/rclone/backend/drive"
+	"github.com/rclone/rclone/backend/local"
+	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/config"
+	"github.com/rclone/rclone/fs/config/configmap"
+	"github.com/rclone/rclone/fs/object"
+	"github.com/rclone/rclone/fstest"
+	"github.com/rclone/rclone/fstest/testy"
+	"github.com/rclone/rclone/lib/random"
+	"github.com/rclone/rclone/vfs/vfsflags"
 	"github.com/stretchr/testify/require"
 )
 
@@ -50,9 +49,7 @@ const (
 
 var (
 	remoteName                  string
-	mountDir                    string
 	uploadDir                   string
-	useMount                    bool
 	runInstance                 *run
 	errNotSupported             = errors.New("not supported")
 	decryptedToEncryptedRemotes = map[string]string{
@@ -88,9 +85,7 @@ var (
 
 func init() {
 	goflag.StringVar(&remoteName, "remote-internal", "TestInternalCache", "Remote to test with, defaults to local filesystem")
-	goflag.StringVar(&mountDir, "mount-dir-internal", "", "")
 	goflag.StringVar(&uploadDir, "upload-dir-internal", "", "")
-	goflag.BoolVar(&useMount, "cache-use-mount", false, "Test only with mount")
 }
 
 // TestMain drives the tests
@@ -98,7 +93,7 @@ func TestMain(m *testing.M) {
 	goflag.Parse()
 	var rc int
 
-	log.Printf("Running with the following params: \n remote: %v, \n mount: %v", remoteName, useMount)
+	log.Printf("Running with the following params: \n remote: %v", remoteName)
 	runInstance = newRun()
 	rc = m.Run()
 	os.Exit(rc)
@@ -120,7 +115,7 @@ func TestInternalListRootAndInnerRemotes(t *testing.T) {
 	require.NoError(t, err)
 	listRootInner, err := runInstance.list(t, rootFs, innerFolder)
 	require.NoError(t, err)
-	listInner, err := rootFs2.List("")
+	listInner, err := rootFs2.List(context.Background(), "")
 	require.NoError(t, err)
 
 	require.Len(t, listRoot, 1)
@@ -138,10 +133,10 @@ func TestInternalVfsCache(t *testing.T) {
 	rootFs, boltDb := runInstance.newCacheFs(t, remoteName, id, true, true, nil, map[string]string{"writes": "true", "info_age": "1h"})
 	defer runInstance.cleanupFs(t, rootFs, boltDb)
 
-	err := rootFs.Mkdir("test")
+	err := rootFs.Mkdir(context.Background(), "test")
 	require.NoError(t, err)
 	runInstance.writeObjectString(t, rootFs, "test/second", "content")
-	_, err = rootFs.List("test")
+	_, err = rootFs.List(context.Background(), "test")
 	require.NoError(t, err)
 
 	testReader := runInstance.randomReader(t, testSize)
@@ -266,37 +261,13 @@ func TestInternalObjNotFound(t *testing.T) {
 	rootFs, boltDb := runInstance.newCacheFs(t, remoteName, id, false, true, nil, nil)
 	defer runInstance.cleanupFs(t, rootFs, boltDb)
 
-	obj, err := rootFs.NewObject("404")
+	obj, err := rootFs.NewObject(context.Background(), "404")
 	require.Error(t, err)
 	require.Nil(t, obj)
 }
 
-func TestInternalRemoteWrittenFileFoundInMount(t *testing.T) {
-	if !runInstance.useMount {
-		t.Skip("test needs mount mode")
-	}
-	id := fmt.Sprintf("tirwffim%v", time.Now().Unix())
-	rootFs, boltDb := runInstance.newCacheFs(t, remoteName, id, true, true, nil, nil)
-	defer runInstance.cleanupFs(t, rootFs, boltDb)
-
-	cfs, err := runInstance.getCacheFs(rootFs)
-	require.NoError(t, err)
-
-	var testData []byte
-	if runInstance.rootIsCrypt {
-		testData, err = base64.StdEncoding.DecodeString(cryptedTextBase64)
-		require.NoError(t, err)
-	} else {
-		testData = []byte("test content")
-	}
-
-	runInstance.writeObjectBytes(t, cfs.UnWrap(), runInstance.encryptRemoteIfNeeded(t, "test"), testData)
-	data, err := runInstance.readDataFromRemote(t, rootFs, "test", 0, int64(len([]byte("test content"))), false)
-	require.NoError(t, err)
-	require.Equal(t, "test content", string(data))
-}
-
 func TestInternalCachedWrittenContentMatches(t *testing.T) {
+	testy.SkipUnreliable(t)
 	id := fmt.Sprintf("ticwcm%v", time.Now().Unix())
 	rootFs, boltDb := runInstance.newCacheFs(t, remoteName, id, false, true, nil, nil)
 	defer runInstance.cleanupFs(t, rootFs, boltDb)
@@ -340,6 +311,7 @@ func TestInternalDoubleWrittenContentMatches(t *testing.T) {
 }
 
 func TestInternalCachedUpdatedContentMatches(t *testing.T) {
+	testy.SkipUnreliable(t)
 	id := fmt.Sprintf("ticucm%v", time.Now().Unix())
 	rootFs, boltDb := runInstance.newCacheFs(t, remoteName, id, false, true, nil, nil)
 	defer runInstance.cleanupFs(t, rootFs, boltDb)
@@ -354,8 +326,8 @@ func TestInternalCachedUpdatedContentMatches(t *testing.T) {
 		testData2, err = base64.StdEncoding.DecodeString(cryptedText2Base64)
 		require.NoError(t, err)
 	} else {
-		testData1 = []byte(fstest.RandomString(100))
-		testData2 = []byte(fstest.RandomString(200))
+		testData1 = []byte(random.String(100))
+		testData2 = []byte(random.String(200))
 	}
 
 	// write the object
@@ -387,10 +359,10 @@ func TestInternalWrappedWrittenContentMatches(t *testing.T) {
 
 	// write the object
 	o := runInstance.writeObjectBytes(t, cfs.UnWrap(), "data.bin", testData)
-	require.Equal(t, o.Size(), int64(testSize))
+	require.Equal(t, o.Size(), testSize)
 	time.Sleep(time.Second * 3)
 
-	checkSample, err := runInstance.readDataFromRemote(t, rootFs, "data.bin", 0, int64(testSize), false)
+	checkSample, err := runInstance.readDataFromRemote(t, rootFs, "data.bin", 0, testSize, false)
 	require.NoError(t, err)
 	require.Equal(t, int64(len(checkSample)), o.Size())
 
@@ -445,7 +417,7 @@ func TestInternalWrappedFsChangeNotSeen(t *testing.T) {
 	require.NoError(t, err)
 	log.Printf("original size: %v", originalSize)
 
-	o, err := cfs.UnWrap().NewObject(runInstance.encryptRemoteIfNeeded(t, "data.bin"))
+	o, err := cfs.UnWrap().NewObject(context.Background(), runInstance.encryptRemoteIfNeeded(t, "data.bin"))
 	require.NoError(t, err)
 	expectedSize := int64(len([]byte("test content")))
 	var data2 []byte
@@ -457,7 +429,7 @@ func TestInternalWrappedFsChangeNotSeen(t *testing.T) {
 		data2 = []byte("test content")
 	}
 	objInfo := object.NewStaticObjectInfo(runInstance.encryptRemoteIfNeeded(t, "data.bin"), time.Now(), int64(len(data2)), true, nil, cfs.UnWrap())
-	err = o.Update(bytes.NewReader(data2), objInfo)
+	err = o.Update(context.Background(), bytes.NewReader(data2), objInfo)
 	require.NoError(t, err)
 	require.Equal(t, int64(len(data2)), o.Size())
 	log.Printf("updated size: %v", len(data2))
@@ -503,9 +475,9 @@ func TestInternalMoveWithNotify(t *testing.T) {
 	} else {
 		testData = []byte("test content")
 	}
-	_ = cfs.UnWrap().Mkdir(runInstance.encryptRemoteIfNeeded(t, "test"))
-	_ = cfs.UnWrap().Mkdir(runInstance.encryptRemoteIfNeeded(t, "test/one"))
-	_ = cfs.UnWrap().Mkdir(runInstance.encryptRemoteIfNeeded(t, "test/second"))
+	_ = cfs.UnWrap().Mkdir(context.Background(), runInstance.encryptRemoteIfNeeded(t, "test"))
+	_ = cfs.UnWrap().Mkdir(context.Background(), runInstance.encryptRemoteIfNeeded(t, "test/one"))
+	_ = cfs.UnWrap().Mkdir(context.Background(), runInstance.encryptRemoteIfNeeded(t, "test/second"))
 	srcObj := runInstance.writeObjectBytes(t, cfs.UnWrap(), srcName, testData)
 
 	// list in mount
@@ -515,7 +487,7 @@ func TestInternalMoveWithNotify(t *testing.T) {
 	require.NoError(t, err)
 
 	// move file
-	_, err = cfs.UnWrap().Features().Move(srcObj, dstName)
+	_, err = cfs.UnWrap().Features().Move(context.Background(), srcObj, dstName)
 	require.NoError(t, err)
 
 	err = runInstance.retryBlock(func() error {
@@ -589,9 +561,9 @@ func TestInternalNotifyCreatesEmptyParts(t *testing.T) {
 	} else {
 		testData = []byte("test content")
 	}
-	err = rootFs.Mkdir("test")
+	err = rootFs.Mkdir(context.Background(), "test")
 	require.NoError(t, err)
-	err = rootFs.Mkdir("test/one")
+	err = rootFs.Mkdir(context.Background(), "test/one")
 	require.NoError(t, err)
 	srcObj := runInstance.writeObjectBytes(t, cfs.UnWrap(), srcName, testData)
 
@@ -608,7 +580,7 @@ func TestInternalNotifyCreatesEmptyParts(t *testing.T) {
 	require.False(t, found)
 
 	// move file
-	_, err = cfs.UnWrap().Features().Move(srcObj, dstName)
+	_, err = cfs.UnWrap().Features().Move(context.Background(), srcObj, dstName)
 	require.NoError(t, err)
 
 	err = runInstance.retryBlock(func() error {
@@ -670,91 +642,23 @@ func TestInternalChangeSeenAfterDirCacheFlush(t *testing.T) {
 	runInstance.writeRemoteBytes(t, rootFs, "data.bin", testData)
 
 	// update in the wrapped fs
-	o, err := cfs.UnWrap().NewObject(runInstance.encryptRemoteIfNeeded(t, "data.bin"))
+	o, err := cfs.UnWrap().NewObject(context.Background(), runInstance.encryptRemoteIfNeeded(t, "data.bin"))
 	require.NoError(t, err)
 	wrappedTime := time.Now().Add(-1 * time.Hour)
-	err = o.SetModTime(wrappedTime)
+	err = o.SetModTime(context.Background(), wrappedTime)
 	require.NoError(t, err)
 
 	// get a new instance from the cache
-	co, err := rootFs.NewObject("data.bin")
+	co, err := rootFs.NewObject(context.Background(), "data.bin")
 	require.NoError(t, err)
-	require.NotEqual(t, o.ModTime().String(), co.ModTime().String())
+	require.NotEqual(t, o.ModTime(context.Background()).String(), co.ModTime(context.Background()).String())
 
 	cfs.DirCacheFlush() // flush the cache
 
 	// get a new instance from the cache
-	co, err = rootFs.NewObject("data.bin")
+	co, err = rootFs.NewObject(context.Background(), "data.bin")
 	require.NoError(t, err)
-	require.Equal(t, wrappedTime.Unix(), co.ModTime().Unix())
-}
-
-func TestInternalChangeSeenAfterRc(t *testing.T) {
-	cacheExpire := rc.Calls.Get("cache/expire")
-	assert.NotNil(t, cacheExpire)
-
-	id := fmt.Sprintf("ticsarc%v", time.Now().Unix())
-	rootFs, boltDb := runInstance.newCacheFs(t, remoteName, id, false, true, nil, nil)
-	defer runInstance.cleanupFs(t, rootFs, boltDb)
-
-	if !runInstance.useMount {
-		t.Skipf("needs mount")
-	}
-	if !runInstance.wrappedIsExternal {
-		t.Skipf("needs drive")
-	}
-
-	cfs, err := runInstance.getCacheFs(rootFs)
-	require.NoError(t, err)
-	chunkSize := cfs.ChunkSize()
-
-	// create some rand test data
-	testData := randStringBytes(int(chunkSize*4 + chunkSize/2))
-	runInstance.writeRemoteBytes(t, rootFs, "data.bin", testData)
-
-	// update in the wrapped fs
-	o, err := cfs.UnWrap().NewObject(runInstance.encryptRemoteIfNeeded(t, "data.bin"))
-	require.NoError(t, err)
-	wrappedTime := time.Now().Add(-1 * time.Hour)
-	err = o.SetModTime(wrappedTime)
-	require.NoError(t, err)
-
-	// get a new instance from the cache
-	co, err := rootFs.NewObject("data.bin")
-	require.NoError(t, err)
-	require.NotEqual(t, o.ModTime().String(), co.ModTime().String())
-
-	// Call the rc function
-	m, err := cacheExpire.Fn(rc.Params{"remote": "data.bin"})
-	require.Contains(t, m, "status")
-	require.Contains(t, m, "message")
-	require.Equal(t, "ok", m["status"])
-	require.Contains(t, m["message"], "cached file cleared")
-
-	// get a new instance from the cache
-	co, err = rootFs.NewObject("data.bin")
-	require.NoError(t, err)
-	require.Equal(t, wrappedTime.Unix(), co.ModTime().Unix())
-	li1, err := runInstance.list(t, rootFs, "")
-
-	// create some rand test data
-	testData2 := randStringBytes(int(chunkSize))
-	runInstance.writeObjectBytes(t, cfs.UnWrap(), runInstance.encryptRemoteIfNeeded(t, "test2"), testData2)
-
-	// list should have 1 item only
-	li1, err = runInstance.list(t, rootFs, "")
-	require.Len(t, li1, 1)
-
-	// Call the rc function
-	m, err = cacheExpire.Fn(rc.Params{"remote": "/"})
-	require.Contains(t, m, "status")
-	require.Contains(t, m, "message")
-	require.Equal(t, "ok", m["status"])
-	require.Contains(t, m["message"], "cached directory cleared")
-
-	// list should have 2 items now
-	li2, err := runInstance.list(t, rootFs, "")
-	require.Len(t, li2, 2)
+	require.Equal(t, wrappedTime.Unix(), co.ModTime(context.Background()).Unix())
 }
 
 func TestInternalCacheWrites(t *testing.T) {
@@ -789,7 +693,7 @@ func TestInternalMaxChunkSizeRespected(t *testing.T) {
 	// create some rand test data
 	testData := randStringBytes(int(int64(totalChunks-1)*chunkSize + chunkSize/2))
 	runInstance.writeRemoteBytes(t, rootFs, "data.bin", testData)
-	o, err := cfs.NewObject(runInstance.encryptRemoteIfNeeded(t, "data.bin"))
+	o, err := cfs.NewObject(context.Background(), runInstance.encryptRemoteIfNeeded(t, "data.bin"))
 	require.NoError(t, err)
 	co, ok := o.(*cache.Object)
 	require.True(t, ok)
@@ -828,7 +732,7 @@ func TestInternalExpiredEntriesRemoved(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, l, 1)
 
-	err = cfs.UnWrap().Mkdir(runInstance.encryptRemoteIfNeeded(t, "test/third"))
+	err = cfs.UnWrap().Mkdir(context.Background(), runInstance.encryptRemoteIfNeeded(t, "test/third"))
 	require.NoError(t, err)
 
 	l, err = runInstance.list(t, rootFs, "test")
@@ -863,14 +767,14 @@ func TestInternalBug2117(t *testing.T) {
 	cfs, err := runInstance.getCacheFs(rootFs)
 	require.NoError(t, err)
 
-	err = cfs.UnWrap().Mkdir("test")
+	err = cfs.UnWrap().Mkdir(context.Background(), "test")
 	require.NoError(t, err)
 	for i := 1; i <= 4; i++ {
-		err = cfs.UnWrap().Mkdir(fmt.Sprintf("test/dir%d", i))
+		err = cfs.UnWrap().Mkdir(context.Background(), fmt.Sprintf("test/dir%d", i))
 		require.NoError(t, err)
 
 		for j := 1; j <= 4; j++ {
-			err = cfs.UnWrap().Mkdir(fmt.Sprintf("test/dir%d/dir%d", i, j))
+			err = cfs.UnWrap().Mkdir(context.Background(), fmt.Sprintf("test/dir%d/dir%d", i, j))
 			require.NoError(t, err)
 
 			runInstance.writeObjectString(t, cfs.UnWrap(), fmt.Sprintf("test/dir%d/dir%d/test.txt", i, j), "test")
@@ -904,15 +808,9 @@ func TestInternalBug2117(t *testing.T) {
 type run struct {
 	okDiff            time.Duration
 	runDefaultCfgMap  configmap.Simple
-	mntDir            string
 	tmpUploadDir      string
-	useMount          bool
-	isMounted         bool
 	rootIsCrypt       bool
 	wrappedIsExternal bool
-	unmountFn         func() error
-	unmountRes        chan error
-	vfs               *vfs.VFS
 	tempFiles         []*os.File
 	dbPath            string
 	chunkPath         string
@@ -922,9 +820,7 @@ type run struct {
 func newRun() *run {
 	var err error
 	r := &run{
-		okDiff:    time.Second * 9, // really big diff here but the build machines seem to be slow. need a different way for this
-		useMount:  useMount,
-		isMounted: false,
+		okDiff: time.Second * 9, // really big diff here but the build machines seem to be slow. need a different way for this
 	}
 
 	// Read in all the defaults for all the options
@@ -936,32 +832,6 @@ func newRun() *run {
 	for _, option := range fsInfo.Options {
 		r.runDefaultCfgMap.Set(option.Name, fmt.Sprint(option.Default))
 	}
-
-	if mountDir == "" {
-		if runtime.GOOS != "windows" {
-			r.mntDir, err = ioutil.TempDir("", "rclonecache-mount")
-			if err != nil {
-				log.Fatalf("Failed to create mount dir: %v", err)
-				return nil
-			}
-		} else {
-			// Find a free drive letter
-			drive := ""
-			for letter := 'E'; letter <= 'Z'; letter++ {
-				drive = string(letter) + ":"
-				_, err := os.Stat(drive + "\\")
-				if os.IsNotExist(err) {
-					goto found
-				}
-			}
-			log.Print("Couldn't find free drive letter for test")
-		found:
-			r.mntDir = drive
-		}
-	} else {
-		r.mntDir = mountDir
-	}
-	log.Printf("Mount Dir: %v", r.mntDir)
 
 	if uploadDir == "" {
 		r.tmpUploadDir, err = ioutil.TempDir("", "rclonecache-tmp")
@@ -1002,6 +872,15 @@ func (r *run) newCacheFs(t *testing.T, remote, id string, needRemote, purge bool
 		return nil, nil
 	}
 
+	// Config to pass to NewFs
+	m := configmap.Simple{}
+	for k, v := range r.runDefaultCfgMap {
+		m.Set(k, v)
+	}
+	for k, v := range flags {
+		m.Set(k, v)
+	}
+
 	// if the remote doesn't exist, create a new one with a local one for it
 	// identify which is the cache remote (it can be wrapped by a crypt too)
 	rootIsCrypt := false
@@ -1010,8 +889,8 @@ func (r *run) newCacheFs(t *testing.T, remote, id string, needRemote, purge bool
 		localRemote := remote + "-local"
 		config.FileSet(localRemote, "type", "local")
 		config.FileSet(localRemote, "nounc", "true")
-		config.FileSet(remote, "type", "cache")
-		config.FileSet(remote, "remote", localRemote+":/var/tmp/"+localRemote)
+		m.Set("type", "cache")
+		m.Set("remote", localRemote+":"+filepath.Join(os.TempDir(), localRemote))
 	} else {
 		remoteType := config.FileGet(remote, "type", "")
 		if remoteType == "" {
@@ -1021,8 +900,8 @@ func (r *run) newCacheFs(t *testing.T, remote, id string, needRemote, purge bool
 		if remoteType != "cache" {
 			if remoteType == "crypt" {
 				rootIsCrypt = true
-				config.FileSet(remote, "password", cryptPassword1)
-				config.FileSet(remote, "password2", cryptPassword2)
+				m.Set("password", cryptPassword1)
+				m.Set("password2", cryptPassword2)
 			}
 			remoteRemote := config.FileGet(remote, "remote", "")
 			if remoteRemote == "" {
@@ -1048,14 +927,6 @@ func (r *run) newCacheFs(t *testing.T, remote, id string, needRemote, purge bool
 
 	fs.Config.LowLevelRetries = 1
 
-	m := configmap.Simple{}
-	for k, v := range r.runDefaultCfgMap {
-		m.Set(k, v)
-	}
-	for k, v := range flags {
-		m.Set(k, v)
-	}
-
 	// Instantiate root
 	if purge {
 		boltDb.PurgeTempUploads()
@@ -1075,33 +946,21 @@ func (r *run) newCacheFs(t *testing.T, remote, id string, needRemote, purge bool
 	}
 
 	if purge {
-		_ = f.Features().Purge()
+		_ = f.Features().Purge(context.Background(), "")
 		require.NoError(t, err)
 	}
-	err = f.Mkdir("")
+	err = f.Mkdir(context.Background(), "")
 	require.NoError(t, err)
-	if r.useMount && !r.isMounted {
-		r.mountFs(t, f)
-	}
-
 	return f, boltDb
 }
 
 func (r *run) cleanupFs(t *testing.T, f fs.Fs, b *cache.Persistent) {
-	if r.useMount && r.isMounted {
-		r.unmountFs(t, f)
-	}
-
-	err := f.Features().Purge()
+	err := f.Features().Purge(context.Background(), "")
 	require.NoError(t, err)
 	cfs, err := r.getCacheFs(f)
 	require.NoError(t, err)
 	cfs.StopBackgroundRunners()
 
-	if r.useMount && runtime.GOOS != "windows" {
-		err = os.RemoveAll(r.mntDir)
-		require.NoError(t, err)
-	}
 	err = os.RemoveAll(r.tmpUploadDir)
 	require.NoError(t, err)
 
@@ -1132,23 +991,6 @@ func (r *run) randomReader(t *testing.T, size int64) io.ReadCloser {
 	return f
 }
 
-func (r *run) writeRemoteRandomBytes(t *testing.T, f fs.Fs, p string, size int64) string {
-	remote := path.Join(p, strconv.Itoa(rand.Int())+".bin")
-	// create some rand test data
-	testData := randStringBytes(int(size))
-
-	r.writeRemoteBytes(t, f, remote, testData)
-	return remote
-}
-
-func (r *run) writeObjectRandomBytes(t *testing.T, f fs.Fs, p string, size int64) fs.Object {
-	remote := path.Join(p, strconv.Itoa(rand.Int())+".bin")
-	// create some rand test data
-	testData := randStringBytes(int(size))
-
-	return r.writeObjectBytes(t, f, remote, testData)
-}
-
 func (r *run) writeRemoteString(t *testing.T, f fs.Fs, remote, content string) {
 	r.writeRemoteBytes(t, f, remote, []byte(content))
 }
@@ -1158,43 +1000,17 @@ func (r *run) writeObjectString(t *testing.T, f fs.Fs, remote, content string) f
 }
 
 func (r *run) writeRemoteBytes(t *testing.T, f fs.Fs, remote string, data []byte) {
-	var err error
-
-	if r.useMount {
-		err = r.retryBlock(func() error {
-			return ioutil.WriteFile(path.Join(r.mntDir, remote), data, 0600)
-		}, 3, time.Second*3)
-		require.NoError(t, err)
-		r.vfs.WaitForWriters(10 * time.Second)
-	} else {
-		r.writeObjectBytes(t, f, remote, data)
-	}
+	r.writeObjectBytes(t, f, remote, data)
 }
 
 func (r *run) writeRemoteReader(t *testing.T, f fs.Fs, remote string, in io.ReadCloser) {
-	defer func() {
-		_ = in.Close()
-	}()
-
-	if r.useMount {
-		out, err := os.Create(path.Join(r.mntDir, remote))
-		require.NoError(t, err)
-		defer func() {
-			_ = out.Close()
-		}()
-
-		_, err = io.Copy(out, in)
-		require.NoError(t, err)
-		r.vfs.WaitForWriters(10 * time.Second)
-	} else {
-		r.writeObjectReader(t, f, remote, in)
-	}
+	r.writeObjectReader(t, f, remote, in)
 }
 
 func (r *run) writeObjectBytes(t *testing.T, f fs.Fs, remote string, data []byte) fs.Object {
 	in := bytes.NewReader(data)
 	_ = r.writeObjectReader(t, f, remote, in)
-	o, err := f.NewObject(remote)
+	o, err := f.NewObject(context.Background(), remote)
 	require.NoError(t, err)
 	require.Equal(t, int64(len(data)), o.Size())
 	return o
@@ -1203,12 +1019,8 @@ func (r *run) writeObjectBytes(t *testing.T, f fs.Fs, remote string, data []byte
 func (r *run) writeObjectReader(t *testing.T, f fs.Fs, remote string, in io.Reader) fs.Object {
 	modTime := time.Now()
 	objInfo := object.NewStaticObjectInfo(remote, modTime, -1, true, nil, f)
-	obj, err := f.Put(in, objInfo)
+	obj, err := f.Put(context.Background(), in, objInfo)
 	require.NoError(t, err)
-	if r.useMount {
-		r.vfs.WaitForWriters(10 * time.Second)
-	}
-
 	return obj
 }
 
@@ -1216,26 +1028,16 @@ func (r *run) updateObjectRemote(t *testing.T, f fs.Fs, remote string, data1 []b
 	var err error
 	var obj fs.Object
 
-	if r.useMount {
-		err = ioutil.WriteFile(path.Join(r.mntDir, remote), data1, 0600)
-		require.NoError(t, err)
-		r.vfs.WaitForWriters(10 * time.Second)
-		err = ioutil.WriteFile(path.Join(r.mntDir, remote), data2, 0600)
-		require.NoError(t, err)
-		r.vfs.WaitForWriters(10 * time.Second)
-		obj, err = f.NewObject(remote)
-	} else {
-		in1 := bytes.NewReader(data1)
-		in2 := bytes.NewReader(data2)
-		objInfo1 := object.NewStaticObjectInfo(remote, time.Now(), int64(len(data1)), true, nil, f)
-		objInfo2 := object.NewStaticObjectInfo(remote, time.Now(), int64(len(data2)), true, nil, f)
+	in1 := bytes.NewReader(data1)
+	in2 := bytes.NewReader(data2)
+	objInfo1 := object.NewStaticObjectInfo(remote, time.Now(), int64(len(data1)), true, nil, f)
+	objInfo2 := object.NewStaticObjectInfo(remote, time.Now(), int64(len(data2)), true, nil, f)
 
-		obj, err = f.Put(in1, objInfo1)
-		require.NoError(t, err)
-		obj, err = f.NewObject(remote)
-		require.NoError(t, err)
-		err = obj.Update(in2, objInfo2)
-	}
+	obj, err = f.Put(context.Background(), in1, objInfo1)
+	require.NoError(t, err)
+	obj, err = f.NewObject(context.Background(), remote)
+	require.NoError(t, err)
+	err = obj.Update(context.Background(), in2, objInfo2)
 	require.NoError(t, err)
 
 	return obj
@@ -1245,30 +1047,12 @@ func (r *run) readDataFromRemote(t *testing.T, f fs.Fs, remote string, offset, e
 	size := end - offset
 	checkSample := make([]byte, size)
 
-	if r.useMount {
-		f, err := os.Open(path.Join(r.mntDir, remote))
-		defer func() {
-			_ = f.Close()
-		}()
-		if err != nil {
-			return checkSample, err
-		}
-		_, _ = f.Seek(offset, io.SeekStart)
-		totalRead, err := io.ReadFull(f, checkSample)
-		checkSample = checkSample[:totalRead]
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			err = nil
-		}
-		if err != nil {
-			return checkSample, err
-		}
-	} else {
-		co, err := f.NewObject(remote)
-		if err != nil {
-			return checkSample, err
-		}
-		checkSample = r.readDataFromObj(t, co, offset, end, noLengthCheck)
+	co, err := f.NewObject(context.Background(), remote)
+	if err != nil {
+		return checkSample, err
 	}
+	checkSample = r.readDataFromObj(t, co, offset, end, noLengthCheck)
+
 	if !noLengthCheck && size != int64(len(checkSample)) {
 		return checkSample, errors.Errorf("read size doesn't match expected: %v <> %v", len(checkSample), size)
 	}
@@ -1278,7 +1062,7 @@ func (r *run) readDataFromRemote(t *testing.T, f fs.Fs, remote string, offset, e
 func (r *run) readDataFromObj(t *testing.T, o fs.Object, offset, end int64, noLengthCheck bool) []byte {
 	size := end - offset
 	checkSample := make([]byte, size)
-	reader, err := o.Open(&fs.SeekOption{Offset: offset})
+	reader, err := o.Open(context.Background(), &fs.SeekOption{Offset: offset})
 	require.NoError(t, err)
 	totalRead, err := io.ReadFull(reader, checkSample)
 	if (err == io.EOF || err == io.ErrUnexpectedEOF) && noLengthCheck {
@@ -1291,28 +1075,19 @@ func (r *run) readDataFromObj(t *testing.T, o fs.Object, offset, end int64, noLe
 }
 
 func (r *run) mkdir(t *testing.T, f fs.Fs, remote string) {
-	var err error
-	if r.useMount {
-		err = os.Mkdir(path.Join(r.mntDir, remote), 0700)
-	} else {
-		err = f.Mkdir(remote)
-	}
+	err := f.Mkdir(context.Background(), remote)
 	require.NoError(t, err)
 }
 
 func (r *run) rm(t *testing.T, f fs.Fs, remote string) error {
 	var err error
 
-	if r.useMount {
-		err = os.Remove(path.Join(r.mntDir, remote))
+	var obj fs.Object
+	obj, err = f.NewObject(context.Background(), remote)
+	if err != nil {
+		err = f.Rmdir(context.Background(), remote)
 	} else {
-		var obj fs.Object
-		obj, err = f.NewObject(remote)
-		if err != nil {
-			err = f.Rmdir(remote)
-		} else {
-			err = obj.Remove()
-		}
+		err = obj.Remove(context.Background())
 	}
 
 	return err
@@ -1321,40 +1096,12 @@ func (r *run) rm(t *testing.T, f fs.Fs, remote string) error {
 func (r *run) list(t *testing.T, f fs.Fs, remote string) ([]interface{}, error) {
 	var err error
 	var l []interface{}
-	if r.useMount {
-		var list []os.FileInfo
-		list, err = ioutil.ReadDir(path.Join(r.mntDir, remote))
-		for _, ll := range list {
-			l = append(l, ll)
-		}
-	} else {
-		var list fs.DirEntries
-		list, err = f.List(remote)
-		for _, ll := range list {
-			l = append(l, ll)
-		}
+	var list fs.DirEntries
+	list, err = f.List(context.Background(), remote)
+	for _, ll := range list {
+		l = append(l, ll)
 	}
 	return l, err
-}
-
-func (r *run) listPath(t *testing.T, f fs.Fs, remote string) []string {
-	var err error
-	var l []string
-	if r.useMount {
-		var list []os.FileInfo
-		list, err = ioutil.ReadDir(path.Join(r.mntDir, remote))
-		for _, ll := range list {
-			l = append(l, ll.Name())
-		}
-	} else {
-		var list fs.DirEntries
-		list, err = f.List(remote)
-		for _, ll := range list {
-			l = append(l, ll.Remote())
-		}
-	}
-	require.NoError(t, err)
-	return l
 }
 
 func (r *run) copyFile(t *testing.T, f fs.Fs, src, dst string) error {
@@ -1381,14 +1128,8 @@ func (r *run) copyFile(t *testing.T, f fs.Fs, src, dst string) error {
 func (r *run) dirMove(t *testing.T, rootFs fs.Fs, src, dst string) error {
 	var err error
 
-	if runInstance.useMount {
-		err = os.Rename(path.Join(runInstance.mntDir, src), path.Join(runInstance.mntDir, dst))
-		if err != nil {
-			return err
-		}
-		r.vfs.WaitForWriters(10 * time.Second)
-	} else if rootFs.Features().DirMove != nil {
-		err = rootFs.Features().DirMove(rootFs, src, dst)
+	if rootFs.Features().DirMove != nil {
+		err = rootFs.Features().DirMove(context.Background(), rootFs, src, dst)
 		if err != nil {
 			return err
 		}
@@ -1403,18 +1144,12 @@ func (r *run) dirMove(t *testing.T, rootFs fs.Fs, src, dst string) error {
 func (r *run) move(t *testing.T, rootFs fs.Fs, src, dst string) error {
 	var err error
 
-	if runInstance.useMount {
-		err = os.Rename(path.Join(runInstance.mntDir, src), path.Join(runInstance.mntDir, dst))
+	if rootFs.Features().Move != nil {
+		obj1, err := rootFs.NewObject(context.Background(), src)
 		if err != nil {
 			return err
 		}
-		r.vfs.WaitForWriters(10 * time.Second)
-	} else if rootFs.Features().Move != nil {
-		obj1, err := rootFs.NewObject(src)
-		if err != nil {
-			return err
-		}
-		_, err = rootFs.Features().Move(obj1, dst)
+		_, err = rootFs.Features().Move(context.Background(), obj1, dst)
 		if err != nil {
 			return err
 		}
@@ -1429,18 +1164,12 @@ func (r *run) move(t *testing.T, rootFs fs.Fs, src, dst string) error {
 func (r *run) copy(t *testing.T, rootFs fs.Fs, src, dst string) error {
 	var err error
 
-	if r.useMount {
-		err = r.copyFile(t, rootFs, path.Join(r.mntDir, src), path.Join(r.mntDir, dst))
+	if rootFs.Features().Copy != nil {
+		obj, err := rootFs.NewObject(context.Background(), src)
 		if err != nil {
 			return err
 		}
-		r.vfs.WaitForWriters(10 * time.Second)
-	} else if rootFs.Features().Copy != nil {
-		obj, err := rootFs.NewObject(src)
-		if err != nil {
-			return err
-		}
-		_, err = rootFs.Features().Copy(obj, dst)
+		_, err = rootFs.Features().Copy(context.Background(), obj, dst)
 		if err != nil {
 			return err
 		}
@@ -1455,31 +1184,17 @@ func (r *run) copy(t *testing.T, rootFs fs.Fs, src, dst string) error {
 func (r *run) modTime(t *testing.T, rootFs fs.Fs, src string) (time.Time, error) {
 	var err error
 
-	if r.useMount {
-		fi, err := os.Stat(path.Join(runInstance.mntDir, src))
-		if err != nil {
-			return time.Time{}, err
-		}
-		return fi.ModTime(), nil
-	}
-	obj1, err := rootFs.NewObject(src)
+	obj1, err := rootFs.NewObject(context.Background(), src)
 	if err != nil {
 		return time.Time{}, err
 	}
-	return obj1.ModTime(), nil
+	return obj1.ModTime(context.Background()), nil
 }
 
 func (r *run) size(t *testing.T, rootFs fs.Fs, src string) (int64, error) {
 	var err error
 
-	if r.useMount {
-		fi, err := os.Stat(path.Join(runInstance.mntDir, src))
-		if err != nil {
-			return int64(0), err
-		}
-		return fi.Size(), nil
-	}
-	obj1, err := rootFs.NewObject(src)
+	obj1, err := rootFs.NewObject(context.Background(), src)
 	if err != nil {
 		return int64(0), err
 	}
@@ -1489,26 +1204,15 @@ func (r *run) size(t *testing.T, rootFs fs.Fs, src string) (int64, error) {
 func (r *run) updateData(t *testing.T, rootFs fs.Fs, src, data, append string) error {
 	var err error
 
-	if r.useMount {
-		f, err := os.OpenFile(path.Join(runInstance.mntDir, src), os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0644)
-		if err != nil {
-			return err
-		}
-		defer func() {
-			_ = f.Close()
-			r.vfs.WaitForWriters(10 * time.Second)
-		}()
-		_, err = f.WriteString(data + append)
-	} else {
-		obj1, err := rootFs.NewObject(src)
-		if err != nil {
-			return err
-		}
-		data1 := []byte(data + append)
-		r := bytes.NewReader(data1)
-		objInfo1 := object.NewStaticObjectInfo(src, time.Now(), int64(len(data1)), true, nil, rootFs)
-		err = obj1.Update(r, objInfo1)
+	var obj1 fs.Object
+	obj1, err = rootFs.NewObject(context.Background(), src)
+	if err != nil {
+		return err
 	}
+	data1 := []byte(data + append)
+	reader := bytes.NewReader(data1)
+	objInfo1 := object.NewStaticObjectInfo(src, time.Now(), int64(len(data1)), true, nil, rootFs)
+	err = obj1.Update(context.Background(), reader, objInfo1)
 
 	return err
 }
@@ -1632,15 +1336,13 @@ func (r *run) getCacheFs(f fs.Fs) (*cache.Fs, error) {
 	cfs, ok := f.(*cache.Fs)
 	if ok {
 		return cfs, nil
-	} else {
-		if f.Features().UnWrap != nil {
-			cfs, ok := f.Features().UnWrap().(*cache.Fs)
-			if ok {
-				return cfs, nil
-			}
+	}
+	if f.Features().UnWrap != nil {
+		cfs, ok := f.Features().UnWrap().(*cache.Fs)
+		if ok {
+			return cfs, nil
 		}
 	}
-
 	return nil, errors.New("didn't found a cache fs")
 }
 

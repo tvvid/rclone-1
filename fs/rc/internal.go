@@ -3,13 +3,17 @@
 package rc
 
 import (
+	"context"
 	"os"
 	"runtime"
+	"time"
 
-	"github.com/ncw/rclone/fs"
-	"github.com/ncw/rclone/fs/config/obscure"
-	"github.com/ncw/rclone/fs/version"
 	"github.com/pkg/errors"
+
+	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/config/obscure"
+	"github.com/rclone/rclone/fs/version"
+	"github.com/rclone/rclone/lib/atexit"
 )
 
 func init() {
@@ -34,8 +38,8 @@ check that parameter passing is working properly.`,
 	})
 }
 
-// Echo the input to the ouput parameters
-func rcNoop(in Params) (out Params, err error) {
+// Echo the input to the output parameters
+func rcNoop(ctx context.Context, in Params) (out Params, err error) {
 	return in, nil
 }
 
@@ -51,7 +55,7 @@ Useful for testing error handling.`,
 }
 
 // Return an error regardless
-func rcError(in Params) (out Params, err error) {
+func rcError(ctx context.Context, in Params) (out Params, err error) {
 	return nil, errors.Errorf("arbitrary error on input %+v", in)
 }
 
@@ -67,7 +71,7 @@ the commands response.`,
 }
 
 // List the registered commands
-func rcList(in Params) (out Params, err error) {
+func rcList(ctx context.Context, in Params) (out Params, err error) {
 	out = make(Params)
 	out["commands"] = Calls.List()
 	return out, nil
@@ -85,7 +89,7 @@ Useful for stopping rclone process.`,
 }
 
 // Return PID of current process
-func rcPid(in Params) (out Params, err error) {
+func rcPid(ctx context.Context, in Params) (out Params, err error) {
 	out = make(Params)
 	out["pid"] = os.Getpid()
 	return out, nil
@@ -111,7 +115,7 @@ The most interesting values for most people are:
 }
 
 // Return the memory statistics
-func rcMemStats(in Params) (out Params, err error) {
+func rcMemStats(ctx context.Context, in Params) (out Params, err error) {
 	out = make(Params)
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
@@ -152,7 +156,7 @@ memory problems.
 }
 
 // Do a garbage collection run
-func rcGc(in Params) (out Params, err error) {
+func rcGc(ctx context.Context, in Params) (out Params, err error) {
 	runtime.GC()
 	return nil, nil
 }
@@ -164,6 +168,7 @@ func init() {
 		Title: "Shows the current version of rclone and the go runtime.",
 		Help: `
 This shows the current version of go and the go runtime
+
 - version - rclone version, eg "v1.44"
 - decomposed - version number as [major, minor, patch, subpatch]
     - note patch and subpatch will be 999 for a git compiled version
@@ -177,7 +182,7 @@ This shows the current version of go and the go runtime
 }
 
 // Return version info
-func rcVersion(in Params) (out Params, err error) {
+func rcVersion(ctx context.Context, in Params) (out Params, err error) {
 	decomposed, err := version.New(fs.Version)
 	if err != nil {
 		return nil, err
@@ -209,7 +214,7 @@ Returns
 }
 
 // Return obscured string
-func rcObscure(in Params) (out Params, err error) {
+func rcObscure(ctx context.Context, in Params) (out Params, err error) {
 	clear, err := in.GetString("clear")
 	if err != nil {
 		return nil, err
@@ -222,4 +227,111 @@ func rcObscure(in Params) (out Params, err error) {
 		"obscured": obscured,
 	}
 	return out, nil
+}
+
+func init() {
+	Add(Call{
+		Path:  "core/quit",
+		Fn:    rcQuit,
+		Title: "Terminates the app.",
+		Help: `
+(optional) Pass an exit code to be used for terminating the app:
+- exitCode - int
+`,
+	})
+}
+
+// Terminates app
+func rcQuit(ctx context.Context, in Params) (out Params, err error) {
+	code, err := in.GetInt64("exitCode")
+
+	if IsErrParamInvalid(err) {
+		return nil, err
+	}
+	if IsErrParamNotFound(err) {
+		code = 0
+	}
+	exitCode := int(code)
+
+	go func(exitCode int) {
+		time.Sleep(time.Millisecond * 1500)
+		atexit.Run()
+		os.Exit(exitCode)
+	}(exitCode)
+
+	return nil, nil
+}
+
+func init() {
+	Add(Call{
+		Path:  "debug/set-mutex-profile-fraction",
+		Fn:    rcSetMutexProfileFraction,
+		Title: "Set runtime.SetMutexProfileFraction for mutex profiling.",
+		Help: `
+SetMutexProfileFraction controls the fraction of mutex contention
+events that are reported in the mutex profile. On average 1/rate
+events are reported. The previous rate is returned.
+
+To turn off profiling entirely, pass rate 0. To just read the current
+rate, pass rate < 0. (For n>1 the details of sampling may change.)
+
+Once this is set you can look use this to profile the mutex contention:
+
+    go tool pprof http://localhost:5572/debug/pprof/mutex
+
+Parameters
+
+- rate - int
+
+Results
+
+- previousRate - int
+`,
+	})
+}
+
+// Terminates app
+func rcSetMutexProfileFraction(ctx context.Context, in Params) (out Params, err error) {
+	rate, err := in.GetInt64("rate")
+	if err != nil {
+		return nil, err
+	}
+	previousRate := runtime.SetMutexProfileFraction(int(rate))
+	out = make(Params)
+	out["previousRate"] = previousRate
+	return out, nil
+}
+
+func init() {
+	Add(Call{
+		Path:  "debug/set-block-profile-rate",
+		Fn:    rcSetBlockProfileRate,
+		Title: "Set runtime.SetBlockProfileRate for blocking profiling.",
+		Help: `
+SetBlockProfileRate controls the fraction of goroutine blocking events
+that are reported in the blocking profile. The profiler aims to sample
+an average of one blocking event per rate nanoseconds spent blocked.
+
+To include every blocking event in the profile, pass rate = 1. To turn
+off profiling entirely, pass rate <= 0.
+
+After calling this you can use this to see the blocking profile:
+
+    go tool pprof http://localhost:5572/debug/pprof/block
+
+Parameters
+
+- rate - int
+`,
+	})
+}
+
+// Terminates app
+func rcSetBlockProfileRate(ctx context.Context, in Params) (out Params, err error) {
+	rate, err := in.GetInt64("rate")
+	if err != nil {
+		return nil, err
+	}
+	runtime.SetBlockProfileRate(int(rate))
+	return nil, nil
 }

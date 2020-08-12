@@ -9,7 +9,10 @@ import (
 )
 
 const (
+	// default time format for almost all request and responses
 	timeFormat = "2006-01-02-T15:04:05Z0700"
+	// the API server seems to use a different format
+	apiTimeFormat = "2006-01-02T15:04:05Z07:00"
 )
 
 // Time represents time values in the Jottacloud API. It uses a custom RFC3339 like format.
@@ -39,6 +42,135 @@ func (t *Time) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
 
 // Return Time string in Jottacloud format
 func (t Time) String() string { return time.Time(t).Format(timeFormat) }
+
+// APIString returns Time string in Jottacloud API format
+func (t Time) APIString() string { return time.Time(t).Format(apiTimeFormat) }
+
+// LoginToken is struct representing the login token generated in the WebUI
+type LoginToken struct {
+	Username      string `json:"username"`
+	Realm         string `json:"realm"`
+	WellKnownLink string `json:"well_known_link"`
+	AuthToken     string `json:"auth_token"`
+}
+
+// WellKnown contains some configuration parameters for setting up endpoints
+type WellKnown struct {
+	Issuer                                     string   `json:"issuer"`
+	AuthorizationEndpoint                      string   `json:"authorization_endpoint"`
+	TokenEndpoint                              string   `json:"token_endpoint"`
+	TokenIntrospectionEndpoint                 string   `json:"token_introspection_endpoint"`
+	UserinfoEndpoint                           string   `json:"userinfo_endpoint"`
+	EndSessionEndpoint                         string   `json:"end_session_endpoint"`
+	JwksURI                                    string   `json:"jwks_uri"`
+	CheckSessionIframe                         string   `json:"check_session_iframe"`
+	GrantTypesSupported                        []string `json:"grant_types_supported"`
+	ResponseTypesSupported                     []string `json:"response_types_supported"`
+	SubjectTypesSupported                      []string `json:"subject_types_supported"`
+	IDTokenSigningAlgValuesSupported           []string `json:"id_token_signing_alg_values_supported"`
+	UserinfoSigningAlgValuesSupported          []string `json:"userinfo_signing_alg_values_supported"`
+	RequestObjectSigningAlgValuesSupported     []string `json:"request_object_signing_alg_values_supported"`
+	ResponseNodesSupported                     []string `json:"response_modes_supported"`
+	RegistrationEndpoint                       string   `json:"registration_endpoint"`
+	TokenEndpointAuthMethodsSupported          []string `json:"token_endpoint_auth_methods_supported"`
+	TokenEndpointAuthSigningAlgValuesSupported []string `json:"token_endpoint_auth_signing_alg_values_supported"`
+	ClaimsSupported                            []string `json:"claims_supported"`
+	ClaimTypesSupported                        []string `json:"claim_types_supported"`
+	ClaimsParameterSupported                   bool     `json:"claims_parameter_supported"`
+	ScopesSupported                            []string `json:"scopes_supported"`
+	RequestParameterSupported                  bool     `json:"request_parameter_supported"`
+	RequestURIParameterSupported               bool     `json:"request_uri_parameter_supported"`
+	CodeChallengeMethodsSupported              []string `json:"code_challenge_methods_supported"`
+	TLSClientCertificateBoundAccessTokens      bool     `json:"tls_client_certificate_bound_access_tokens"`
+	IntrospectionEndpoint                      string   `json:"introspection_endpoint"`
+}
+
+// TokenJSON is the struct representing the HTTP response from OAuth2
+// providers returning a token in JSON form.
+type TokenJSON struct {
+	AccessToken      string `json:"access_token"`
+	ExpiresIn        int32  `json:"expires_in"` // at least PayPal returns string, while most return number
+	RefreshExpiresIn int32  `json:"refresh_expires_in"`
+	RefreshToken     string `json:"refresh_token"`
+	TokenType        string `json:"token_type"`
+	IDToken          string `json:"id_token"`
+	NotBeforePolicy  int32  `json:"not-before-policy"`
+	SessionState     string `json:"session_state"`
+	Scope            string `json:"scope"`
+}
+
+// JSON structures returned by new API
+
+// AllocateFileRequest to prepare an upload to Jottacloud
+type AllocateFileRequest struct {
+	Bytes    int64  `json:"bytes"`
+	Created  string `json:"created"`
+	Md5      string `json:"md5"`
+	Modified string `json:"modified"`
+	Path     string `json:"path"`
+}
+
+// AllocateFileResponse for upload requests
+type AllocateFileResponse struct {
+	Name      string `json:"name"`
+	Path      string `json:"path"`
+	State     string `json:"state"`
+	UploadID  string `json:"upload_id"`
+	UploadURL string `json:"upload_url"`
+	Bytes     int64  `json:"bytes"`
+	ResumePos int64  `json:"resume_pos"`
+}
+
+// UploadResponse after an upload
+type UploadResponse struct {
+	Name      string      `json:"name"`
+	Path      string      `json:"path"`
+	Kind      string      `json:"kind"`
+	ContentID string      `json:"content_id"`
+	Bytes     int64       `json:"bytes"`
+	Md5       string      `json:"md5"`
+	Created   int64       `json:"created"`
+	Modified  int64       `json:"modified"`
+	Deleted   interface{} `json:"deleted"`
+	Mime      string      `json:"mime"`
+}
+
+// DeviceRegistrationResponse is the response to registering a device
+type DeviceRegistrationResponse struct {
+	ClientID     string `json:"client_id"`
+	ClientSecret string `json:"client_secret"`
+}
+
+// CustomerInfo provides general information about the account. Required for finding the correct internal username.
+type CustomerInfo struct {
+	Username          string      `json:"username"`
+	Email             string      `json:"email"`
+	Name              string      `json:"name"`
+	CountryCode       string      `json:"country_code"`
+	LanguageCode      string      `json:"language_code"`
+	CustomerGroupCode string      `json:"customer_group_code"`
+	BrandCode         string      `json:"brand_code"`
+	AccountType       string      `json:"account_type"`
+	SubscriptionType  string      `json:"subscription_type"`
+	Usage             int64       `json:"usage"`
+	Qouta             int64       `json:"quota"`
+	BusinessUsage     int64       `json:"business_usage"`
+	BusinessQouta     int64       `json:"business_quota"`
+	WriteLocked       bool        `json:"write_locked"`
+	ReadLocked        bool        `json:"read_locked"`
+	LockedCause       interface{} `json:"locked_cause"`
+	WebHash           string      `json:"web_hash"`
+	AndroidHash       string      `json:"android_hash"`
+	IOSHash           string      `json:"ios_hash"`
+}
+
+// TrashResponse is returned when emptying the Trash
+type TrashResponse struct {
+	Folders int64 `json:"folders"`
+	Files   int64 `json:"files"`
+}
+
+// XML structures returned by the old API
 
 // Flag is a hacky type for checking if an attribute is present
 type Flag bool
@@ -87,8 +219,8 @@ GET http://www.jottacloud.com/JFS/<account>
 </user>
 */
 
-// AccountInfo represents a Jottacloud account
-type AccountInfo struct {
+// DriveInfo represents a Jottacloud account
+type DriveInfo struct {
 	Username          string        `xml:"username"`
 	AccountType       string        `xml:"account-type"`
 	Locked            bool          `xml:"locked"`

@@ -9,27 +9,35 @@ import (
 	"os/signal"
 	"sync"
 
-	"github.com/ncw/rclone/fs"
+	"github.com/rclone/rclone/fs"
 )
 
 var (
-	fns          []func()
+	fns          = make(map[FnHandle]bool)
+	fnsMutex     sync.Mutex
 	exitChan     chan os.Signal
 	exitOnce     sync.Once
 	registerOnce sync.Once
 )
 
-// Register a function to be called on exit
-func Register(fn func()) {
-	fns = append(fns, fn)
-	// Run AtExit handlers on SIGINT or SIGTERM so everything gets
-	// tidied up properly
+// FnHandle is the type of the handle returned by function `Register`
+// that can be used to unregister an at-exit function
+type FnHandle *func()
+
+// Register a function to be called on exit.
+// Returns a handle which can be used to unregister the function with `Unregister`.
+func Register(fn func()) FnHandle {
+	fnsMutex.Lock()
+	fns[&fn] = true
+	fnsMutex.Unlock()
+
+	// Run AtExit handlers on exitSignals so everything gets tidied up properly
 	registerOnce.Do(func() {
 		exitChan = make(chan os.Signal, 1)
-		signal.Notify(exitChan, os.Interrupt) // syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT
+		signal.Notify(exitChan, exitSignals...)
 		go func() {
-			sig, closed := <-exitChan
-			if closed || sig == nil {
+			sig := <-exitChan
+			if sig == nil {
 				return
 			}
 			fs.Infof(nil, "Signal received: %s", sig)
@@ -38,9 +46,18 @@ func Register(fn func()) {
 			os.Exit(0)
 		}()
 	})
+
+	return &fn
 }
 
-// IgnoreSignals disables the signal handler and prevents Run from beeing executed automatically
+// Unregister a function using the handle returned by `Register`
+func Unregister(handle FnHandle) {
+	fnsMutex.Lock()
+	defer fnsMutex.Unlock()
+	delete(fns, handle)
+}
+
+// IgnoreSignals disables the signal handler and prevents Run from being executed automatically
 func IgnoreSignals() {
 	registerOnce.Do(func() {})
 	if exitChan != nil {
@@ -53,8 +70,30 @@ func IgnoreSignals() {
 // Run all the at exit functions if they haven't been run already
 func Run() {
 	exitOnce.Do(func() {
-		for _, fn := range fns {
-			fn()
+		fnsMutex.Lock()
+		defer fnsMutex.Unlock()
+		for fnHandle := range fns {
+			(*fnHandle)()
 		}
 	})
+}
+
+// OnError registers fn with atexit and returns a function which
+// runs fn() if *perr != nil and deregisters fn
+//
+// It should be used in a defer statement normally so
+//
+//     defer OnError(&err, cancelFunc)()
+//
+// So cancelFunc will be run if the function exits with an error or
+// at exit.
+func OnError(perr *error, fn func()) func() {
+	handle := Register(fn)
+	return func() {
+		defer Unregister(handle)
+		if *perr != nil {
+			fn()
+		}
+	}
+
 }

@@ -1,9 +1,10 @@
-// +build !plan9
+// +build !plan9,!js
 
 package cache
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -15,10 +16,10 @@ import (
 	"sync"
 	"time"
 
-	bolt "github.com/coreos/bbolt"
-	"github.com/ncw/rclone/fs"
-	"github.com/ncw/rclone/fs/walk"
 	"github.com/pkg/errors"
+	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/walk"
+	bolt "go.etcd.io/bbolt"
 )
 
 // Constants
@@ -398,7 +399,7 @@ func (b *Persistent) AddObject(cachedObject *Object) error {
 		if err != nil {
 			return errors.Errorf("couldn't marshal object (%v) info: %v", cachedObject, err)
 		}
-		err = bucket.Put([]byte(cachedObject.Name), []byte(encoded))
+		err = bucket.Put([]byte(cachedObject.Name), encoded)
 		if err != nil {
 			return errors.Errorf("couldn't cache object (%v) info: %v", cachedObject, err)
 		}
@@ -766,31 +767,6 @@ func (b *Persistent) iterateBuckets(buk *bolt.Bucket, bucketFn func(name string)
 	return err
 }
 
-func (b *Persistent) dumpRoot() string {
-	var itBuckets func(buk *bolt.Bucket) map[string]interface{}
-
-	itBuckets = func(buk *bolt.Bucket) map[string]interface{} {
-		m := make(map[string]interface{})
-		c := buk.Cursor()
-		for k, v := c.First(); k != nil; k, v = c.Next() {
-			if v == nil {
-				buk2 := buk.Bucket(k)
-				m[string(k)] = itBuckets(buk2)
-			} else {
-				m[string(k)] = "-"
-			}
-		}
-		return m
-	}
-	var mm map[string]interface{}
-	_ = b.db.View(func(tx *bolt.Tx) error {
-		mm = itBuckets(tx.Bucket([]byte(RootBucket)))
-		return nil
-	})
-	raw, _ := json.MarshalIndent(mm, "", "  ")
-	return string(raw)
-}
-
 // addPendingUpload adds a new file to the pending queue of uploads
 func (b *Persistent) addPendingUpload(destPath string, started bool) error {
 	return b.db.Update(func(tx *bolt.Tx) error {
@@ -809,7 +785,7 @@ func (b *Persistent) addPendingUpload(destPath string, started bool) error {
 		if err != nil {
 			return errors.Errorf("couldn't marshal object (%v) info: %v", destPath, err)
 		}
-		err = bucket.Put([]byte(destPath), []byte(encoded))
+		err = bucket.Put([]byte(destPath), encoded)
 		if err != nil {
 			return errors.Errorf("couldn't cache object (%v) info: %v", destPath, err)
 		}
@@ -1004,17 +980,8 @@ func (b *Persistent) updatePendingUpload(remote string, fn func(item *tempUpload
 	})
 }
 
-// SetPendingUploadToStarted is a way to mark an entry as started (even if it's not already)
-// TO BE USED IN TESTING ONLY
-func (b *Persistent) SetPendingUploadToStarted(remote string) error {
-	return b.updatePendingUpload(remote, func(item *tempUploadInfo) error {
-		item.Started = true
-		return nil
-	})
-}
-
 // ReconcileTempUploads will recursively look for all the files in the temp directory and add them to the queue
-func (b *Persistent) ReconcileTempUploads(cacheFs *Fs) error {
+func (b *Persistent) ReconcileTempUploads(ctx context.Context, cacheFs *Fs) error {
 	return b.db.Update(func(tx *bolt.Tx) error {
 		_ = tx.DeleteBucket([]byte(tempBucket))
 		bucket, err := tx.CreateBucketIfNotExists([]byte(tempBucket))
@@ -1023,7 +990,7 @@ func (b *Persistent) ReconcileTempUploads(cacheFs *Fs) error {
 		}
 
 		var queuedEntries []fs.Object
-		err = walk.Walk(cacheFs.tempFs, "", true, -1, func(path string, entries fs.DirEntries, err error) error {
+		err = walk.ListR(ctx, cacheFs.tempFs, "", true, -1, walk.ListObjects, func(entries fs.DirEntries) error {
 			for _, o := range entries {
 				if oo, ok := o.(fs.Object); ok {
 					queuedEntries = append(queuedEntries, oo)
@@ -1049,26 +1016,13 @@ func (b *Persistent) ReconcileTempUploads(cacheFs *Fs) error {
 			if err != nil {
 				return errors.Errorf("couldn't marshal object (%v) info: %v", queuedEntry, err)
 			}
-			err = bucket.Put([]byte(destPath), []byte(encoded))
+			err = bucket.Put([]byte(destPath), encoded)
 			if err != nil {
 				return errors.Errorf("couldn't cache object (%v) info: %v", destPath, err)
 			}
 			fs.Debugf(cacheFs, "reconciled temporary upload: %v", destPath)
 		}
 
-		return nil
-	})
-}
-
-// PurgeTempUploads will remove all the pending uploads from the queue
-// TO BE USED IN TESTING ONLY
-func (b *Persistent) PurgeTempUploads() {
-	b.tempQueueMux.Lock()
-	defer b.tempQueueMux.Unlock()
-
-	_ = b.db.Update(func(tx *bolt.Tx) error {
-		_ = tx.DeleteBucket([]byte(tempBucket))
-		_, _ = tx.CreateBucketIfNotExists([]byte(tempBucket))
 		return nil
 	})
 }

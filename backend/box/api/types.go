@@ -45,7 +45,7 @@ type Error struct {
 	RequestID   string `json:"request_id"`
 }
 
-// Error returns a string for the error and statistifes the error interface
+// Error returns a string for the error and satisfies the error interface
 func (e *Error) Error() string {
 	out := fmt.Sprintf("Error %q (%d)", e.Code, e.Status)
 	if e.Message != "" {
@@ -57,7 +57,7 @@ func (e *Error) Error() string {
 	return out
 }
 
-// Check Error statisfies the error interface
+// Check Error satisfies the error interface
 var _ error = (*Error)(nil)
 
 // ItemFields are the fields needed for FileInfo
@@ -201,4 +201,44 @@ type CommitUpload struct {
 		ContentCreatedAt  Time `json:"content_created_at"`
 		ContentModifiedAt Time `json:"content_modified_at"`
 	} `json:"attributes"`
+}
+
+// ConfigJSON defines the shape of a box config.json
+type ConfigJSON struct {
+	BoxAppSettings AppSettings `json:"boxAppSettings"`
+	EnterpriseID   string      `json:"enterpriseID"`
+}
+
+// AppSettings defines the shape of the boxAppSettings within box config.json
+type AppSettings struct {
+	ClientID     string  `json:"clientID"`
+	ClientSecret string  `json:"clientSecret"`
+	AppAuth      AppAuth `json:"appAuth"`
+}
+
+// AppAuth defines the shape of the appAuth within boxAppSettings in config.json
+type AppAuth struct {
+	PublicKeyID string `json:"publicKeyID"`
+	PrivateKey  string `json:"privateKey"`
+	Passphrase  string `json:"passphrase"`
+}
+
+// User is returned from /users/me
+type User struct {
+	Type          string    `json:"type"`
+	ID            string    `json:"id"`
+	Name          string    `json:"name"`
+	Login         string    `json:"login"`
+	CreatedAt     time.Time `json:"created_at"`
+	ModifiedAt    time.Time `json:"modified_at"`
+	Language      string    `json:"language"`
+	Timezone      string    `json:"timezone"`
+	SpaceAmount   int64     `json:"space_amount"`
+	SpaceUsed     int64     `json:"space_used"`
+	MaxUploadSize int64     `json:"max_upload_size"`
+	Status        string    `json:"status"`
+	JobTitle      string    `json:"job_title"`
+	Phone         string    `json:"phone"`
+	Address       string    `json:"address"`
+	AvatarURL     string    `json:"avatar_url"`
 }
