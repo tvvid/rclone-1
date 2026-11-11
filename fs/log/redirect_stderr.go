@@ -1,13 +1,13 @@
 // Log the panic to the log file - for oses which can't do this
 
-// +build !windows,!darwin,!dragonfly,!freebsd,!linux,!nacl,!netbsd,!openbsd
+//go:build !windows && !darwin && !dragonfly && !freebsd && !linux && !nacl && !netbsd && !openbsd && !aix
 
 package log
 
 import (
 	"os"
 
-	"github.com/ncw/rclone/fs"
+	"github.com/rclone/rclone/fs"
 )
 
 // redirectStderr to the file passed in

@@ -1,67 +1,22 @@
-// +build go1.9
-
 package restic
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
 
-	"github.com/ncw/rclone/cmd"
-	"github.com/ncw/rclone/cmd/serve/httplib/httpflags"
+	"github.com/rclone/rclone/cmd"
+	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/config/configfile"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-// declare a few helper functions
-
-// wantFunc tests the HTTP response in res and marks the test as errored if something is incorrect.
-type wantFunc func(t testing.TB, res *httptest.ResponseRecorder)
-
-// newRequest returns a new HTTP request with the given params. On error, the
-// test is marked as failed.
-func newRequest(t testing.TB, method, path string, body io.Reader) *http.Request {
-	req, err := http.NewRequest(method, path, body)
-	require.NoError(t, err)
-	return req
-}
-
-// wantCode returns a function which checks that the response has the correct HTTP status code.
-func wantCode(code int) wantFunc {
-	return func(t testing.TB, res *httptest.ResponseRecorder) {
-		assert.Equal(t, code, res.Code)
-	}
-}
-
-// wantBody returns a function which checks that the response has the data in the body.
-func wantBody(body string) wantFunc {
-	return func(t testing.TB, res *httptest.ResponseRecorder) {
-		assert.NotNil(t, res.Body)
-		assert.Equal(t, res.Body.Bytes(), []byte(body))
-	}
-}
-
-// checkRequest uses f to process the request and runs the checker functions on the result.
-func checkRequest(t testing.TB, f http.HandlerFunc, req *http.Request, want []wantFunc) {
-	rr := httptest.NewRecorder()
-	f(rr, req)
-
-	for _, fn := range want {
-		fn(t, rr)
-	}
-}
-
-// TestRequest is a sequence of HTTP requests with (optional) tests for the response.
-type TestRequest struct {
-	req  *http.Request
-	want []wantFunc
-}
 
 // createOverwriteDeleteSeq returns a sequence which will create a new file at
 // path, and then try to overwrite and delete it.
@@ -111,6 +66,8 @@ func createOverwriteDeleteSeq(t testing.TB, path string) []TestRequest {
 
 // TestResticHandler runs tests on the restic handler code, especially in append-only mode.
 func TestResticHandler(t *testing.T) {
+	ctx := context.Background()
+	configfile.Install()
 	buf := make([]byte, 32)
 	_, err := io.ReadFull(rand.Reader, buf)
 	require.NoError(t, err)
@@ -156,28 +113,20 @@ func TestResticHandler(t *testing.T) {
 	}
 
 	// setup rclone with a local backend in a temporary directory
-	tempdir, err := ioutil.TempDir("", "rclone-restic-test-")
-	require.NoError(t, err)
+	tempdir := t.TempDir()
 
-	// make sure the tempdir is properly removed
-	defer func() {
-		err := os.RemoveAll(tempdir)
-		require.NoError(t, err)
-	}()
-
-	// globally set append-only mode
-	prev := appendOnly
-	appendOnly = true
-	defer func() {
-		appendOnly = prev // reset when done
-	}()
+	// set append-only mode
+	opt := newOpt()
+	opt.AppendOnly = true
 
 	// make a new file system in the temp dir
 	f := cmd.NewFsSrc([]string{tempdir})
-	srv := newServer(f, &httpflags.Opt)
+	s, err := newServer(ctx, f, &opt)
+	require.NoError(t, err)
+	router := s.server.Router()
 
 	// create the repo
-	checkRequest(t, srv.handler,
+	checkRequest(t, router.ServeHTTP,
 		newRequest(t, "POST", "/?create=true", nil),
 		[]wantFunc{wantCode(http.StatusOK)})
 
@@ -185,8 +134,65 @@ func TestResticHandler(t *testing.T) {
 		t.Run("", func(t *testing.T) {
 			for i, seq := range test.seq {
 				t.Logf("request %v: %v %v", i, seq.req.Method, seq.req.URL.Path)
-				checkRequest(t, srv.handler, seq.req, seq.want)
+				checkRequest(t, router.ServeHTTP, seq.req, seq.want)
 			}
 		})
 	}
+}
+
+func TestAppendOnlyFailsClosedOnLookupError(t *testing.T) {
+	ctx := context.Background()
+	configfile.Install()
+
+	underlying := cmd.NewFsSrc([]string{t.TempDir()})
+	f := &newObjectErrorFs{
+		Fs:  underlying,
+		err: errors.New("lookup failed"),
+	}
+	opt := newOpt()
+	opt.AppendOnly = true
+	s, err := newServer(ctx, f, &opt)
+	require.NoError(t, err)
+
+	req := newRequest(t, "POST", "/config", strings.NewReader("replacement"))
+	checkRequest(t, s.server.Router().ServeHTTP, req, []wantFunc{wantCode(http.StatusInternalServerError)})
+
+	_, err = underlying.NewObject(ctx, "config")
+	assert.ErrorIs(t, err, fs.ErrorObjectNotFound)
+}
+
+func TestAppendOnlyConcurrentUploads(t *testing.T) {
+	configfile.Install()
+	opt := newOpt()
+	opt.AppendOnly = true
+	f := cmd.NewFsSrc([]string{t.TempDir()})
+	s, err := newServer(context.Background(), f, &opt)
+	require.NoError(t, err)
+	handler := s.server.Router().ServeHTTP
+
+	const uploads = 10
+	start := make(chan struct{})
+	results := make(chan int, uploads)
+	for range uploads {
+		go func() {
+			req := newRequest(t, "POST", "/config", strings.NewReader("config data"))
+			recorder := httptest.NewRecorder()
+			<-start
+			handler(recorder, req)
+			results <- recorder.Code
+		}()
+	}
+	close(start)
+
+	succeeded := 0
+	for range uploads {
+		if code := <-results; code == http.StatusOK {
+			succeeded++
+		} else {
+			assert.Equal(t, http.StatusForbidden, code)
+		}
+	}
+	assert.Equal(t, 1, succeeded)
+	checkRequest(t, handler, newRequest(t, "GET", "/config", nil),
+		[]wantFunc{wantCode(http.StatusOK), wantBody("config data")})
 }

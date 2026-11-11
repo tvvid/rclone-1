@@ -1,9 +1,11 @@
 package swift
 
 import (
+	"context"
 	"net/http"
+	"time"
 
-	"github.com/ncw/swift"
+	"github.com/ncw/swift/v2"
 )
 
 // auth is an authenticator for swift.  It overrides the StorageUrl
@@ -27,19 +29,19 @@ func newAuth(parentAuth swift.Authenticator, storageURL string, authToken string
 }
 
 // Request creates an http.Request for the auth - return nil if not needed
-func (a *auth) Request(c *swift.Connection) (*http.Request, error) {
+func (a *auth) Request(ctx context.Context, c *swift.Connection) (*http.Request, error) {
 	if a.parentAuth == nil {
 		return nil, nil
 	}
-	return a.parentAuth.Request(c)
+	return a.parentAuth.Request(ctx, c)
 }
 
 // Response parses the http.Response
-func (a *auth) Response(resp *http.Response) error {
+func (a *auth) Response(ctx context.Context, resp *http.Response) error {
 	if a.parentAuth == nil {
 		return nil
 	}
-	return a.parentAuth.Response(resp)
+	return a.parentAuth.Response(ctx, resp)
 }
 
 // The public storage URL - set Internal to true to read
@@ -65,6 +67,14 @@ func (a *auth) Token() string {
 	return a.parentAuth.Token()
 }
 
+// Expires returns the time the token expires if known or Zero if not.
+func (a *auth) Expires() (t time.Time) {
+	if do, ok := a.parentAuth.(swift.Expireser); ok {
+		t = do.Expires()
+	}
+	return t
+}
+
 // The CDN url if available
 func (a *auth) CdnUrl() string { // nolint
 	if a.parentAuth == nil {
@@ -74,4 +84,7 @@ func (a *auth) CdnUrl() string { // nolint
 }
 
 // Check the interfaces are satisfied
-var _ swift.Authenticator = (*auth)(nil)
+var (
+	_ swift.Authenticator = (*auth)(nil)
+	_ swift.Expireser     = (*auth)(nil)
+)

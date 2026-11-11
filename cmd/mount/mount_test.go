@@ -1,13 +1,14 @@
-// +build linux darwin freebsd
+//go:build linux
 
 package mount
 
 import (
 	"testing"
 
-	"github.com/ncw/rclone/cmd/mountlib/mounttest"
+	"github.com/rclone/rclone/vfs/vfscommon"
+	"github.com/rclone/rclone/vfs/vfstest"
 )
 
 func TestMount(t *testing.T) {
-	mounttest.RunTests(t, mount)
+	vfstest.RunTests(t, false, vfscommon.CacheModeOff, true, mount)
 }

@@ -1,39 +1,45 @@
+// Package ls provides the ls command.
 package ls
 
 import (
+	"context"
 	"os"
 
-	"github.com/ncw/rclone/cmd"
-	"github.com/ncw/rclone/cmd/ls/lshelp"
-	"github.com/ncw/rclone/fs/operations"
+	"github.com/rclone/rclone/cmd"
+	"github.com/rclone/rclone/cmd/ls/lshelp"
+	"github.com/rclone/rclone/fs/operations"
 	"github.com/spf13/cobra"
 )
 
 func init() {
-	cmd.Root.AddCommand(commandDefintion)
+	cmd.Root.AddCommand(commandDefinition)
 }
 
-var commandDefintion = &cobra.Command{
+var commandDefinition = &cobra.Command{
 	Use:   "ls remote:path",
 	Short: `List the objects in the path with size and path.`,
-	Long: `
-Lists the objects in the source path to standard output in a human
+	Long: `Lists the objects in the source path to standard output in a human
 readable format with size and path. Recurses by default.
 
-Eg
+E.g.
 
-    $ rclone ls swift:bucket
-        60295 bevajer5jef
-        90613 canole
-        94467 diwogej7
-        37600 fubuwic
+` + "```console" + `
+$ rclone ls swift:bucket
+    60295 bevajer5jef
+    90613 canole
+    94467 diwogej7
+    37600 fubuwic
+` + "```" + `
 
 ` + lshelp.Help,
+	Annotations: map[string]string{
+		"groups": "Filter,Listing",
+	},
 	Run: func(command *cobra.Command, args []string) {
 		cmd.CheckArgs(1, 1, command, args)
 		fsrc := cmd.NewFsSrc(args)
 		cmd.Run(false, false, command, func() error {
-			return operations.List(fsrc, os.Stdout)
+			return operations.List(context.Background(), fsrc, os.Stdout)
 		})
 	},
 }

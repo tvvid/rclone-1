@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """
 Update the authors.md file with the authors from the git log
 """
@@ -7,31 +7,47 @@ import re
 import subprocess
 
 AUTHORS = "docs/content/authors.md"
-IGNORE = [ "nick@raig-wood.com" ]
+IGNORE = "bin/.ignore-emails"
 
-def load():
+def load(filename):
     """
-    returns a set of emails already in authors.md
+    returns a set of emails already in the file
     """
-    with open(AUTHORS) as fd:
+    with open(filename) as fd:
         authors = fd.read()
-    emails = set(re.findall(r"<(.*?)>", authors))
-    emails.update(IGNORE)
-    return emails
+    return set(re.findall(r"<(.*?)>", authors))
 
-def add_email(name, email):
+def add_email(added, name, email):
     """
-    adds the email passed in to the end of authors.md
+    adds the email passed in to the end of authors.md and records it in added
     """
-    print "Adding %s <%s>" % (name, email)
+    print("Adding %s <%s>" % (name, email))
     with open(AUTHORS, "a+") as fd:
-        print >>fd, "  * %s <%s>" % (name, email)
-    subprocess.check_call(["git", "commit", "-m", "Add %s to contributors" % name, AUTHORS])
-    
-def main():
-    out = subprocess.check_output(["git", "log", '--reverse', '--format=%an|%ae', "master"])
+        print("- %s <%s>" % (name, email), file=fd)
+    added.append((name, email))
 
-    previous = load()
+def commit(added):
+    """
+    commits authors.md with a message describing the names in added
+    """
+    if not added:
+        return
+    if len(added) == 1:
+        message = "Add %s to contributors" % added[0][0]
+    else:
+        message = "Add %d new contributors\n\n" % len(added)
+        message += "".join("- %s\n" % name for name, _ in added)
+    subprocess.check_call(["git", "commit", "-m", message, AUTHORS])
+
+def main():
+    # Add emails from authors
+    out = subprocess.check_output(["git", "log", '--reverse', '--format=%an|%ae', "master"])
+    out = out.decode("utf-8")
+
+    ignored = load(IGNORE)
+    previous = load(AUTHORS)
+    previous.update(ignored)
+    added = []
     for line in out.split("\n"):
         line = line.strip()
         if line == "":
@@ -40,7 +56,27 @@ def main():
         if email in previous:
             continue
         previous.add(email)
-        add_email(name, email)
+        add_email(added, name, email)
+
+    # Add emails from Co-authored-by: lines
+    out = subprocess.check_output(["git", "log", '-i', '--grep', 'Co-authored-by:', "master"])
+    out = out.decode("utf-8")
+    co_authored_by = re.compile(r"(?i)Co-authored-by:\s+(.*?)\s+<([^>]+)>$")
+
+    for line in out.split("\n"):
+        line = line.strip()
+        m = co_authored_by.search(line)
+        if not m:
+            continue
+        name, email = m.group(1), m.group(2)
+        name = name.strip()
+        email = email.strip()
+        if email in previous:
+            continue
+        previous.add(email)
+        add_email(added, name, email)
+
+    commit(added)
 
 if __name__ == "__main__":
     main()

@@ -1,36 +1,55 @@
+// Package deletefile provides the deletefile command.
 package deletefile
 
 import (
-	"github.com/ncw/rclone/cmd"
-	"github.com/ncw/rclone/fs/operations"
-	"github.com/pkg/errors"
+	"context"
+	"fmt"
+	"strings"
+
+	"github.com/rclone/rclone/cmd"
+	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/operations"
 	"github.com/spf13/cobra"
 )
 
 func init() {
-	cmd.Root.AddCommand(commandDefintion)
+	cmd.Root.AddCommand(commandDefinition)
 }
 
-var commandDefintion = &cobra.Command{
+var commandDefinition = &cobra.Command{
 	Use:   "deletefile remote:path",
 	Short: `Remove a single file from remote.`,
-	Long: `
-Remove a single file from remote.  Unlike ` + "`" + `delete` + "`" + ` it cannot be used to
-remove a directory and it doesn't obey include/exclude filters - if the specified file exists,
-it will always be removed.
-`,
+	// Warning! "|" will be replaced by backticks below
+	Long: strings.ReplaceAll(`Remove a single file from remote. Unlike |delete| it cannot be used to
+remove a directory and it doesn't obey include/exclude filters - if the
+specified file exists, it will always be removed from its original location.
+
+The |--backup-dir| and |--suffix| flags are honored when set.`, "|", "`"),
+	Annotations: map[string]string{
+		"versionIntroduced": "v1.42",
+		"groups":            "Important,Sync",
+	},
 	Run: func(command *cobra.Command, args []string) {
 		cmd.CheckArgs(1, 1, command, args)
-		fs, fileName := cmd.NewFsFile(args[0])
+		f, fileName := cmd.NewFsFile(args[0])
 		cmd.Run(true, false, command, func() error {
+			ctx := context.Background()
 			if fileName == "" {
-				return errors.Errorf("%s is a directory or doesn't exist", args[0])
+				return fmt.Errorf("%s is a directory or doesn't exist: %w", args[0], fs.ErrorObjectNotFound)
 			}
-			fileObj, err := fs.NewObject(fileName)
+			fileObj, err := f.NewObject(ctx, fileName)
 			if err != nil {
 				return err
 			}
-			return operations.DeleteFile(fileObj)
+			ci := fs.GetConfig(ctx)
+			var backupDir fs.Fs
+			if ci.BackupDir != "" || ci.Suffix != "" {
+				backupDir, err = operations.BackupDir(ctx, f, f, fileName)
+				if err != nil {
+					return err
+				}
+			}
+			return operations.DeleteFileWithBackupDir(ctx, fileObj, backupDir)
 		})
 	},
 }

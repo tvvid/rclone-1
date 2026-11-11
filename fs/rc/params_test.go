@@ -1,12 +1,18 @@
 package rc
 
 import (
+	"errors"
 	"fmt"
+	"math"
+	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
 
-	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/rclone/rclone/fs"
 )
 
 func TestErrParamNotFoundError(t *testing.T) {
@@ -58,6 +64,19 @@ func TestReshape(t *testing.T) {
 
 }
 
+func TestParamsCopy(t *testing.T) {
+	in := Params{
+		"ok":  1,
+		"x":   "seventeen",
+		"nil": nil,
+	}
+	out := in.Copy()
+	assert.Equal(t, in, out)
+	if &in == &out {
+		t.Error("didn't copy")
+	}
+}
+
 func TestParamsGet(t *testing.T) {
 	in := Params{
 		"ok": 1,
@@ -91,7 +110,7 @@ func TestParamsGetString(t *testing.T) {
 
 func TestParamsGetInt64(t *testing.T) {
 	for _, test := range []struct {
-		value     interface{}
+		value     any
 		result    int64
 		errString string
 	}{
@@ -100,8 +119,15 @@ func TestParamsGetInt64(t *testing.T) {
 		{int(12), 12, ""},
 		{int64(13), 13, ""},
 		{float64(14), 14, ""},
-		{float64(9.3E18), 0, "overflows int64"},
-		{float64(-9.3E18), 0, "overflows int64"},
+		{float64(9.3e18), 0, "overflows int64"},
+		{float64(-9.3e18), 0, "overflows int64"},
+		{float64(math.MaxInt64), 0, "overflows int64"},
+		{math.Nextafter(float64(math.MaxInt64), 0), 9223372036854774784, ""},
+		{float64(math.MinInt64), math.MinInt64, ""},
+		{"3000000000", 3000000000, ""},
+		{"9223372036854775807", math.MaxInt64, ""},
+		{"-9223372036854775808", math.MinInt64, ""},
+		{"9223372036854775808", 0, "couldn't parse"},
 	} {
 		t.Run(fmt.Sprintf("%T=%v", test.value, test.value), func(t *testing.T) {
 			in := Params{
@@ -132,9 +158,44 @@ func TestParamsGetInt64(t *testing.T) {
 	assert.Equal(t, true, IsErrParamInvalid(e3), e3.Error())
 }
 
+func TestParamsGetInt(t *testing.T) {
+	in := Params{
+		"int":      "123",
+		"bad":      "123x",
+		"notInt":   []string{"a", "b"},
+		"maxInt":   int64(math.MaxInt),
+		"minInt":   int64(math.MinInt),
+		"overflow": "9223372036854775808",
+	}
+	v, err := in.GetInt("int")
+	require.NoError(t, err)
+	assert.Equal(t, 123, v)
+	v, err = in.GetInt("maxInt")
+	require.NoError(t, err)
+	assert.Equal(t, math.MaxInt, v)
+	v, err = in.GetInt("minInt")
+	require.NoError(t, err)
+	assert.Equal(t, math.MinInt, v)
+	for _, key := range []string{"bad", "notInt", "overflow"} {
+		v, err = in.GetInt(key)
+		assert.True(t, IsErrParamInvalid(err), key)
+		assert.Equal(t, 0, v)
+	}
+	v, err = in.GetInt("notFound")
+	assert.Equal(t, ErrParamNotFound("notFound"), err)
+	assert.Equal(t, 0, v)
+	if math.MaxInt == math.MaxInt32 {
+		in["big"] = int64(math.MaxInt32) + 1
+		v, err = in.GetInt("big")
+		assert.True(t, IsErrParamInvalid(err))
+		assert.Contains(t, err.Error(), "overflows int")
+		assert.Equal(t, 0, v)
+	}
+}
+
 func TestParamsGetFloat64(t *testing.T) {
 	for _, test := range []struct {
-		value     interface{}
+		value     any
 		result    float64
 		errString string
 	}{
@@ -173,9 +234,60 @@ func TestParamsGetFloat64(t *testing.T) {
 	assert.Equal(t, true, IsErrParamInvalid(e3), e3.Error())
 }
 
+func TestParamsGetDuration(t *testing.T) {
+	for _, test := range []struct {
+		value     any
+		result    time.Duration
+		errString string
+	}{
+		{"86400", time.Hour * 24, ""},
+		{"1y", time.Hour * 24 * 365, ""},
+		{"60", time.Minute * 1, ""},
+		{"0", 0, ""},
+		{"-45", -time.Second * 45, ""},
+		{"2", time.Second * 2, ""},
+		{"2h4m7s", time.Hour*2 + 4*time.Minute + 7*time.Second, ""},
+		{"3d", time.Hour * 24 * 3, ""},
+		{"off", time.Duration(fs.DurationOff), ""},
+		{"", 0, "parse duration"},
+		{12, 0, "expecting string"},
+		{"34y", time.Hour * 24 * 365 * 34, ""},
+		{"30d", time.Hour * 24 * 30, ""},
+		{"2M", time.Hour * 24 * 60, ""},
+		{"wrong", 0, "parse duration"},
+	} {
+		t.Run(fmt.Sprintf("%T=%v", test.value, test.value), func(t *testing.T) {
+			in := Params{
+				"key": test.value,
+			}
+			v1, e1 := in.GetDuration("key")
+			if test.errString == "" {
+				require.NoError(t, e1)
+				assert.Equal(t, test.result, v1)
+			} else {
+				require.NotNil(t, e1)
+				require.Error(t, e1)
+				assert.Contains(t, e1.Error(), test.errString)
+				assert.Equal(t, time.Duration(0), v1)
+			}
+		})
+	}
+	in := Params{
+		"notDuration": []string{"a", "b"},
+	}
+	v2, e2 := in.GetDuration("notOK")
+	assert.Error(t, e2)
+	assert.Equal(t, time.Duration(0), v2)
+	assert.Equal(t, ErrParamNotFound("notOK"), e2)
+	v3, e3 := in.GetDuration("notDuration")
+	assert.Error(t, e3)
+	assert.Equal(t, time.Duration(0), v3)
+	assert.Equal(t, true, IsErrParamInvalid(e3), e3.Error())
+}
+
 func TestParamsGetBool(t *testing.T) {
 	for _, test := range []struct {
-		value     interface{}
+		value     any
 		result    bool
 		errString string
 	}{
@@ -248,4 +360,97 @@ func TestParamsGetStruct(t *testing.T) {
 	assert.Equal(t, "one", out.String)
 	assert.Equal(t, 4.2, out.Float)
 	assert.Equal(t, true, IsErrParamInvalid(e3), e3.Error())
+}
+
+func TestParamsGetStructString(t *testing.T) {
+	in := Params{
+		"struct": `{"String": "one", "Float": 4.2}`,
+	}
+	var out struct {
+		String string
+		Float  float64
+	}
+	e1 := in.GetStruct("struct", &out)
+	assert.NoError(t, e1)
+	assert.Equal(t, "one", out.String)
+	assert.Equal(t, 4.2, out.Float)
+}
+
+func TestParamsGetStructMissingOK(t *testing.T) {
+	in := Params{
+		"struct": Params{
+			"String": "one",
+			"Float":  4.2,
+		},
+	}
+	var out struct {
+		String string
+		Float  float64
+	}
+	e1 := in.GetStructMissingOK("struct", &out)
+	assert.NoError(t, e1)
+	assert.Equal(t, "one", out.String)
+	assert.Equal(t, 4.2, out.Float)
+
+	e2 := in.GetStructMissingOK("notOK", &out)
+	assert.NoError(t, e2)
+	assert.Equal(t, "one", out.String)
+	assert.Equal(t, 4.2, out.Float)
+
+	in["struct"] = "string"
+	e3 := in.GetStructMissingOK("struct", &out)
+	assert.Error(t, e3)
+	assert.Equal(t, "one", out.String)
+	assert.Equal(t, 4.2, out.Float)
+	assert.Equal(t, true, IsErrParamInvalid(e3), e3.Error())
+}
+
+func TestParamsGetHTTPRequest(t *testing.T) {
+	in := Params{}
+	req, err := in.GetHTTPRequest()
+	assert.Nil(t, req)
+	assert.Error(t, err)
+	assert.Equal(t, true, IsErrParamNotFound(err), err.Error())
+
+	in = Params{
+		"_request": 42,
+	}
+	req, err = in.GetHTTPRequest()
+	assert.Nil(t, req)
+	assert.Error(t, err)
+	assert.Equal(t, true, IsErrParamInvalid(err), err.Error())
+
+	r := new(http.Request)
+	in = Params{
+		"_request": r,
+	}
+	req, err = in.GetHTTPRequest()
+	assert.NotNil(t, req)
+	assert.NoError(t, err)
+	assert.Equal(t, r, req)
+}
+
+func TestParamsGetHTTPResponseWriter(t *testing.T) {
+	in := Params{}
+	wr, err := in.GetHTTPResponseWriter()
+	assert.Nil(t, wr)
+	assert.Error(t, err)
+	assert.Equal(t, true, IsErrParamNotFound(err), err.Error())
+
+	in = Params{
+		"_response": 42,
+	}
+	wr, err = in.GetHTTPResponseWriter()
+	assert.Nil(t, wr)
+	assert.Error(t, err)
+	assert.Equal(t, true, IsErrParamInvalid(err), err.Error())
+
+	var w http.ResponseWriter = httptest.NewRecorder()
+	in = Params{
+		"_response": w,
+	}
+	wr, err = in.GetHTTPResponseWriter()
+	assert.NotNil(t, wr)
+	assert.NoError(t, err)
+	assert.Equal(t, w, wr)
 }

@@ -13,18 +13,18 @@ type Error struct {
 	} `json:"error"`
 }
 
-// Error statisfies the error interface
+// Error satisfies the error interface
 func (e *Error) Error() string {
 	return fmt.Sprintf("%s (Error %d)", e.Info.Message, e.Info.Code)
 }
 
-// Account describes a OpenDRIVE account
+// Account describes an OpenDRIVE account
 type Account struct {
 	Username string `json:"username"`
 	Password string `json:"passwd"`
 }
 
-// UserSessionInfo describes a OpenDRIVE session
+// UserSessionInfo describes an OpenDRIVE session
 type UserSessionInfo struct {
 	Username string `json:"username"`
 	Password string `json:"passwd"`
@@ -45,7 +45,7 @@ type UserSessionInfo struct {
 	PartnerUsersDomain string          `json:"PartnerUsersDomain"`
 }
 
-// FolderList describes a OpenDRIVE listing
+// FolderList describes an OpenDRIVE listing
 type FolderList struct {
 	// DirUpdateTime    string   `json:"DirUpdateTime,string"`
 	Name             string   `json:"Name"`
@@ -56,7 +56,7 @@ type FolderList struct {
 	Files            []File   `json:"Files"`
 }
 
-// Folder describes a OpenDRIVE folder
+// Folder describes an OpenDRIVE folder
 type Folder struct {
 	FolderID      string `json:"FolderID"`
 	Name          string `json:"Name"`
@@ -100,6 +100,13 @@ type moveCopyFolder struct {
 	NewFolderName string `json:"new_folder_name"` // New name for destination folder.
 }
 
+type renameFolder struct {
+	SessionID  string `json:"session_id"`
+	FolderID   string `json:"folder_id"`
+	FolderName string `json:"folder_name"` // New name for destination folder (max 255).
+	SharingID  string `json:"sharing_id"`
+}
+
 type moveCopyFolderResponse struct {
 	FolderID string `json:"FolderID"`
 }
@@ -109,7 +116,7 @@ type removeFolder struct {
 	FolderID  string `json:"folder_id"`
 }
 
-// File describes a OpenDRIVE file
+// File describes an OpenDRIVE file
 type File struct {
 	FileID            string `json:"FileId"`
 	FileHash          string `json:"FileHash"`
@@ -144,6 +151,14 @@ type moveCopyFile struct {
 type moveCopyFileResponse struct {
 	FileID string `json:"FileID"`
 	Size   string `json:"Size"`
+}
+
+type renameFile struct {
+	SessionID      string `json:"session_id"`
+	NewFileName    string `json:"new_file_name"` // New name for destination file.
+	FileID         string `json:"file_id"`
+	AccessFolderID string `json:"access_folder_id"`
+	SharingID      string `json:"sharing_id"`
 }
 
 type createFile struct {
@@ -211,4 +226,15 @@ type permissions struct {
 	SessionID    string `json:"session_id"`
 	FileID       string `json:"file_id"`
 	FileIsPublic int64  `json:"file_ispublic"`
+}
+
+type uploadFileChunkReply struct {
+	TotalWritten int64 `json:"TotalWritten"`
+}
+
+// usersInfoResponse describes OpenDrive users/info.json response
+type usersInfoResponse struct {
+	// This response contains many other values but these are the only ones currently in use
+	StorageUsed int64 `json:"StorageUsed,string"`
+	MaxStorage  int64 `json:"MaxStorage,string"`
 }

@@ -4,8 +4,8 @@ package b2
 import (
 	"testing"
 
-	"github.com/ncw/rclone/fs"
-	"github.com/ncw/rclone/fstest/fstests"
+	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fstest/fstests"
 )
 
 // TestIntegration runs integration tests against the remote
@@ -28,7 +28,12 @@ func (f *Fs) SetUploadCutoff(cs fs.SizeSuffix) (fs.SizeSuffix, error) {
 	return f.setUploadCutoff(cs)
 }
 
+func (f *Fs) SetCopyCutoff(cs fs.SizeSuffix) (fs.SizeSuffix, error) {
+	return f.setCopyCutoff(cs)
+}
+
 var (
 	_ fstests.SetUploadChunkSizer = (*Fs)(nil)
 	_ fstests.SetUploadCutoffer   = (*Fs)(nil)
+	_ fstests.SetCopyCutoffer     = (*Fs)(nil)
 )

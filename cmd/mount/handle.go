@@ -1,15 +1,15 @@
-// +build linux darwin freebsd
+//go:build linux
 
 package mount
 
 import (
+	"context"
 	"io"
 
 	"bazil.org/fuse"
 	fusefs "bazil.org/fuse/fs"
-	"github.com/ncw/rclone/fs/log"
-	"github.com/ncw/rclone/vfs"
-	"golang.org/x/net/context" // switch to "context" when we stop supporting go1.8
+	"github.com/rclone/rclone/fs/log"
+	"github.com/rclone/rclone/vfs"
 )
 
 // FileHandle is an open for read file handle on a File
@@ -24,15 +24,13 @@ var _ fusefs.HandleReader = (*FileHandle)(nil)
 func (fh *FileHandle) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) (err error) {
 	var n int
 	defer log.Trace(fh, "len=%d, offset=%d", req.Size, req.Offset)("read=%d, err=%v", &n, &err)
-	data := make([]byte, req.Size)
+	data := resp.Data[:req.Size]
 	n, err = fh.Handle.ReadAt(data, req.Offset)
+	resp.Data = data[:n]
 	if err == io.EOF {
 		err = nil
-	} else if err != nil {
-		return translateError(err)
 	}
-	resp.Data = data[:n]
-	return nil
+	return translateError(err)
 }
 
 // Check interface satisfied
@@ -45,7 +43,7 @@ func (fh *FileHandle) Write(ctx context.Context, req *fuse.WriteRequest, resp *f
 	if err != nil {
 		return translateError(err)
 	}
-	resp.Size = int(n)
+	resp.Size = n
 	return nil
 }
 

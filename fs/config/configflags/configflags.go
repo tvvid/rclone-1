@@ -4,15 +4,15 @@ package configflags
 
 // Options set by command line flags
 import (
-	"log"
+	"context"
 	"net"
-	"path/filepath"
+	"os"
+	"strconv"
 	"strings"
 
-	"github.com/ncw/rclone/fs"
-	"github.com/ncw/rclone/fs/config"
-	"github.com/ncw/rclone/fs/config/flags"
-	"github.com/ncw/rclone/fs/rc"
+	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/config"
+	"github.com/rclone/rclone/fs/config/flags"
 	"github.com/spf13/pflag"
 )
 
@@ -20,6 +20,9 @@ var (
 	// these will get interpreted into fs.Config via SetFlags() below
 	verbose         int
 	quiet           bool
+	configPath      string
+	cacheDir        string
+	tempDir         string
 	dumpHeaders     bool
 	dumpBodies      bool
 	deleteBefore    bool
@@ -27,143 +30,222 @@ var (
 	deleteAfter     bool
 	bindAddr        string
 	disableFeatures string
+	dscp            string
+	uploadHeaders   []string
+	downloadHeaders []string
+	headers         []string
+	metadataSet     []string
 )
 
 // AddFlags adds the non filing system specific flags to the command
-func AddFlags(flagSet *pflag.FlagSet) {
-	rc.AddOption("main", fs.Config)
-	// NB defaults which aren't the zero for the type should be set in fs/config.go NewConfig
-	flags.CountVarP(flagSet, &verbose, "verbose", "v", "Print lots more stuff (repeat for more)")
-	flags.BoolVarP(flagSet, &quiet, "quiet", "q", false, "Print as little stuff as possible")
-	flags.DurationVarP(flagSet, &fs.Config.ModifyWindow, "modify-window", "", fs.Config.ModifyWindow, "Max time diff to be considered the same")
-	flags.IntVarP(flagSet, &fs.Config.Checkers, "checkers", "", fs.Config.Checkers, "Number of checkers to run in parallel.")
-	flags.IntVarP(flagSet, &fs.Config.Transfers, "transfers", "", fs.Config.Transfers, "Number of file transfers to run in parallel.")
-	flags.StringVarP(flagSet, &config.ConfigPath, "config", "", config.ConfigPath, "Config file.")
-	flags.StringVarP(flagSet, &config.CacheDir, "cache-dir", "", config.CacheDir, "Directory rclone will use for caching.")
-	flags.BoolVarP(flagSet, &fs.Config.CheckSum, "checksum", "c", fs.Config.CheckSum, "Skip based on checksum & size, not mod-time & size")
-	flags.BoolVarP(flagSet, &fs.Config.SizeOnly, "size-only", "", fs.Config.SizeOnly, "Skip based on size only, not mod-time or checksum")
-	flags.BoolVarP(flagSet, &fs.Config.IgnoreTimes, "ignore-times", "I", fs.Config.IgnoreTimes, "Don't skip files that match size and time - transfer all files")
-	flags.BoolVarP(flagSet, &fs.Config.IgnoreExisting, "ignore-existing", "", fs.Config.IgnoreExisting, "Skip all files that exist on destination")
-	flags.BoolVarP(flagSet, &fs.Config.IgnoreErrors, "ignore-errors", "", fs.Config.IgnoreErrors, "delete even if there are I/O errors")
-	flags.BoolVarP(flagSet, &fs.Config.DryRun, "dry-run", "n", fs.Config.DryRun, "Do a trial run with no permanent changes")
-	flags.DurationVarP(flagSet, &fs.Config.ConnectTimeout, "contimeout", "", fs.Config.ConnectTimeout, "Connect timeout")
-	flags.DurationVarP(flagSet, &fs.Config.Timeout, "timeout", "", fs.Config.Timeout, "IO idle timeout")
-	flags.BoolVarP(flagSet, &dumpHeaders, "dump-headers", "", false, "Dump HTTP bodies - may contain sensitive info")
-	flags.BoolVarP(flagSet, &dumpBodies, "dump-bodies", "", false, "Dump HTTP headers and bodies - may contain sensitive info")
-	flags.BoolVarP(flagSet, &fs.Config.InsecureSkipVerify, "no-check-certificate", "", fs.Config.InsecureSkipVerify, "Do not verify the server SSL certificate. Insecure.")
-	flags.BoolVarP(flagSet, &fs.Config.AskPassword, "ask-password", "", fs.Config.AskPassword, "Allow prompt for password for encrypted configuration.")
-	flags.BoolVarP(flagSet, &deleteBefore, "delete-before", "", false, "When synchronizing, delete files on destination before transferring")
-	flags.BoolVarP(flagSet, &deleteDuring, "delete-during", "", false, "When synchronizing, delete files during transfer")
-	flags.BoolVarP(flagSet, &deleteAfter, "delete-after", "", false, "When synchronizing, delete files on destination after transferring (default)")
-	flags.IntVar64P(flagSet, &fs.Config.MaxDelete, "max-delete", "", -1, "When synchronizing, limit the number of deletes")
-	flags.BoolVarP(flagSet, &fs.Config.TrackRenames, "track-renames", "", fs.Config.TrackRenames, "When synchronizing, track file renames and do a server side move if possible")
-	flags.IntVarP(flagSet, &fs.Config.LowLevelRetries, "low-level-retries", "", fs.Config.LowLevelRetries, "Number of low level retries to do.")
-	flags.BoolVarP(flagSet, &fs.Config.UpdateOlder, "update", "u", fs.Config.UpdateOlder, "Skip files that are newer on the destination.")
-	flags.BoolVarP(flagSet, &fs.Config.UseServerModTime, "use-server-modtime", "", fs.Config.UseServerModTime, "Use server modified time instead of object metadata")
-	flags.BoolVarP(flagSet, &fs.Config.NoGzip, "no-gzip-encoding", "", fs.Config.NoGzip, "Don't set Accept-Encoding: gzip.")
-	flags.IntVarP(flagSet, &fs.Config.MaxDepth, "max-depth", "", fs.Config.MaxDepth, "If set limits the recursion depth to this.")
-	flags.BoolVarP(flagSet, &fs.Config.IgnoreSize, "ignore-size", "", false, "Ignore size when skipping use mod-time or checksum.")
-	flags.BoolVarP(flagSet, &fs.Config.IgnoreChecksum, "ignore-checksum", "", fs.Config.IgnoreChecksum, "Skip post copy check of checksums.")
-	flags.BoolVarP(flagSet, &fs.Config.NoTraverse, "no-traverse", "", fs.Config.NoTraverse, "Don't traverse destination file system on copy.")
-	flags.BoolVarP(flagSet, &fs.Config.NoUpdateModTime, "no-update-modtime", "", fs.Config.NoUpdateModTime, "Don't update destination mod-time if files identical.")
-	flags.StringVarP(flagSet, &fs.Config.BackupDir, "backup-dir", "", fs.Config.BackupDir, "Make backups into hierarchy based in DIR.")
-	flags.StringVarP(flagSet, &fs.Config.Suffix, "suffix", "", fs.Config.Suffix, "Suffix for use with --backup-dir.")
-	flags.BoolVarP(flagSet, &fs.Config.UseListR, "fast-list", "", fs.Config.UseListR, "Use recursive list if available. Uses more memory but fewer transactions.")
-	flags.Float64VarP(flagSet, &fs.Config.TPSLimit, "tpslimit", "", fs.Config.TPSLimit, "Limit HTTP transactions per second to this.")
-	flags.IntVarP(flagSet, &fs.Config.TPSLimitBurst, "tpslimit-burst", "", fs.Config.TPSLimitBurst, "Max burst of transactions for --tpslimit.")
-	flags.StringVarP(flagSet, &bindAddr, "bind", "", "", "Local address to bind to for outgoing connections, IPv4, IPv6 or name.")
-	flags.StringVarP(flagSet, &disableFeatures, "disable", "", "", "Disable a comma separated list of features.  Use help to see a list.")
-	flags.StringVarP(flagSet, &fs.Config.UserAgent, "user-agent", "", fs.Config.UserAgent, "Set the user-agent to a specified string. The default is rclone/ version")
-	flags.BoolVarP(flagSet, &fs.Config.Immutable, "immutable", "", fs.Config.Immutable, "Do not modify files. Fail if existing files have been modified.")
-	flags.BoolVarP(flagSet, &fs.Config.AutoConfirm, "auto-confirm", "", fs.Config.AutoConfirm, "If enabled, do not request console confirmation.")
-	flags.IntVarP(flagSet, &fs.Config.StatsFileNameLength, "stats-file-name-length", "", fs.Config.StatsFileNameLength, "Max file name length in stats. 0 for no limit")
-	flags.FVarP(flagSet, &fs.Config.LogLevel, "log-level", "", "Log level DEBUG|INFO|NOTICE|ERROR")
-	flags.FVarP(flagSet, &fs.Config.StatsLogLevel, "stats-log-level", "", "Log level to show --stats output DEBUG|INFO|NOTICE|ERROR")
-	flags.FVarP(flagSet, &fs.Config.BwLimit, "bwlimit", "", "Bandwidth limit in kBytes/s, or use suffix b|k|M|G or a full timetable.")
-	flags.FVarP(flagSet, &fs.Config.BufferSize, "buffer-size", "", "In memory buffer size when reading files for each --transfer.")
-	flags.FVarP(flagSet, &fs.Config.StreamingUploadCutoff, "streaming-upload-cutoff", "", "Cutoff for switching to chunked upload if file size is unknown. Upload starts after reaching cutoff or when file ends.")
-	flags.FVarP(flagSet, &fs.Config.Dump, "dump", "", "List of items to dump from: "+fs.DumpFlagsList)
-	flags.FVarP(flagSet, &fs.Config.MaxTransfer, "max-transfer", "", "Maximum size of data to transfer.")
-	flags.IntVarP(flagSet, &fs.Config.MaxBacklog, "max-backlog", "", fs.Config.MaxBacklog, "Maximum number of objects in sync or check backlog.")
-	flags.BoolVarP(flagSet, &fs.Config.StatsOneLine, "stats-one-line", "", fs.Config.StatsOneLine, "Make the stats fit on one line.")
-	flags.BoolVarP(flagSet, &fs.Config.Progress, "progress", "P", fs.Config.Progress, "Show progress during transfer.")
+func AddFlags(ci *fs.ConfigInfo, flagSet *pflag.FlagSet) {
+	flags.AddFlagsFromOptions(flagSet, "", fs.ConfigOptionsInfo)
+
+	// Add flags we haven't converted into options yet
+	flags.CountVarP(flagSet, &verbose, "verbose", "v", "Print lots more stuff (repeat for more)", "Logging,Important")
+	flags.BoolVarP(flagSet, &quiet, "quiet", "q", false, "Print as little stuff as possible", "Logging")
+	flags.StringVarP(flagSet, &configPath, "config", "", config.GetConfigPath(), "Config file", "Config")
+	flags.StringVarP(flagSet, &cacheDir, "cache-dir", "", config.GetCacheDir(), "Directory rclone will use for caching", "Config")
+	flags.StringVarP(flagSet, &tempDir, "temp-dir", "", os.TempDir(), "Directory rclone will use for temporary files", "Config")
+	flags.BoolVarP(flagSet, &dumpHeaders, "dump-headers", "", false, "Dump HTTP headers - may contain sensitive info", "Debugging")
+	flags.BoolVarP(flagSet, &dumpBodies, "dump-bodies", "", false, "Dump HTTP headers and bodies - may contain sensitive info", "Debugging")
+	flags.BoolVarP(flagSet, &deleteBefore, "delete-before", "", false, "When synchronizing, delete files on destination before transferring", "Sync")
+	flags.BoolVarP(flagSet, &deleteDuring, "delete-during", "", false, "When synchronizing, delete files during transfer", "Sync")
+	flags.BoolVarP(flagSet, &deleteAfter, "delete-after", "", false, "When synchronizing, delete files on destination after transferring (default)", "Sync")
+	flags.StringVarP(flagSet, &bindAddr, "bind", "", "", "Local address to bind to for outgoing connections, IPv4, IPv6 or name", "Networking")
+	flags.StringVarP(flagSet, &disableFeatures, "disable", "", "", "Disable a comma separated list of features (use --disable help to see a list)", "Config")
+	flags.StringArrayVarP(flagSet, &uploadHeaders, "header-upload", "", nil, "Set HTTP header for upload transactions", "Networking")
+	flags.StringArrayVarP(flagSet, &downloadHeaders, "header-download", "", nil, "Set HTTP header for download transactions", "Networking")
+	flags.StringArrayVarP(flagSet, &headers, "header", "", nil, "Set HTTP header for all transactions", "Networking")
+	flags.StringArrayVarP(flagSet, &metadataSet, "metadata-set", "", nil, "Add metadata key=value when uploading", "Metadata")
+	flags.StringVarP(flagSet, &dscp, "dscp", "", "", "Set DSCP value to connections, value or name, e.g. CS1, LE, DF, AF21", "Networking")
 }
 
-// SetFlags converts any flags into config which weren't straight foward
-func SetFlags() {
-	if verbose >= 2 {
-		fs.Config.LogLevel = fs.LogLevelDebug
-	} else if verbose >= 1 {
-		fs.Config.LogLevel = fs.LogLevelInfo
-	}
-	if quiet {
-		if verbose > 0 {
-			log.Fatalf("Can't set -v and -q")
-		}
-		fs.Config.LogLevel = fs.LogLevelError
-	}
-	logLevelFlag := pflag.Lookup("log-level")
-	if logLevelFlag != nil && logLevelFlag.Changed {
-		if verbose > 0 {
-			log.Fatalf("Can't set -v and --log-level")
-		}
-		if quiet {
-			log.Fatalf("Can't set -q and --log-level")
-		}
-	}
-
+// SetFlags sets flags which aren't part of the config system
+func SetFlags(ci *fs.ConfigInfo) {
+	// Process obsolete --dump-headers and --dump-bodies flags
 	if dumpHeaders {
-		fs.Config.Dump |= fs.DumpHeaders
+		ci.Dump |= fs.DumpHeaders
 		fs.Logf(nil, "--dump-headers is obsolete - please use --dump headers instead")
 	}
 	if dumpBodies {
-		fs.Config.Dump |= fs.DumpBodies
+		ci.Dump |= fs.DumpBodies
 		fs.Logf(nil, "--dump-bodies is obsolete - please use --dump bodies instead")
 	}
 
+	// Process -v flag
+	if verbose >= 2 {
+		ci.LogLevel = fs.LogLevelDebug
+	} else if verbose >= 1 {
+		ci.LogLevel = fs.LogLevelInfo
+	}
+
+	// Process -q flag
+	if quiet {
+		if verbose > 0 {
+			fs.Fatalf(nil, "Can't set -v and -q")
+		}
+		ci.LogLevel = fs.LogLevelError
+	}
+
+	// Can't set log level, -v, -q
+	logLevelFlag := pflag.Lookup("log-level")
+	if logLevelFlag != nil && logLevelFlag.Changed {
+		if verbose > 0 {
+			fs.Fatalf(nil, "Can't set -v and --log-level")
+		}
+		if quiet {
+			fs.Fatalf(nil, "Can't set -q and --log-level")
+		}
+	}
+
+	// Process --delete-before, --delete-during and --delete-after
 	switch {
 	case deleteBefore && (deleteDuring || deleteAfter),
 		deleteDuring && deleteAfter:
-		log.Fatalf(`Only one of --delete-before, --delete-during or --delete-after can be used.`)
+		fs.Fatalf(nil, `Only one of --delete-before, --delete-during or --delete-after can be used.`)
 	case deleteBefore:
-		fs.Config.DeleteMode = fs.DeleteModeBefore
+		ci.DeleteMode = fs.DeleteModeBefore
 	case deleteDuring:
-		fs.Config.DeleteMode = fs.DeleteModeDuring
+		ci.DeleteMode = fs.DeleteModeDuring
 	case deleteAfter:
-		fs.Config.DeleteMode = fs.DeleteModeAfter
+		ci.DeleteMode = fs.DeleteModeAfter
 	default:
-		fs.Config.DeleteMode = fs.DeleteModeDefault
+		ci.DeleteMode = fs.DeleteModeDefault
 	}
 
-	if fs.Config.IgnoreSize && fs.Config.SizeOnly {
-		log.Fatalf(`Can't use --size-only and --ignore-size together.`)
-	}
-
-	if fs.Config.Suffix != "" && fs.Config.BackupDir == "" {
-		log.Fatalf(`Can only use --suffix with --backup-dir.`)
-	}
-
+	// Process --bind into IP address
 	if bindAddr != "" {
 		addrs, err := net.LookupIP(bindAddr)
 		if err != nil {
-			log.Fatalf("--bind: Failed to parse %q as IP address: %v", bindAddr, err)
+			fs.Fatalf(nil, "--bind: Failed to parse %q as IP address: %v", bindAddr, err)
 		}
 		if len(addrs) != 1 {
-			log.Fatalf("--bind: Expecting 1 IP address for %q but got %d", bindAddr, len(addrs))
+			fs.Fatalf(nil, "--bind: Expecting 1 IP address for %q but got %d", bindAddr, len(addrs))
 		}
-		fs.Config.BindAddr = addrs[0]
+		ci.BindAddr = addrs[0]
 	}
 
+	// Process --disable
 	if disableFeatures != "" {
 		if disableFeatures == "help" {
-			log.Fatalf("Possible backend features are: %s\n", strings.Join(new(fs.Features).List(), ", "))
+			fs.Fatalf(nil, "Possible backend features are: %s\n", strings.Join(new(fs.Features).List(), ", "))
 		}
-		fs.Config.DisableFeatures = strings.Split(disableFeatures, ",")
+		ci.DisableFeatures = strings.Split(disableFeatures, ",")
 	}
 
-	// Make the config file absolute
-	configPath, err := filepath.Abs(config.ConfigPath)
-	if err == nil {
-		config.ConfigPath = configPath
+	// Process --headers-upload, --headers-download, --headers
+	if len(uploadHeaders) != 0 {
+		ci.UploadHeaders = fs.MustParseHeaders(uploadHeaders)
+	}
+	if len(downloadHeaders) != 0 {
+		ci.DownloadHeaders = fs.MustParseHeaders(downloadHeaders)
+	}
+	if len(headers) != 0 {
+		ci.Headers = fs.MustParseHeaders(headers)
+	}
+
+	// Process --metadata-set
+	if len(metadataSet) != 0 {
+		ci.MetadataSet = make(fs.Metadata, len(metadataSet))
+		for _, kv := range metadataSet {
+			equal := strings.IndexRune(kv, '=')
+			if equal < 0 {
+				fs.Fatalf(nil, "Failed to parse '%s' as metadata key=value.", kv)
+			}
+			ci.MetadataSet[strings.ToLower(kv[:equal])] = kv[equal+1:]
+		}
+		fs.Debugf(nil, "MetadataUpload %v", ci.MetadataSet)
+	}
+
+	// Process --dscp
+	if len(dscp) != 0 {
+		if value, ok := parseDSCP(dscp); ok {
+			ci.TrafficClass = value << 2
+		} else {
+			fs.Fatalf(nil, "--dscp: Invalid DSCP name: %v", dscp)
+		}
+	}
+
+	// Process --config path
+	if err := config.SetConfigPath(configPath); err != nil {
+		fs.Fatalf(nil, "--config: Failed to set %q as config path: %v", configPath, err)
+	}
+
+	// Process --cache-dir path
+	if err := config.SetCacheDir(cacheDir); err != nil {
+		fs.Fatalf(nil, "--cache-dir: Failed to set %q as cache dir: %v", cacheDir, err)
+	}
+
+	// Process --temp-dir path
+	if err := config.SetTempDir(tempDir); err != nil {
+		fs.Fatalf(nil, "--temp-dir: Failed to set %q as temp dir: %v", tempDir, err)
+	}
+
+	// Process --multi-thread-streams - set whether multi-thread-streams was set
+	multiThreadStreamsFlag := pflag.Lookup("multi-thread-streams")
+	ci.MultiThreadSet = multiThreadStreamsFlag != nil && multiThreadStreamsFlag.Changed
+
+	// Reload any changes
+	if err := ci.Reload(context.Background()); err != nil {
+		fs.Fatalf(nil, "Failed to reload config changes: %v", err)
+	}
+}
+
+// parseDSCP converts DSCP names to value
+func parseDSCP(dscp string) (uint8, bool) {
+	if s, err := strconv.ParseUint(dscp, 10, 6); err == nil {
+		return uint8(s), true
+	}
+	dscp = strings.ToUpper(dscp)
+	switch dscp {
+	case "BE":
+		fallthrough
+	case "DF":
+		fallthrough
+	case "CS0":
+		return 0x00, true
+	case "CS1":
+		return 0x08, true
+	case "AF11":
+		return 0x0A, true
+	case "AF12":
+		return 0x0C, true
+	case "AF13":
+		return 0x0E, true
+	case "CS2":
+		return 0x10, true
+	case "AF21":
+		return 0x12, true
+	case "AF22":
+		return 0x14, true
+	case "AF23":
+		return 0x16, true
+	case "CS3":
+		return 0x18, true
+	case "AF31":
+		return 0x1A, true
+	case "AF32":
+		return 0x1C, true
+	case "AF33":
+		return 0x1E, true
+	case "CS4":
+		return 0x20, true
+	case "AF41":
+		return 0x22, true
+	case "AF42":
+		return 0x24, true
+	case "AF43":
+		return 0x26, true
+	case "CS5":
+		return 0x28, true
+	case "EF":
+		return 0x2E, true
+	case "CS6":
+		return 0x30, true
+	case "LE":
+		return 0x01, true
+	default:
+		return 0, false
 	}
 }

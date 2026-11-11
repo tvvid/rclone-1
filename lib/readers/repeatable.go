@@ -1,10 +1,9 @@
 package readers
 
 import (
+	"errors"
 	"io"
 	"sync"
-
-	"github.com/pkg/errors"
 )
 
 // A RepeatableReader implements the io.ReadSeeker it allow to seek cached data
@@ -42,7 +41,7 @@ func (r *RepeatableReader) Seek(offset int64, whence int) (int64, error) {
 		return 0, errors.New("fs.RepeatableReader.Seek: negative position")
 	}
 	if abs > cacheLen {
-		return offset - (abs - cacheLen), errors.New("fs.RepeatableReader.Seek: offset is unavailable")
+		return cacheLen, errors.New("fs.RepeatableReader.Seek: offset is unavailable")
 	}
 	r.i = abs
 	return abs, nil
@@ -82,7 +81,7 @@ func NewRepeatableReaderSized(r io.Reader, size int) *RepeatableReader {
 }
 
 // NewRepeatableLimitReader create new repeatable reader from Reader r
-// with an initial buffer of size wrapped in a io.LimitReader to read
+// with an initial buffer of size wrapped in an io.LimitReader to read
 // only size.
 func NewRepeatableLimitReader(r io.Reader, size int) *RepeatableReader {
 	return NewRepeatableReaderSized(io.LimitReader(r, int64(size)), size)
@@ -98,7 +97,7 @@ func NewRepeatableReaderBuffer(r io.Reader, buf []byte) *RepeatableReader {
 }
 
 // NewRepeatableLimitReaderBuffer create new repeatable reader from
-// Reader r and buf wrapped in a io.LimitReader to read only size.
+// Reader r and buf wrapped in an io.LimitReader to read only size.
 func NewRepeatableLimitReaderBuffer(r io.Reader, buf []byte, size int64) *RepeatableReader {
-	return NewRepeatableReaderBuffer(io.LimitReader(r, int64(size)), buf)
+	return NewRepeatableReaderBuffer(io.LimitReader(r, size), buf)
 }

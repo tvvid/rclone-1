@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # An example script to run when bisecting go with git bisect -run when
 # looking for an rclone regression
@@ -16,7 +16,7 @@ source ~/bin/use-go1.11
 go version
 
 # Compile rclone
-cd ~/go/src/github.com/ncw/rclone
+cd ~/go/src/github.com/rclone/rclone
 make
 
 # run the failing test

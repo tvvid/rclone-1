@@ -1,7 +1,7 @@
 // Accounting and limiting reader
 // Unix specific functions.
 
-// +build darwin dragonfly freebsd linux netbsd openbsd solaris
+//go:build darwin || dragonfly || freebsd || linux || netbsd || openbsd || solaris
 
 package accounting
 
@@ -10,11 +10,11 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/ncw/rclone/fs"
+	"github.com/rclone/rclone/fs"
 )
 
 // startSignalHandler() sets a signal handler to catch SIGUSR2 and toggle throttling.
-func startSignalHandler() {
+func (tb *tokenBucket) startSignalHandler() {
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGUSR2)
 
@@ -22,15 +22,27 @@ func startSignalHandler() {
 		// This runs forever, but blocks until the signal is received.
 		for {
 			<-signals
-			tokenBucketMu.Lock()
-			bwLimitToggledOff = !bwLimitToggledOff
-			tokenBucket, prevTokenBucket = prevTokenBucket, tokenBucket
-			s := "disabled"
-			if tokenBucket != nil {
-				s = "enabled"
-			}
-			tokenBucketMu.Unlock()
-			fs.Logf(nil, "Bandwidth limit %s by user", s)
+
+			func() {
+				tb.mu.Lock()
+				defer tb.mu.Unlock()
+
+				// if there's no bandwidth limit configured now, do nothing
+				if !tb.currLimit.Bandwidth.IsSet() {
+					fs.Debugf(nil, "SIGUSR2 received but no bandwidth limit configured right now, ignoring")
+					return
+				}
+
+				tb.toggledOff = !tb.toggledOff
+				tb.curr, tb.prev = tb.prev, tb.curr
+				s, limit := "disabled", "off"
+				if !tb.curr._isOff() {
+					s = "enabled"
+					limit = tb.currLimit.Bandwidth.String()
+				}
+
+				fs.Logf(nil, "Bandwidth limit %s by user (now %s)", s, limit)
+			}()
 		}
 	}()
 }

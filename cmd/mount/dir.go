@@ -1,40 +1,44 @@
-// +build linux darwin freebsd
+//go:build linux
 
 package mount
 
 import (
+	"context"
+	"fmt"
+	"io"
 	"os"
+	"path"
+	"syscall"
 	"time"
 
 	"bazil.org/fuse"
 	fusefs "bazil.org/fuse/fs"
-	"github.com/ncw/rclone/cmd/mountlib"
-	"github.com/ncw/rclone/fs/log"
-	"github.com/ncw/rclone/vfs"
-	"github.com/pkg/errors"
-	"golang.org/x/net/context" // switch to "context" when we stop supporting go1.8
+	"github.com/rclone/rclone/cmd/mountlib"
+	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/log"
+	"github.com/rclone/rclone/vfs"
 )
 
 // Dir represents a directory entry
 type Dir struct {
 	*vfs.Dir
+	fsys *FS
 }
 
-// Check interface satsified
+// Check interface satisfied
 var _ fusefs.Node = (*Dir)(nil)
 
 // Attr updates the attributes of a directory
 func (d *Dir) Attr(ctx context.Context, a *fuse.Attr) (err error) {
 	defer log.Trace(d, "")("attr=%+v, err=%v", a, &err)
-	a.Valid = mountlib.AttrTimeout
+	a.Valid = time.Duration(d.fsys.opt.AttrTimeout)
 	a.Gid = d.VFS().Opt.GID
 	a.Uid = d.VFS().Opt.UID
-	a.Mode = os.ModeDir | d.VFS().Opt.DirPerms
+	a.Mode = d.Mode()
 	modTime := d.ModTime()
 	a.Atime = modTime
 	a.Mtime = modTime
 	a.Ctime = modTime
-	a.Crtime = modTime
 	// FIXME include Valid so get some caching?
 	// FIXME fs.Debugf(d.path, "Dir.Attr %+v", a)
 	return nil
@@ -74,14 +78,24 @@ func (d *Dir) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.Lo
 	if err != nil {
 		return nil, translateError(err)
 	}
-	resp.EntryValid = mountlib.AttrTimeout
+	resp.EntryValid = time.Duration(d.fsys.opt.AttrTimeout)
+	// Check the mnode to see if it has a fuse Node cached
+	// We must return the same fuse nodes for vfs Nodes
+	node, ok := mnode.Aux(d.fsys).(fusefs.Node)
+	if ok {
+		return node, nil
+	}
 	switch x := mnode.(type) {
 	case *vfs.File:
-		return &File{x}, nil
+		node = &File{x, d.fsys}
 	case *vfs.Dir:
-		return &Dir{x}, nil
+		node = &Dir{x, d.fsys}
+	default:
+		panic("bad type")
 	}
-	panic("bad type")
+	// Cache the node for later
+	mnode.SetAux(d.fsys, node)
+	return node, nil
 }
 
 // Check interface satisfied
@@ -95,14 +109,32 @@ func (d *Dir) ReadDirAll(ctx context.Context) (dirents []fuse.Dirent, err error)
 	if err != nil {
 		return nil, translateError(err)
 	}
+	dirents = append(dirents, fuse.Dirent{
+		Type: fuse.DT_Dir,
+		Name: ".",
+	}, fuse.Dirent{
+		Type: fuse.DT_Dir,
+		Name: "..",
+	})
 	for _, node := range items {
+		name := node.Name()
+		if len(name) > mountlib.MaxLeafSize {
+			fs.Errorf(d, "Name too long (%d bytes) for FUSE, skipping: %s", len(name), name)
+			continue
+		}
 		var dirent = fuse.Dirent{
 			// Inode FIXME ???
 			Type: fuse.DT_File,
-			Name: node.Name(),
+			Name: name,
 		}
 		if node.IsDir() {
 			dirent.Type = fuse.DT_Dir
+		}
+		switch node := node.(type) {
+		case *vfs.File:
+			if node.IsSymlink() {
+				dirent.Type = fuse.DT_Link
+			}
 		}
 		dirents = append(dirents, dirent)
 	}
@@ -115,15 +147,19 @@ var _ fusefs.NodeCreater = (*Dir)(nil)
 // Create makes a new file
 func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.CreateResponse) (node fusefs.Node, handle fusefs.Handle, err error) {
 	defer log.Trace(d, "name=%q", req.Name)("node=%v, handle=%v, err=%v", &node, &handle, &err)
-	file, err := d.Dir.Create(req.Name, int(req.Flags))
+	// translate the fuse flags to os flags
+	osFlags := int(req.Flags) | os.O_CREATE
+	file, err := d.Dir.Create(req.Name, osFlags)
 	if err != nil {
 		return nil, nil, translateError(err)
 	}
-	fh, err := file.Open(int(req.Flags) | os.O_CREATE)
+	fh, err := file.Open(osFlags)
 	if err != nil {
 		return nil, nil, translateError(err)
 	}
-	return &File{file}, &FileHandle{fh}, err
+	node = &File{file, d.fsys}
+	file.SetAux(d.fsys, node) // cache the FUSE node for later
+	return node, &FileHandle{fh}, err
 }
 
 var _ fusefs.NodeMkdirer = (*Dir)(nil)
@@ -135,7 +171,9 @@ func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (node fusefs.No
 	if err != nil {
 		return nil, translateError(err)
 	}
-	return &Dir{dir}, nil
+	node = &Dir{dir, d.fsys}
+	dir.SetAux(d.fsys, node) // cache the FUSE node for later
+	return node, nil
 }
 
 var _ fusefs.NodeRemover = (*Dir)(nil)
@@ -152,6 +190,15 @@ func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) (err error) {
 	return nil
 }
 
+// Invalidate a leaf in a directory
+func (d *Dir) invalidateEntry(dirNode fusefs.Node, leaf string) {
+	fs.Debugf(dirNode, "Invalidating %q", leaf)
+	err := d.fsys.server.InvalidateEntry(dirNode, leaf)
+	if err != nil {
+		fs.Debugf(dirNode, "Failed to invalidate %q: %v", leaf, err)
+	}
+}
+
 // Check interface satisfied
 var _ fusefs.NodeRenamer = (*Dir)(nil)
 
@@ -160,13 +207,19 @@ func (d *Dir) Rename(ctx context.Context, req *fuse.RenameRequest, newDir fusefs
 	defer log.Trace(d, "oldName=%q, newName=%q, newDir=%+v", req.OldName, req.NewName, newDir)("err=%v", &err)
 	destDir, ok := newDir.(*Dir)
 	if !ok {
-		return errors.Errorf("Unknown Dir type %T", newDir)
+		return fmt.Errorf("unknown Dir type %T", newDir)
 	}
-
 	err = d.Dir.Rename(req.OldName, req.NewName, destDir.Dir)
 	if err != nil {
 		return translateError(err)
 	}
+
+	// Invalidate the new directory entry so it gets re-read (in
+	// the background otherwise we cause a deadlock)
+	//
+	// See https://github.com/rclone/rclone/issues/4977 for why
+	go d.invalidateEntry(newDir, req.NewName)
+	//go d.invalidateEntry(d, req.OldName)
 
 	return nil
 }
@@ -191,5 +244,53 @@ var _ fusefs.NodeLinker = (*Dir)(nil)
 // existing Node. Receiver must be a directory.
 func (d *Dir) Link(ctx context.Context, req *fuse.LinkRequest, old fusefs.Node) (newNode fusefs.Node, err error) {
 	defer log.Trace(d, "req=%v, old=%v", req, old)("new=%v, err=%v", &newNode, &err)
-	return nil, fuse.ENOSYS
+	return nil, syscall.ENOSYS
+}
+
+var _ fusefs.NodeSymlinker = (*Dir)(nil)
+
+// Symlink create a symbolic link.
+func (d *Dir) Symlink(ctx context.Context, req *fuse.SymlinkRequest) (node fusefs.Node, err error) {
+	defer log.Trace(d, "newname=%v, target=%v", req.NewName, req.Target)("node=%v, err=%v", &node, &err)
+
+	newName := path.Join(d.Path(), req.NewName)
+	target := req.Target
+
+	n, err := d.VFS().CreateSymlink(target, newName)
+	if err != nil {
+		return nil, err
+	}
+
+	node = &File{n.(*vfs.File), d.fsys}
+	return node, nil
+}
+
+// Check interface satisfied
+var _ fusefs.NodeMknoder = (*Dir)(nil)
+
+// Mknod is called to create a file. Since we define create this will
+// be called in preference, however NFS likes to call it for some
+// reason. We don't actually create a file here just the Node.
+func (d *Dir) Mknod(ctx context.Context, req *fuse.MknodRequest) (node fusefs.Node, err error) {
+	defer log.Trace(d, "name=%v, mode=%d, rdev=%d", req.Name, req.Mode, req.Rdev)("node=%v, err=%v", &node, &err)
+	if req.Rdev != 0 {
+		fs.Errorf(d, "Can't create device node %q", req.Name)
+		return nil, fuse.Errno(syscall.EIO)
+	}
+	var cReq = fuse.CreateRequest{
+		Name:  req.Name,
+		Flags: fuse.OpenFlags(os.O_CREATE | os.O_WRONLY),
+		Mode:  req.Mode,
+		Umask: req.Umask,
+	}
+	var cResp fuse.CreateResponse
+	node, handle, err := d.Create(ctx, &cReq, &cResp)
+	if err != nil {
+		return nil, err
+	}
+	err = handle.(io.Closer).Close()
+	if err != nil {
+		return nil, err
+	}
+	return node, nil
 }

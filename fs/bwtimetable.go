@@ -1,19 +1,64 @@
 package fs
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/pkg/errors"
 )
+
+// BwPair represents an upload and a download bandwidth
+type BwPair struct {
+	Tx SizeSuffix // upload bandwidth
+	Rx SizeSuffix // download bandwidth
+}
+
+// String returns a printable representation of a BwPair
+func (bp *BwPair) String() string {
+	var out strings.Builder
+	out.WriteString(bp.Tx.stringRoundTrip())
+	if bp.Rx != bp.Tx {
+		out.WriteRune(':')
+		out.WriteString(bp.Rx.stringRoundTrip())
+	}
+	return out.String()
+}
+
+// Set the bandwidth from a string which is either
+// SizeSuffix or SizeSuffix:SizeSuffix (for tx:rx bandwidth)
+func (bp *BwPair) Set(s string) (err error) {
+	before, after, ok := strings.Cut(s, ":")
+	stx, srx := s, ""
+	if ok {
+		stx, srx = before, after
+	}
+	err = bp.Tx.Set(stx)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		bp.Rx = bp.Tx
+	} else {
+		err = bp.Rx.Set(srx)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// IsSet returns true if either of the bandwidth limits are set
+func (bp *BwPair) IsSet() bool {
+	return bp.Tx > 0 || bp.Rx > 0
+}
 
 // BwTimeSlot represents a bandwidth configuration at a point in time.
 type BwTimeSlot struct {
 	DayOfTheWeek int
 	HHMM         int
-	Bandwidth    SizeSuffix
+	Bandwidth    BwPair
 }
 
 // BwTimetable contains all configured time slots.
@@ -21,31 +66,44 @@ type BwTimetable []BwTimeSlot
 
 // String returns a printable representation of BwTimetable.
 func (x BwTimetable) String() string {
-	ret := []string{}
+	var out strings.Builder
+	bwOnly := len(x) == 1 && x[0].DayOfTheWeek == 0 && x[0].HHMM == 0
 	for _, ts := range x {
-		ret = append(ret, fmt.Sprintf("%s-%04.4d,%s", time.Weekday(ts.DayOfTheWeek), ts.HHMM, ts.Bandwidth.String()))
+		if out.Len() != 0 {
+			out.WriteRune(' ')
+		}
+		if !bwOnly {
+			_, _ = fmt.Fprintf(&out, "%s-%02d:%02d,", time.Weekday(ts.DayOfTheWeek).String()[:3], ts.HHMM/100, ts.HHMM%100)
+		}
+		out.WriteString(ts.Bandwidth.String())
 	}
-	return strings.Join(ret, " ")
+	return out.String()
 }
 
 // Basic hour format checking
 func validateHour(HHMM string) error {
-	if len(HHMM) != 5 {
-		return errors.Errorf("invalid time specification (hh:mm): %q", HHMM)
+	if len(HHMM) != 5 || HHMM[2] != ':' {
+		return fmt.Errorf("invalid time specification (hh:mm): %q", HHMM)
+	}
+	// strconv.Atoi accepts a sign, so check for digits explicitly
+	for _, i := range []int{0, 1, 3, 4} {
+		if HHMM[i] < '0' || HHMM[i] > '9' {
+			return fmt.Errorf("invalid time specification (hh:mm): %q", HHMM)
+		}
 	}
 	hh, err := strconv.Atoi(HHMM[0:2])
 	if err != nil {
-		return errors.Errorf("invalid hour in time specification %q: %v", HHMM, err)
+		return fmt.Errorf("invalid hour in time specification %q: %v", HHMM, err)
 	}
 	if hh < 0 || hh > 23 {
-		return errors.Errorf("invalid hour (must be between 00 and 23): %q", hh)
+		return fmt.Errorf("invalid hour (must be between 00 and 23): %d", hh)
 	}
 	mm, err := strconv.Atoi(HHMM[3:])
 	if err != nil {
-		return errors.Errorf("invalid minute in time specification: %q: %v", HHMM, err)
+		return fmt.Errorf("invalid minute in time specification: %q: %v", HHMM, err)
 	}
 	if mm < 0 || mm > 59 {
-		return errors.Errorf("invalid minute (must be between 00 and 59): %q", hh)
+		return fmt.Errorf("invalid minute (must be between 00 and 59): %d", mm)
 	}
 	return nil
 }
@@ -74,13 +132,13 @@ func parseWeekday(dayOfWeek string) (int, error) {
 	if dayOfWeek == "sat" || dayOfWeek == "saturday" {
 		return 6, nil
 	}
-	return 0, errors.Errorf("invalid weekday: %q", dayOfWeek)
+	return 0, fmt.Errorf("invalid weekday: %q", dayOfWeek)
 }
 
 // Set the bandwidth timetable.
 func (x *BwTimetable) Set(s string) error {
 	// The timetable is formatted as:
-	// "dayOfWeek-hh:mm,bandwidth dayOfWeek-hh:mm,banwidth..." ex: "Mon-10:00,10G Mon-11:30,1G Tue-18:00,off"
+	// "dayOfWeek-hh:mm,bandwidth dayOfWeek-hh:mm,bandwidth..." ex: "Mon-10:00,10G Mon-11:30,1G Tue-18:00,off"
 	// If only a single bandwidth identifier is provided, we assume constant bandwidth.
 
 	if len(s) == 0 {
@@ -98,12 +156,17 @@ func (x *BwTimetable) Set(s string) error {
 		return nil
 	}
 
-	for _, tok := range strings.Split(s, " ") {
+	var newTimetable BwTimetable
+
+	// Split the timetable string by both spaces and semicolons
+	for tok := range strings.FieldsFuncSeq(s, func(r rune) bool {
+		return r == ' ' || r == ';'
+	}) {
 		tv := strings.Split(tok, ",")
 
 		// Format must be dayOfWeek-HH:MM,BW
 		if len(tv) != 2 {
-			return errors.Errorf("invalid time/bandwidth specification: %q", tok)
+			return fmt.Errorf("invalid time/bandwidth specification: %q", tok)
 		}
 
 		weekday := 0
@@ -113,7 +176,7 @@ func (x *BwTimetable) Set(s string) error {
 			if err := validateHour(HHMM); err != nil {
 				return err
 			}
-			for i := 0; i < 7; i++ {
+			for i := range 7 {
 				hh, _ := strconv.Atoi(HHMM[0:2])
 				mm, _ := strconv.Atoi(HHMM[3:])
 				ts := BwTimeSlot{
@@ -123,12 +186,12 @@ func (x *BwTimetable) Set(s string) error {
 				if err := ts.Bandwidth.Set(tv[1]); err != nil {
 					return err
 				}
-				*x = append(*x, ts)
+				newTimetable = append(newTimetable, ts)
 			}
 		} else {
 			timespec := strings.Split(tv[0], "-")
 			if len(timespec) != 2 {
-				return errors.Errorf("invalid time specification: %q", tv[0])
+				return fmt.Errorf("invalid time specification: %q", tv[0])
 			}
 			var err error
 			weekday, err = parseWeekday(timespec[0])
@@ -150,13 +213,14 @@ func (x *BwTimetable) Set(s string) error {
 			if err := ts.Bandwidth.Set(tv[1]); err != nil {
 				return err
 			}
-			*x = append(*x, ts)
+			newTimetable = append(newTimetable, ts)
 		}
 	}
+	*x = newTimetable
 	return nil
 }
 
-//	Difference in minutes between lateDayOfWeekHHMM and earlyDayOfWeekHHMM
+// Difference in minutes between lateDayOfWeekHHMM and earlyDayOfWeekHHMM
 func timeDiff(lateDayOfWeekHHMM int, earlyDayOfWeekHHMM int) int {
 
 	lateTimeMinutes := (lateDayOfWeekHHMM / 10000) * 24 * 60
@@ -174,17 +238,21 @@ func timeDiff(lateDayOfWeekHHMM int, earlyDayOfWeekHHMM int) int {
 func (x BwTimetable) LimitAt(tt time.Time) BwTimeSlot {
 	// If the timetable is empty, we return an unlimited BwTimeSlot starting at Sunday midnight.
 	if len(x) == 0 {
-		return BwTimeSlot{DayOfTheWeek: 0, HHMM: 0, Bandwidth: -1}
+		return BwTimeSlot{Bandwidth: BwPair{-1, -1}}
 	}
 
 	dayOfWeekHHMM := int(tt.Weekday())*10000 + tt.Hour()*100 + tt.Minute()
 
-	// By default, we return the last element in the timetable. This
-	// satisfies two conditions: 1) If there's only one element it
-	// will always be selected, and 2) The last element of the table
-	// will "wrap around" until overridden by an earlier time slot.
-	// there's only one time slot in the timetable.
-	ret := x[len(x)-1]
+	// By default, we return the latest time slot in the week, which
+	// "wraps around" until overridden by an earlier time slot. This is
+	// the only time slot when there is just one, and doesn't depend on
+	// the order the time slots were given in.
+	ret := x[0]
+	for _, ts := range x[1:] {
+		if (ts.DayOfTheWeek*10000)+ts.HHMM >= (ret.DayOfTheWeek*10000)+ret.HHMM {
+			ret = ts
+		}
+	}
 	mindif := 0
 	first := true
 
@@ -211,4 +279,20 @@ func (x BwTimetable) LimitAt(tt time.Time) BwTimeSlot {
 // Type of the value
 func (x BwTimetable) Type() string {
 	return "BwTimetable"
+}
+
+// UnmarshalJSON unmarshals a string value
+func (x *BwTimetable) UnmarshalJSON(in []byte) error {
+	var s string
+	err := json.Unmarshal(in, &s)
+	if err != nil {
+		return err
+	}
+	return x.Set(s)
+}
+
+// MarshalJSON marshals as a string value
+func (x BwTimetable) MarshalJSON() ([]byte, error) {
+	s := x.String()
+	return json.Marshal(s)
 }

@@ -2,50 +2,67 @@
 package rcserver
 
 import (
+	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
 	"mime"
 	"net/http"
 	"net/url"
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
-	"github.com/ncw/rclone/cmd/serve/httplib"
-	"github.com/ncw/rclone/cmd/serve/httplib/serve"
-	"github.com/ncw/rclone/fs"
-	"github.com/ncw/rclone/fs/config"
-	"github.com/ncw/rclone/fs/list"
-	"github.com/ncw/rclone/fs/rc"
-	"github.com/pkg/errors"
+	"github.com/go-chi/chi/v5/middleware"
+	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/cache"
+	"github.com/rclone/rclone/fs/config"
+	"github.com/rclone/rclone/fs/fspath"
+	"github.com/rclone/rclone/fs/list"
+	"github.com/rclone/rclone/fs/rc"
+	"github.com/rclone/rclone/fs/rc/jobs"
+	libhttp "github.com/rclone/rclone/lib/http"
+	"github.com/rclone/rclone/lib/http/serve"
 	"github.com/skratchdot/open-golang/open"
 )
 
 // Start the remote control server if configured
 //
 // If the server wasn't configured the *Server returned may be nil
-func Start(opt *rc.Options) (*Server, error) {
+func Start(ctx context.Context, opt *rc.Options) (*Server, error) {
+	jobs.SetOpt(opt) // set the defaults for jobs
 	if opt.Enabled {
 		// Serve on the DefaultServeMux so can have global registrations appear
-		s := newServer(opt, http.DefaultServeMux)
+		s, err := newServer(ctx, opt, http.DefaultServeMux)
+		if err != nil {
+			return nil, err
+		}
 		return s, s.Serve()
 	}
 	return nil, nil
 }
 
+// maxUnauthenticatedBodySize is the largest POST body accepted when
+// the rc server has no authentication. It is kept small as decoding
+// JSON can use many times the size of its input in memory.
+const maxUnauthenticatedBodySize = 64 << 10
+
 // Server contains everything to run the rc server
 type Server struct {
-	*httplib.Server
-	files http.Handler
-	opt   *rc.Options
+	ctx            context.Context // for global config
+	server         *libhttp.Server
+	files          http.Handler
+	pluginsHandler http.Handler
+	opt            *rc.Options
+	noAuth         bool // snapshot of opt.NoAuth at startup to prevent runtime mutation
 }
 
-func newServer(opt *rc.Options, mux *http.ServeMux) *Server {
-	s := &Server{
-		Server: httplib.NewServer(mux, &opt.HTTPOptions),
-		opt:    opt,
-	}
-	mux.HandleFunc("/", s.handler)
-
+func newServer(ctx context.Context, opt *rc.Options, mux *http.ServeMux) (*Server, error) {
+	fileHandler := http.Handler(nil)
+	pluginsHandler := http.Handler(nil)
 	// Add some more mime types which are often missing
 	_ = mime.AddExtensionType(".wasm", "application/wasm")
 	_ = mime.AddExtensionType(".js", "application/javascript")
@@ -53,32 +70,87 @@ func newServer(opt *rc.Options, mux *http.ServeMux) *Server {
 	// File handling
 	if opt.Files != "" {
 		fs.Logf(nil, "Serving files from %q", opt.Files)
-		s.files = http.FileServer(http.Dir(opt.Files))
+		fileHandler = http.FileServer(http.Dir(opt.Files))
+	} else if opt.WebUI {
+		return nil, errors.New("--rc-web-gui has been superseded by the `rclone gui` command")
 	}
-	return s
+
+	s := &Server{
+		ctx:            ctx,
+		opt:            opt,
+		files:          fileHandler,
+		pluginsHandler: pluginsHandler,
+		noAuth:         opt.NoAuth,
+	}
+
+	var err error
+	s.server, err = libhttp.NewServer(ctx,
+		libhttp.WithConfig(opt.HTTP),
+		libhttp.WithAuth(opt.Auth),
+		libhttp.WithTemplate(opt.Template),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to init server: %w", err)
+	}
+
+	router := s.server.Router()
+	router.Use(
+		middleware.SetHeader("Accept-Ranges", "bytes"),
+		middleware.SetHeader("Server", "rclone/"+fs.Version),
+	)
+
+	// Add the debug handler which is installed in the default mux.
+	// Only do this if auth is enabled.
+	if s.noAuth || s.server.UsingAuth() {
+		router.Handle("/debug/pprof/*", mux)
+	}
+
+	// FIXME split these up into individual functions
+	router.Get("/*", s.handler)
+	router.Head("/*", s.handler)
+	router.Post("/*", s.handler)
+	router.Options("/*", s.handler)
+
+	return s, nil
 }
 
 // Serve runs the http server in the background.
 //
 // Use s.Close() and s.Wait() to shutdown server
 func (s *Server) Serve() error {
-	err := s.Server.Serve()
-	if err != nil {
-		return err
-	}
-	fs.Logf(nil, "Serving remote control on %s", s.URL())
-	// Open the files in the browser if set
-	if s.files != nil {
-		openURL, err := url.Parse(s.URL())
-		if err != nil {
-			return errors.Wrap(err, "invalid serving URL")
+	s.server.Serve()
+
+	for _, URL := range s.server.URLs() {
+		fs.Logf(nil, "Serving remote control on %s", URL)
+		// Open the files in the browser if set
+		if s.files != nil {
+			openURL, err := url.Parse(URL)
+			if err != nil {
+				return fmt.Errorf("invalid serving URL: %w", err)
+			}
+			// Add username, password into the URL if they are set
+			user, pass := s.opt.Auth.BasicUser, s.opt.Auth.BasicPass
+			if user != "" && pass != "" {
+				openURL.User = url.UserPassword(user, pass)
+
+				// Base64 encode username and password to be sent through url
+				loginToken := user + ":" + pass
+				parameters := url.Values{}
+				encodedToken := base64.URLEncoding.EncodeToString([]byte(loginToken))
+				fs.Debugf(nil, "login_token %q", encodedToken)
+				parameters.Add("login_token", encodedToken)
+				openURL.RawQuery = parameters.Encode()
+				openURL.RawPath = "/#/login"
+			}
+			// Don't open browser if serving in testing environment or required not to do so.
+			if flag.Lookup("test.v") == nil {
+				if err := open.Start(openURL.String()); err != nil {
+					fs.Errorf(nil, "Failed to open Web GUI in browser: %v. Manually access it at: %s", err, openURL.String())
+				}
+			} else {
+				fs.Logf(nil, "Web GUI is not automatically opening browser. Navigate to %s to use.", openURL.String())
+			}
 		}
-		// Add username, password into the URL if they are set
-		user, pass := s.opt.HTTPOptions.BasicUser, s.opt.HTTPOptions.BasicPass
-		if user != "" || pass != "" {
-			openURL.User = url.UserPassword(user, pass)
-		}
-		_ = open.Start(openURL.String())
 	}
 	return nil
 }
@@ -86,36 +158,19 @@ func (s *Server) Serve() error {
 // writeError writes a formatted error to the output
 func writeError(path string, in rc.Params, w http.ResponseWriter, err error, status int) {
 	fs.Errorf(nil, "rc: %q: error: %v", path, err)
-	// Adjust the error return for some well known errors
-	errOrig := errors.Cause(err)
-	switch {
-	case errOrig == fs.ErrorDirNotFound || errOrig == fs.ErrorObjectNotFound:
-		status = http.StatusNotFound
-	case rc.IsErrParamInvalid(err) || rc.IsErrParamNotFound(err):
-		status = http.StatusBadRequest
-	}
+	params, status := rc.Error(path, in, err, status)
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	err = rc.WriteJSON(w, rc.Params{
-		"status": status,
-		"error":  err.Error(),
-		"input":  in,
-		"path":   path,
-	})
+	err = rc.WriteJSON(w, params)
 	if err != nil {
 		// can't return the error at this point
-		fs.Errorf(nil, "rc: failed to write JSON output: %v", err)
+		fs.Errorf(nil, "rc: writeError: failed to write JSON output from %#v: %v", in, err)
 	}
 }
 
 // handler reads incoming requests and dispatches them
 func (s *Server) handler(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimLeft(r.URL.Path, "/")
-
-	w.Header().Add("Access-Control-Allow-Origin", "*")
-
-	// echo back access control headers client needs
-	reqAccessHeaders := r.Header.Get("Access-Control-Request-Headers")
-	w.Header().Add("Access-Control-Allow-Headers", reqAccessHeaders)
 
 	switch r.Method {
 	case "POST":
@@ -125,20 +180,60 @@ func (s *Server) handler(w http.ResponseWriter, r *http.Request) {
 	case "GET", "HEAD":
 		s.handleGet(w, r, path)
 	default:
-		writeError(path, nil, w, errors.Errorf("method %q not allowed", r.Method), http.StatusMethodNotAllowed)
+		writeError(path, nil, w, fmt.Errorf("method %q not allowed", r.Method), http.StatusMethodNotAllowed)
 		return
 	}
 }
 
+// bodyErrorStatus returns the HTTP status for an error reading the request body
+func bodyErrorStatus(err error) int {
+	if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
+		return http.StatusRequestEntityTooLarge
+	}
+	return http.StatusBadRequest
+}
+
 func (s *Server) handlePost(w http.ResponseWriter, r *http.Request, path string) {
+	ctx := r.Context()
 	contentType := r.Header.Get("Content-Type")
 
+	// Find the call and check authorisation before reading the
+	// body so rejected requests can't make the server use memory
+	call := rc.Calls.Get(path)
+	if call == nil {
+		writeError(path, rc.Params{}, w, fmt.Errorf("couldn't find method %q", path), http.StatusNotFound)
+		return
+	}
+	if !s.noAuth && !call.NoAuth && !s.server.UsingAuth() {
+		writeError(path, rc.Params{}, w, fmt.Errorf("authentication must be set up on the rc server to use %q or the --rc-no-auth flag must be in use", path), http.StatusForbidden)
+		return
+	}
+
+	// Without auth anyone who can connect may POST, so bound the
+	// memory a request can make the server use
+	if !s.noAuth && !s.server.UsingAuth() {
+		r.Body = http.MaxBytesReader(w, r.Body, maxUnauthenticatedBodySize)
+	}
+
+	var (
+		contentTypeMediaType string
+		contentTypeParams    map[string]string
+	)
+	if contentType != "" {
+		var err error
+		contentTypeMediaType, contentTypeParams, err = mime.ParseMediaType(contentType)
+		if err != nil {
+			writeError(path, nil, w, fmt.Errorf("failed to parse Content-Type: %w", err), http.StatusBadRequest)
+			return
+		}
+	}
+
 	values := r.URL.Query()
-	if contentType == "application/x-www-form-urlencoded" {
+	if contentTypeMediaType == "application/x-www-form-urlencoded" {
 		// Parse the POST and URL parameters into r.Form, for others r.Form will be empty value
 		err := r.ParseForm()
 		if err != nil {
-			writeError(path, nil, w, errors.Wrap(err, "failed to parse form/URL parameters"), http.StatusBadRequest)
+			writeError(path, nil, w, fmt.Errorf("failed to parse form/URL parameters: %w", err), bodyErrorStatus(err))
 			return
 		}
 		values = r.Form
@@ -153,43 +248,52 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request, path string)
 	}
 
 	// Parse a JSON blob from the input
-	if contentType == "application/json" {
+	if contentTypeMediaType == "application/json" {
+		// Check the charset is utf-8 or unset
+		if charset, ok := contentTypeParams["charset"]; ok && !strings.EqualFold(charset, "utf-8") {
+			writeError(path, in, w, fmt.Errorf("unsupported charset %q for JSON input", charset), http.StatusBadRequest)
+			return
+		}
+
 		err := json.NewDecoder(r.Body).Decode(&in)
 		if err != nil {
-			writeError(path, in, w, errors.Wrap(err, "failed to read input JSON"), http.StatusBadRequest)
+			status := bodyErrorStatus(err)
+			if status == http.StatusRequestEntityTooLarge {
+				in = nil // don't echo back the partial input
+			}
+			writeError(path, in, w, fmt.Errorf("failed to read input JSON: %w", err), status)
 			return
 		}
 	}
 
-	// Find the call
-	call := rc.Calls.Get(path)
-	if call == nil {
-		writeError(path, in, w, errors.Errorf("couldn't find method %q", path), http.StatusNotFound)
-		return
+	// Check for Prefer: respond-async header (RFC 7240)
+	preferAsync := false
+	for pref := range strings.SplitSeq(r.Header.Get("Prefer"), ",") {
+		if strings.EqualFold(strings.TrimSpace(pref), "respond-async") {
+			preferAsync = true
+			in["_async"] = true
+			break
+		}
 	}
 
-	// Check to see if it requires authorisation
-	if !s.opt.NoAuth && call.AuthRequired && !s.UsingAuth() {
-		writeError(path, in, w, errors.Errorf("authentication must be set up on the rc server to use %q or the --rc-no-auth flag must be in use", path), http.StatusForbidden)
-		return
+	inOrig := in.Copy()
+
+	if call.NeedsRequest {
+		// Add the request to RC
+		in["_request"] = r
 	}
 
-	// Check to see if it is async or not
-	isAsync, err := in.GetBool("_async")
-	if rc.NotErrParamNotFound(err) {
-		writeError(path, in, w, err, http.StatusBadRequest)
-		return
+	if call.NeedsResponse {
+		in["_response"] = w
 	}
 
 	fs.Debugf(nil, "rc: %q: with parameters %+v", path, in)
-	var out rc.Params
-	if isAsync {
-		out, err = rc.StartJob(call.Fn, in)
-	} else {
-		out, err = call.Fn(in)
+	job, out, err := jobs.NewJob(ctx, call.Fn, in)
+	if job != nil {
+		w.Header().Add("x-rclone-jobid", fmt.Sprintf("%d", job.ID))
 	}
 	if err != nil {
-		writeError(path, in, w, err, http.StatusInternalServerError)
+		writeError(path, inOrig, w, err, http.StatusInternalServerError)
 		return
 	}
 	if out == nil {
@@ -197,10 +301,16 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request, path string)
 	}
 
 	fs.Debugf(nil, "rc: %q: reply %+v: %v", path, out, err)
+	w.Header().Set("Content-Type", "application/json")
+	if preferAsync {
+		w.Header().Set("Preference-Applied", "respond-async")
+		w.WriteHeader(http.StatusAccepted)
+	}
 	err = rc.WriteJSON(w, out)
 	if err != nil {
-		// can't return the error at this point
-		fs.Errorf(nil, "rc: failed to write JSON output: %v", err)
+		// can't return the error at this point - but have a go anyway
+		writeError(path, inOrig, w, err, http.StatusInternalServerError)
+		fs.Errorf(nil, "rc: handlePost: failed to write JSON output: %v", err)
 	}
 }
 
@@ -209,42 +319,110 @@ func (s *Server) handleOptions(w http.ResponseWriter, r *http.Request, path stri
 }
 
 func (s *Server) serveRoot(w http.ResponseWriter, r *http.Request) {
-	remotes := config.FileSections()
-	sort.Strings(remotes)
-	directory := serve.NewDirectory("")
-	directory.Title = "List of all rclone remotes."
-	q := url.Values{}
-	for _, remote := range remotes {
-		q.Set("fs", remote)
-		directory.AddEntry("["+remote+":]", true)
+	// Listing the configured remotes discloses their names so
+	// require auth like the rest of the rc endpoints
+	if !s.noAuth && !s.server.UsingAuth() {
+		writeError(r.URL.Path, nil, w, errors.New("listing the remotes requires authentication to be set up on the rc server or the --rc-no-auth flag"), http.StatusForbidden)
+		return
 	}
+	remoteNames := config.GetRemoteNames()
+	sort.Strings(remoteNames)
+	directory := serve.NewDirectory("", s.server.HTMLTemplate())
+	directory.Name = "List of all rclone remotes."
+	q := url.Values{}
+	for _, remoteName := range remoteNames {
+		q.Set("fs", remoteName)
+		directory.AddHTMLEntry("["+remoteName+":]", true, -1, time.Time{})
+	}
+	sortParm := r.URL.Query().Get("sort")
+	orderParm := r.URL.Query().Get("order")
+	directory.ProcessQueryParams(sortParm, orderParm)
+
 	directory.Serve(w, r)
 }
 
-func (s *Server) serveRemote(w http.ResponseWriter, r *http.Request, path string, fsName string) {
-	f, err := rc.GetCachedFs(fsName)
+// checkServeRemote returns an error if fsName must not be instantiated on the
+// file-serving (--rc-serve) path given the current authentication state.
+//
+// Instantiating a backend from request-supplied configuration can execute
+// commands during initialisation (e.g. webdav bearer_token_command, sftp ssh),
+// read arbitrary local files, or mutate process-wide config via global.*
+// options so shouldn't be done without authentication.
+//
+// authenticated must be true if the request has been authenticated (HTTP auth
+// is configured on the server) or --rc-no-auth was passed to explicitly opt in
+// to running without authentication.
+func checkServeRemote(fsName string, authenticated bool) error {
+	parsed, err := fspath.Parse(fsName)
 	if err != nil {
-		writeError(path, nil, w, errors.Wrap(err, "failed to make Fs"), http.StatusInternalServerError)
+		return fmt.Errorf("invalid remote %q: %w", fsName, err)
+	}
+
+	// global.* connection string options mutate process-wide rclone config. Never honour these
+	// from a request-derived remote, even when the request is authenticated
+	for k := range parsed.Config {
+		if strings.HasPrefix(k, "global.") {
+			return fmt.Errorf("setting %q on a served remote is not allowed", k)
+		}
+	}
+
+	if authenticated {
+		return nil
+	}
+
+	// On an unauthenticated server only allow access to pre-configured named remotes. Reject
+	// inline backend definitions, connection string option overrides and bare local paths
+	switch {
+	case parsed.Name == "":
+		return errors.New("serving local paths requires authentication to be set up on the rc server or the --rc-no-auth flag")
+	case strings.HasPrefix(parsed.Name, ":"):
+		return errors.New("serving inline remotes requires authentication to be set up on the rc server or the --rc-no-auth flag")
+	case len(parsed.Config) > 0:
+		return errors.New("serving remotes with connection string parameters requires authentication to be set up on the rc server or the --rc-no-auth flag")
+	}
+	return nil
+}
+
+func (s *Server) serveRemote(w http.ResponseWriter, r *http.Request, path string, fsName string) {
+	// Check we are allowed to instantiate this remote
+	authenticated := s.noAuth || s.server.UsingAuth()
+	if err := checkServeRemote(fsName, authenticated); err != nil {
+		writeError(path, nil, w, err, http.StatusForbidden)
+		return
+	}
+	// Mark as an rc request e.g. so NewFs can reject global.* config
+	f, err := cache.Get(fs.WithRCRequest(s.ctx), fsName)
+	if err != nil {
+		writeError(path, nil, w, fmt.Errorf("failed to make Fs: %w", err), http.StatusInternalServerError)
 		return
 	}
 	if path == "" || strings.HasSuffix(path, "/") {
 		path = strings.Trim(path, "/")
-		entries, err := list.DirSorted(f, false, path)
+		entries, err := list.DirSorted(r.Context(), f, false, path)
 		if err != nil {
-			writeError(path, nil, w, errors.Wrap(err, "failed to list directory"), http.StatusInternalServerError)
+			writeError(path, nil, w, fmt.Errorf("failed to list directory: %w", err), http.StatusInternalServerError)
 			return
 		}
 		// Make the entries for display
-		directory := serve.NewDirectory(path)
+		directory := serve.NewDirectory(path, s.server.HTMLTemplate())
 		for _, entry := range entries {
 			_, isDir := entry.(fs.Directory)
-			directory.AddEntry(entry.Remote(), isDir)
+			var modTime time.Time
+			if !s.opt.ServeNoModTime {
+				modTime = entry.ModTime(r.Context())
+			}
+			directory.AddHTMLEntry(entry.Remote(), isDir, entry.Size(), modTime)
 		}
+		sortParm := r.URL.Query().Get("sort")
+		orderParm := r.URL.Query().Get("order")
+		directory.ProcessQueryParams(sortParm, orderParm)
+
 		directory.Serve(w, r)
 	} else {
-		o, err := f.NewObject(path)
+		path = strings.Trim(path, "/")
+		o, err := f.NewObject(r.Context(), path)
 		if err != nil {
-			writeError(path, nil, w, errors.Wrap(err, "failed to find object"), http.StatusInternalServerError)
+			writeError(path, nil, w, fmt.Errorf("failed to find object: %w", err), http.StatusInternalServerError)
 			return
 		}
 		serve.Object(w, r, o)
@@ -256,11 +434,15 @@ var fsMatch = regexp.MustCompile(`^\[(.*?)\](.*)$`)
 
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, path string) {
 	// Look to see if this has an fs in the path
-	match := fsMatch.FindStringSubmatch(path)
+	fsMatchResult := fsMatch.FindStringSubmatch(path)
+
 	switch {
-	case match != nil && s.opt.Serve:
+	case fsMatchResult != nil && s.opt.Serve:
 		// Serve /[fs]/remote files
-		s.serveRemote(w, r, match[2], match[1])
+		s.serveRemote(w, r, fsMatchResult[2], fsMatchResult[1])
+		return
+	case path == "metrics" && s.opt.EnableMetrics:
+		promHandlerFunc(w, r)
 		return
 	case path == "*" && s.opt.Serve:
 		// Serve /* as the remote listing
@@ -268,6 +450,7 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, path string) 
 		return
 	case s.files != nil:
 		// Serve the files
+		r.URL.Path = "/" + path
 		s.files.ServeHTTP(w, r)
 		return
 	case path == "" && s.opt.Serve:
@@ -276,4 +459,20 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, path string) 
 		return
 	}
 	http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+}
+
+// URLs returns the URLs the server is listening on. Only valid after
+// Serve has been called (which Start does internally before returning).
+func (s *Server) URLs() []string {
+	return s.server.URLs()
+}
+
+// Wait blocks while the server is serving requests
+func (s *Server) Wait() {
+	s.server.Wait()
+}
+
+// Shutdown gracefully shuts down the server
+func (s *Server) Shutdown() error {
+	return s.server.Shutdown()
 }

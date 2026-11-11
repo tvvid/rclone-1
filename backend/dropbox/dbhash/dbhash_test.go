@@ -5,13 +5,13 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/ncw/rclone/backend/dropbox/dbhash"
+	"github.com/rclone/rclone/backend/dropbox/dbhash"
 	"github.com/stretchr/testify/assert"
 )
 
 func testChunk(t *testing.T, chunk int) {
 	data := make([]byte, chunk)
-	for i := 0; i < chunk; i++ {
+	for i := range chunk {
 		data[i] = 'A'
 	}
 	for _, test := range []struct {

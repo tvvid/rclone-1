@@ -1,106 +1,106 @@
-// Package cmount implents a FUSE mounting system for rclone remotes.
+//go:build cmount && ((linux && cgo) || (darwin && cgo) || (freebsd && cgo) || (openbsd && cgo) || windows)
+
+// Package cmount implements a FUSE mounting system for rclone remotes.
 //
 // This uses the cgo based cgofuse library
-
-// +build cmount
-// +build cgo
-// +build linux darwin freebsd windows
-
 package cmount
 
 import (
+	"errors"
 	"fmt"
 	"os"
-	"os/signal"
 	"runtime"
-	"syscall"
+	"strings"
 	"time"
 
-	"github.com/billziss-gh/cgofuse/fuse"
-	"github.com/ncw/rclone/cmd/mountlib"
-	"github.com/ncw/rclone/fs"
-	"github.com/ncw/rclone/vfs"
-	"github.com/ncw/rclone/vfs/vfsflags"
-	"github.com/okzk/sdnotify"
-	"github.com/pkg/errors"
+	"github.com/rclone/rclone/cmd/mountlib"
+	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/lib/atexit"
+	"github.com/rclone/rclone/lib/buildinfo"
+	"github.com/rclone/rclone/vfs"
+	"github.com/winfsp/cgofuse/fuse"
 )
 
 func init() {
 	name := "cmount"
-	if runtime.GOOS == "windows" {
+	cmountOnly := runtime.GOOS != "linux" // rclone mount only works for linux
+	if cmountOnly {
 		name = "mount"
 	}
-	mountlib.NewMountCommand(name, Mount)
+	cmd := mountlib.NewMountCommand(name, false, mount)
+	if cmountOnly {
+		cmd.Aliases = append(cmd.Aliases, "cmount")
+	}
+	mountlib.AddRc("cmount", mount)
+	buildinfo.Tags = append(buildinfo.Tags, "cmount")
 }
 
 // mountOptions configures the options from the command line flags
-func mountOptions(device string, mountpoint string) (options []string) {
+func mountOptions(VFS *vfs.VFS, device string, mountpoint string, opt *mountlib.Options) (options []string) {
 	// Options
 	options = []string{
-		"-o", "fsname=" + device,
-		"-o", "subtype=rclone",
-		"-o", fmt.Sprintf("max_readahead=%d", mountlib.MaxReadAhead),
-		"-o", fmt.Sprintf("attr_timeout=%g", mountlib.AttrTimeout.Seconds()),
-		// This causes FUSE to supply O_TRUNC with the Open
-		// call which is more efficient for cmount.  However
-		// it does not work with cgofuse on Windows with
-		// WinFSP so cmount must work with or without it.
-		"-o", "atomic_o_trunc",
+		"-o", fmt.Sprintf("attr_timeout=%g", time.Duration(opt.AttrTimeout).Seconds()),
 	}
-	if mountlib.DebugFUSE {
+	if opt.DebugFUSE {
 		options = append(options, "-o", "debug")
 	}
 
-	// OSX options
-	if runtime.GOOS == "darwin" {
-		if mountlib.NoAppleDouble {
-			options = append(options, "-o", "noappledouble")
-		}
-		if mountlib.NoAppleXattr {
-			options = append(options, "-o", "noapplexattr")
-		}
-	}
-
-	// Windows options
 	if runtime.GOOS == "windows" {
-		// These cause WinFsp to mean the current user
 		options = append(options, "-o", "uid=-1")
 		options = append(options, "-o", "gid=-1")
 		options = append(options, "--FileSystemName=rclone")
-	}
-
-	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
-		if mountlib.VolumeName != "" {
-			options = append(options, "-o", "volname="+mountlib.VolumeName)
+		if opt.VolumeName != "" {
+			if opt.NetworkMode {
+				options = append(options, "--VolumePrefix="+opt.VolumeName)
+			} else {
+				options = append(options, "-o", "volname="+opt.VolumeName)
+			}
+		}
+	} else {
+		options = append(options, "-o", "fsname="+device)
+		options = append(options, "-o", "subtype=rclone")
+		if runtime.GOOS != "openbsd" {
+			options = append(options, "-o", fmt.Sprintf("max_readahead=%d", opt.MaxReadAhead))
+			// This causes FUSE to supply O_TRUNC with the Open
+			// call which is more efficient for cmount.  However
+			// it does not work with cgofuse on Windows with
+			// WinFSP so cmount must work with or without it.
+			options = append(options, "-o", "atomic_o_trunc")
+		}
+		if opt.DaemonTimeout != 0 {
+			options = append(options, "-o", fmt.Sprintf("daemon_timeout=%d", int(time.Duration(opt.DaemonTimeout).Seconds())))
+		}
+		if opt.AllowOther {
+			options = append(options, "-o", "allow_other")
+		}
+		if opt.AllowRoot {
+			options = append(options, "-o", "allow_root")
+		}
+		if opt.DefaultPermissions {
+			options = append(options, "-o", "default_permissions")
+		}
+		if VFS.Opt.ReadOnly {
+			options = append(options, "-o", "ro")
+		}
+		//if opt.WritebackCache {
+		// FIXME? options = append(options, "-o", WritebackCache())
+		//}
+		if runtime.GOOS == "darwin" {
+			if opt.VolumeName != "" {
+				options = append(options, "-o", "volname="+opt.VolumeName)
+			}
+			if opt.NoAppleDouble {
+				options = append(options, "-o", "noappledouble")
+			}
+			if opt.NoAppleXattr {
+				options = append(options, "-o", "noapplexattr")
+			}
 		}
 	}
-	if mountlib.AllowNonEmpty {
-		options = append(options, "-o", "nonempty")
-	}
-	if mountlib.AllowOther {
-		options = append(options, "-o", "allow_other")
-	}
-	if mountlib.AllowRoot {
-		options = append(options, "-o", "allow_root")
-	}
-	if mountlib.DefaultPermissions {
-		options = append(options, "-o", "default_permissions")
-	}
-	if vfsflags.Opt.ReadOnly {
-		options = append(options, "-o", "ro")
-	}
-	if mountlib.WritebackCache {
-		// FIXME? options = append(options, "-o", WritebackCache())
-	}
-	if mountlib.DaemonTimeout != 0 {
-		options = append(options, "-o", fmt.Sprintf("daemon_timeout=%d", int(mountlib.DaemonTimeout.Seconds())))
-	}
-	for _, option := range mountlib.ExtraOptions {
+	for _, option := range opt.ExtraOptions {
 		options = append(options, "-o", option)
 	}
-	for _, option := range mountlib.ExtraFlags {
-		options = append(options, option)
-	}
+	options = append(options, opt.ExtraFlags...)
 	return options
 }
 
@@ -108,7 +108,7 @@ func mountOptions(device string, mountpoint string) (options []string) {
 func waitFor(fn func() bool) (ok bool) {
 	const totalWait = 10 * time.Second
 	const individualWait = 10 * time.Millisecond
-	for i := 0; i < int(totalWait/individualWait); i++ {
+	for range int(totalWait / individualWait) {
 		ok = fn()
 		if ok {
 			return ok
@@ -124,31 +124,41 @@ func waitFor(fn func() bool) (ok bool) {
 //
 // returns an error, and an error channel for the serve process to
 // report an error when fusermount is called.
-func mount(f fs.Fs, mountpoint string) (*vfs.VFS, <-chan error, func() error, error) {
-	fs.Debugf(f, "Mounting on %q", mountpoint)
-
-	// Check the mountpoint - in Windows the mountpoint musn't exist before the mount
-	if runtime.GOOS != "windows" {
-		fi, err := os.Stat(mountpoint)
-		if err != nil {
-			return nil, nil, nil, errors.Wrap(err, "mountpoint")
-		}
-		if !fi.IsDir() {
-			return nil, nil, nil, errors.New("mountpoint is not a directory")
-		}
+func mount(VFS *vfs.VFS, mountPath string, opt *mountlib.Options) (<-chan error, func() error, string, error) {
+	// Get mountpoint using OS specific logic
+	f := VFS.Fs()
+	mountpoint, err := getMountpoint(f, mountPath, opt)
+	if err != nil {
+		return nil, nil, "", err
 	}
+	fs.Debugf(nil, "Mounting on %q (%q)", mountpoint, opt.VolumeName)
 
 	// Create underlying FS
-	fsys := NewFS(f)
+	fsys := NewFS(VFS, opt)
 	host := fuse.NewFileSystemHost(fsys)
+	host.SetCapReaddirPlus(true) // only works on Windows
+	if opt.CaseInsensitive.Valid {
+		host.SetCapCaseInsensitive(opt.CaseInsensitive.Value)
+	} else {
+		host.SetCapCaseInsensitive(f.Features().CaseInsensitive)
+	}
 
 	// Create options
-	options := mountOptions(f.Name()+":"+f.Root(), mountpoint)
+	options := mountOptions(VFS, opt.DeviceName, mountpoint, opt)
 	fs.Debugf(f, "Mounting with options: %q", options)
 
 	// Serve the mount point in the background returning error to errChan
 	errChan := make(chan error, 1)
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				err := fmt.Errorf("mount failed: %v", r)
+				if strings.Contains(strings.ToLower(err.Error()), "cannot find winfsp") {
+					err = fmt.Errorf("%w\nHint: Install WinFsp from https://winfsp.dev/rel/", err)
+				}
+				errChan <- err
+			}
+		}()
 		var err error
 		ok := host.Mount(mountpoint, options)
 		if !ok {
@@ -160,11 +170,20 @@ func mount(f fs.Fs, mountpoint string) (*vfs.VFS, <-chan error, func() error, er
 
 	// unmount
 	unmount := func() error {
-		// Shutdown the VFS
-		fsys.VFS.Shutdown()
-		fs.Debugf(nil, "Calling host.Unmount")
-		if host.Unmount() {
-			fs.Debugf(nil, "host.Unmount succeeded")
+		var umountOK bool
+		if fsys.destroyed.Load() != 0 {
+			fs.Debugf(nil, "Not calling host.Unmount as mount already Destroyed")
+			umountOK = true
+		} else if atexit.Signalled() {
+			// If we have received a signal then FUSE will be shutting down already
+			fs.Debugf(nil, "Not calling host.Unmount as signal received")
+			umountOK = true
+		} else {
+			fs.Debugf(nil, "Calling host.Unmount")
+			umountOK = host.Unmount()
+		}
+		if umountOK {
+			fs.Debugf(nil, "Unmounted successfully")
 			if runtime.GOOS == "windows" {
 				if !waitFor(func() bool {
 					_, err := os.Stat(mountpoint)
@@ -183,8 +202,8 @@ func mount(f fs.Fs, mountpoint string) (*vfs.VFS, <-chan error, func() error, er
 	// system didn't blow up before starting
 	select {
 	case err := <-errChan:
-		err = errors.Wrap(err, "mount stopped before calling Init")
-		return nil, nil, nil, err
+		err = fmt.Errorf("mount stopped before calling Init: %w", err)
+		return nil, nil, "", err
 	case <-fsys.ready:
 	}
 
@@ -199,49 +218,5 @@ func mount(f fs.Fs, mountpoint string) (*vfs.VFS, <-chan error, func() error, er
 		}
 	}
 
-	return fsys.VFS, errChan, unmount, nil
-}
-
-// Mount mounts the remote at mountpoint.
-//
-// If noModTime is set then it
-func Mount(f fs.Fs, mountpoint string) error {
-	// Mount it
-	FS, errChan, _, err := mount(f, mountpoint)
-	if err != nil {
-		return errors.Wrap(err, "failed to mount FUSE fs")
-	}
-
-	// Note cgofuse unmounts the fs on SIGINT etc
-
-	sigHup := make(chan os.Signal, 1)
-	signal.Notify(sigHup, syscall.SIGHUP)
-
-	if err := sdnotify.Ready(); err != nil && err != sdnotify.ErrSdNotifyNoSocket {
-		return errors.Wrap(err, "failed to notify systemd")
-	}
-
-waitloop:
-	for {
-		select {
-		// umount triggered outside the app
-		case err = <-errChan:
-			break waitloop
-		// user sent SIGHUP to clear the cache
-		case <-sigHup:
-			root, err := FS.Root()
-			if err != nil {
-				fs.Errorf(f, "Error reading root: %v", err)
-			} else {
-				root.ForgetAll()
-			}
-		}
-	}
-
-	_ = sdnotify.Stopping()
-	if err != nil {
-		return errors.Wrap(err, "failed to umount FUSE fs")
-	}
-
-	return nil
+	return errChan, unmount, mountpoint, nil
 }

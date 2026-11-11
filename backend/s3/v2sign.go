@@ -3,6 +3,7 @@
 package s3
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha1"
 	"encoding/base64"
@@ -10,10 +11,14 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	v4signer "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 )
 
 // URL parameters that need to be added to the signature
 var s3ParamsToSign = map[string]struct{}{
+	"delete":                       {},
 	"acl":                          {},
 	"location":                     {},
 	"logging":                      {},
@@ -35,10 +40,17 @@ var s3ParamsToSign = map[string]struct{}{
 	"response-content-encoding":    {},
 }
 
-// sign signs requests using v2 auth
+// Implement HTTPSignerV4 interface
+type v2Signer struct {
+	opt *Options
+}
+
+// SignHTTP signs requests using v2 auth.
 //
-// Cobbled together from goamz and aws-sdk-go
-func sign(AccessKey, SecretKey string, req *http.Request) {
+// Cobbled together from goamz and aws-sdk-go.
+//
+// Bodged up to compile with AWS SDK v2
+func (v2 *v2Signer) SignHTTP(ctx context.Context, credentials aws.Credentials, req *http.Request, payloadHash string, service string, region string, signingTime time.Time, optFns ...func(*v4signer.SignerOptions)) error {
 	// Set date
 	date := time.Now().UTC().Format(time.RFC1123)
 	req.Header.Set("Date", date)
@@ -53,6 +65,7 @@ func sign(AccessKey, SecretKey string, req *http.Request) {
 	var md5 string
 	var contentType string
 	var headersToSign []string
+	tmpHeadersToSign := make(map[string][]string)
 	for k, v := range req.Header {
 		k = strings.ToLower(k)
 		switch k {
@@ -62,15 +75,24 @@ func sign(AccessKey, SecretKey string, req *http.Request) {
 			contentType = v[0]
 		default:
 			if strings.HasPrefix(k, "x-amz-") {
-				vall := strings.Join(v, ",")
-				headersToSign = append(headersToSign, k+":"+vall)
+				tmpHeadersToSign[k] = v
 			}
 		}
+	}
+	var keys []string
+	for k := range tmpHeadersToSign {
+		keys = append(keys, k)
+	}
+	// https://docs.aws.amazon.com/AmazonS3/latest/dev/RESTAuthentication.html
+	sort.Strings(keys)
+
+	for _, key := range keys {
+		vall := strings.Join(tmpHeadersToSign[key], ",")
+		headersToSign = append(headersToSign, key+":"+vall)
 	}
 	// Make headers of interest into canonical string
 	var joinedHeadersToSign string
 	if len(headersToSign) > 0 {
-		sort.StringSlice(headersToSign).Sort()
 		joinedHeadersToSign = strings.Join(headersToSign, "\n") + "\n"
 	}
 
@@ -96,11 +118,12 @@ func sign(AccessKey, SecretKey string, req *http.Request) {
 
 	// Make signature
 	payload := req.Method + "\n" + md5 + "\n" + contentType + "\n" + date + "\n" + joinedHeadersToSign + uri
-	hash := hmac.New(sha1.New, []byte(SecretKey))
+	hash := hmac.New(sha1.New, []byte(v2.opt.SecretAccessKey))
 	_, _ = hash.Write([]byte(payload))
 	signature := make([]byte, base64.StdEncoding.EncodedLen(hash.Size()))
 	base64.StdEncoding.Encode(signature, hash.Sum(nil))
 
 	// Set signature in request
-	req.Header.Set("Authorization", "AWS "+AccessKey+":"+string(signature))
+	req.Header.Set("Authorization", "AWS "+v2.opt.AccessKeyID+":"+string(signature))
+	return nil
 }

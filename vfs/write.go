@@ -1,29 +1,36 @@
 package vfs
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"sync"
 	"time"
 
-	"github.com/ncw/rclone/fs"
-	"github.com/ncw/rclone/fs/operations"
+	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/operations"
+	"github.com/rclone/rclone/vfs/vfscommon"
 )
 
 // WriteFileHandle is an open for write handle on a File
 type WriteFileHandle struct {
 	baseHandle
 	mu          sync.Mutex
-	closed      bool // set if handle has been closed
+	cond        sync.Cond // cond lock for out of sequence writes
 	remote      string
 	pipeWriter  *io.PipeWriter
 	o           fs.Object
 	result      chan error
 	file        *File
-	writeCalled bool // set the first time Write() is called
+	ctx         context.Context    // the streaming upload runs under this
+	cancel      context.CancelFunc // fails the streaming upload, unblocking a stalled write
 	offset      int64
-	opened      bool
 	flags       int
+	closed      bool // set if handle has been closed
+	writeCalled bool // set the first time Write() is called
+	opened      bool
 	truncated   bool
 }
 
@@ -35,12 +42,17 @@ var (
 )
 
 func newWriteFileHandle(d *Dir, f *File, remote string, flags int) (*WriteFileHandle, error) {
+	if f.IsSymlink() {
+		remote += fs.LinkSuffix
+	}
 	fh := &WriteFileHandle{
 		remote: remote,
 		flags:  flags,
 		result: make(chan error, 1),
 		file:   f,
 	}
+	fh.ctx, fh.cancel = context.WithCancel(f.ctx)
+	fh.cond = sync.Cond{L: &fh.mu}
 	fh.file.addWriter(fh)
 	return fh, nil
 }
@@ -64,19 +76,29 @@ func (fh *WriteFileHandle) openPending() (err error) {
 	var pipeReader *io.PipeReader
 	pipeReader, fh.pipeWriter = io.Pipe()
 	go func() {
-		// NB Rcat deals with Stats.Transferring etc
-		o, err := operations.Rcat(fh.file.d.f, fh.remote, pipeReader, time.Now())
+		var (
+			o   fs.Object
+			err error
+		)
+		// Report the outcome however this ends: if a panic escaped here the
+		// process would die, and if it were recovered without reporting then
+		// whoever is waiting on the result would wait forever.
+		defer func() {
+			// Close the pipeReader so the pipeWriter fails with ErrClosedPipe
+			_ = pipeReader.Close()
+			fh.o = o
+			fh.result <- err
+		}()
+		defer vfscommon.RecoverPanic(fh.remote, &err)
+		// NB Rcat deals with Stats.Transferring, etc.
+		o, err = operations.Rcat(fh.ctx, fh.file.Fs(), fh.remote, pipeReader, time.Now(), nil)
 		if err != nil {
 			fs.Errorf(fh.remote, "WriteFileHandle.New Rcat failed: %v", err)
 		}
-		// Close the pipeReader so the pipeWriter fails with ErrClosedPipe
-		_ = pipeReader.Close()
-		fh.o = o
-		fh.result <- err
 	}()
 	fh.file.setSize(0)
 	fh.truncated = true
-	fh.file.d.addObject(fh.file) // make sure the directory has this object in it now
+	fh.file.Dir().addObject(fh.file) // make sure the directory has this object in it now
 	fh.opened = true
 	return nil
 }
@@ -94,7 +116,7 @@ func (fh *WriteFileHandle) String() string {
 	return fh.file.String() + " (w)"
 }
 
-// Node returns the Node assocuated with this - satisfies Noder interface
+// Node returns the Node associated with this - satisfies Noder interface
 func (fh *WriteFileHandle) Node() Node {
 	fh.mu.Lock()
 	defer fh.mu.Unlock()
@@ -119,12 +141,15 @@ func (fh *WriteFileHandle) WriteAt(p []byte, off int64) (n int, err error) {
 	return fh.writeAt(p, off)
 }
 
-// Implementatino of WriteAt - call with lock held
+// Implementation of WriteAt - call with lock held
 func (fh *WriteFileHandle) writeAt(p []byte, off int64) (n int, err error) {
-	// fs.Debugf(fh.remote, "WriteFileHandle.Write len=%d", len(p))
+	// defer log.Trace(fh.remote, "len=%d off=%d", len(p), off)("n=%d, fh.off=%d, err=%v", &n, &fh.offset, &err)
 	if fh.closed {
 		fs.Errorf(fh.remote, "WriteFileHandle.Write: error: %v", EBADF)
 		return 0, ECLOSED
+	}
+	if fh.offset != off {
+		waitSequential("write", fh.remote, &fh.cond, time.Duration(fh.file.VFS().Opt.WriteWait), &fh.offset, off)
 	}
 	if fh.offset != off {
 		fs.Errorf(fh.remote, "WriteFileHandle.Write: can't seek in file without --vfs-cache-mode >= writes")
@@ -142,6 +167,7 @@ func (fh *WriteFileHandle) writeAt(p []byte, off int64) (n int, err error) {
 		return 0, err
 	}
 	// fs.Debugf(fh.remote, "WriteFileHandle.Write OK (%d bytes written)", n)
+	fh.cond.Broadcast() // wake everyone up waiting for an in-sequence read
 	return n, nil
 }
 
@@ -176,27 +202,48 @@ func (fh *WriteFileHandle) Offset() (offset int64) {
 //
 // Must be called with fh.mu held
 func (fh *WriteFileHandle) close() (err error) {
+	return fh.closeWithError(nil)
+}
+
+// closeWithError closes the file handle like close does. If reason is
+// non-nil the streaming upload is failed with reason rather than being
+// ended normally, so a partially written file is discarded instead of
+// being stored as if it were complete.
+//
+// Must be called with fh.mu held
+func (fh *WriteFileHandle) closeWithError(reason error) (err error) {
 	if fh.closed {
 		return ECLOSED
 	}
 	fh.closed = true
+	// Release the upload context once the upload has finished
+	defer fh.cancel()
 	// leave writer open until file is transferred
 	defer func() {
-		fh.file.delWriter(fh, false)
-		fh.file.finishWriterClose()
+		fh.file.delWriter(fh)
 	}()
-	// If file not opened and not safe to truncate then then leave file intact
+	// If file not opened and not safe to truncate then leave file intact
 	if !fh.opened && !fh.safeToTruncate() {
 		return nil
 	}
 	if err = fh.openPending(); err != nil {
 		return err
 	}
-	writeCloseErr := fh.pipeWriter.Close()
+	writeCloseErr := fh.pipeWriter.CloseWithError(reason)
 	err = <-fh.result
 	if err == nil {
 		fh.file.setObject(fh.o)
 		err = writeCloseErr
+	} else {
+		if fh.file.getObject() == nil {
+			// Remove vfs file entry when no object is present
+			_ = fh.file.Remove()
+		}
+		if reason != nil {
+			// The upload's own error is usually just the cancellation
+			// the abandon caused - reason is the cause worth reporting.
+			err = reason
+		}
 	}
 	return err
 }
@@ -206,6 +253,34 @@ func (fh *WriteFileHandle) Close() error {
 	fh.mu.Lock()
 	defer fh.mu.Unlock()
 	return fh.close()
+}
+
+// CloseWithError closes the file handle, abandoning the write.
+//
+// The streaming upload to the backend is failed with reason rather than
+// being ended normally, so the partially written file is discarded
+// instead of being stored as if it were complete. A stalled upload is
+// interrupted rather than waited for, so this returns promptly even
+// when the backend has stopped accepting data. A nil reason is the
+// same as Close.
+//
+// It returns ECLOSED if the handle has already been closed.
+func (fh *WriteFileHandle) CloseWithError(reason error) error {
+	// Don't let an EOF-like reason be mistaken for a clean end of stream
+	// by whatever is reading the other end of the pipe.
+	if reason != nil && (errors.Is(reason, io.EOF) || errors.Is(reason, io.ErrUnexpectedEOF)) {
+		reason = fmt.Errorf("write aborted: %v", reason)
+	}
+	if reason != nil {
+		// Fail the upload before taking the lock: a write blocked on a
+		// stalled upload holds fh.mu, and only failing the upload
+		// unblocks it - otherwise the abandon would wait out the
+		// backend's timeout (or forever without one).
+		fh.cancel()
+	}
+	fh.mu.Lock()
+	defer fh.mu.Unlock()
+	return fh.closeWithError(reason)
 }
 
 // Flush is called on each close() of a file descriptor. So if a
@@ -241,7 +316,7 @@ func (fh *WriteFileHandle) Flush() error {
 	err := fh.close()
 	if err != nil {
 		fs.Errorf(fh.remote, "WriteFileHandle.Flush error: %v", err)
-	} else {
+		//} else {
 		// fs.Debugf(fh.remote, "WriteFileHandle.Flush OK")
 	}
 	return err
@@ -262,7 +337,7 @@ func (fh *WriteFileHandle) Release() error {
 	err := fh.close()
 	if err != nil {
 		fs.Errorf(fh.remote, "WriteFileHandle.Release error: %v", err)
-	} else {
+		//} else {
 		// fs.Debugf(fh.remote, "WriteFileHandle.Release OK")
 	}
 	return err
@@ -277,11 +352,9 @@ func (fh *WriteFileHandle) Stat() (os.FileInfo, error) {
 
 // Truncate file to given size
 func (fh *WriteFileHandle) Truncate(size int64) (err error) {
+	// defer log.Trace(fh.remote, "size=%d", size)("err=%v", &err)
 	fh.mu.Lock()
 	defer fh.mu.Unlock()
-	if fh.closed {
-		return ECLOSED
-	}
 	if size != fh.offset {
 		fs.Errorf(fh.remote, "WriteFileHandle: Truncate: Can't change size without --vfs-cache-mode >= writes")
 		return EPERM
@@ -312,4 +385,9 @@ func (fh *WriteFileHandle) ReadAt(p []byte, off int64) (n int, err error) {
 // data to disk.
 func (fh *WriteFileHandle) Sync() error {
 	return nil
+}
+
+// Name returns the name of the file from the underlying Object.
+func (fh *WriteFileHandle) Name() string {
+	return fh.file.String()
 }

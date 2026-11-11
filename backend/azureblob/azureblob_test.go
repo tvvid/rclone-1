@@ -1,24 +1,50 @@
 // Test AzureBlob filesystem interface
 
-// +build !plan9,!solaris,go1.8
+//go:build !plan9 && !js
 
 package azureblob
 
 import (
 	"testing"
 
-	"github.com/ncw/rclone/fs"
-	"github.com/ncw/rclone/fstest/fstests"
+	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fstest"
+	"github.com/rclone/rclone/fstest/fstests"
+	"github.com/stretchr/testify/assert"
 )
 
 // TestIntegration runs integration tests against the remote
 func TestIntegration(t *testing.T) {
+	name := "TestAzureBlob"
 	fstests.Run(t, &fstests.Opt{
-		RemoteName:  "TestAzureBlob:",
+		RemoteName:  name + ":",
 		NilObject:   (*Object)(nil),
-		TiersToTest: []string{"Hot", "Cool"},
+		TiersToTest: []string{"Hot", "Cool", "Cold"},
 		ChunkedUpload: fstests.ChunkedUploadConfig{
-			MaxChunkSize: maxChunkSize,
+			MinChunkSize: defaultChunkSize,
+		},
+		ExtraConfig: []fstests.ExtraConfigItem{
+			{Name: name, Key: "use_copy_blob", Value: "false"},
+		},
+	})
+}
+
+// TestIntegration2 runs integration tests against the remote
+func TestIntegration2(t *testing.T) {
+	if *fstest.RemoteName != "" {
+		t.Skip("Skipping as -remote set")
+	}
+	name := "TestAzureBlob"
+	fstests.Run(t, &fstests.Opt{
+		RemoteName:  name + ":",
+		NilObject:   (*Object)(nil),
+		TiersToTest: []string{"Hot", "Cool", "Cold"},
+		ChunkedUpload: fstests.ChunkedUploadConfig{
+			MinChunkSize: defaultChunkSize,
+		},
+		ExtraConfig: []fstests.ExtraConfigItem{
+			{Name: name, Key: "directory_markers", Value: "true"},
+			{Name: name, Key: "use_copy_blob", Value: "false"},
 		},
 	})
 }
@@ -27,11 +53,34 @@ func (f *Fs) SetUploadChunkSize(cs fs.SizeSuffix) (fs.SizeSuffix, error) {
 	return f.setUploadChunkSize(cs)
 }
 
-func (f *Fs) SetUploadCutoff(cs fs.SizeSuffix) (fs.SizeSuffix, error) {
-	return f.setUploadCutoff(cs)
+func (f *Fs) SetCopyCutoff(cs fs.SizeSuffix) (fs.SizeSuffix, error) {
+	return f.setCopyCutoff(cs)
 }
 
 var (
 	_ fstests.SetUploadChunkSizer = (*Fs)(nil)
-	_ fstests.SetUploadCutoffer   = (*Fs)(nil)
+	_ fstests.SetCopyCutoffer     = (*Fs)(nil)
 )
+
+func TestValidateAccessTier(t *testing.T) {
+	tests := map[string]struct {
+		accessTier string
+		want       bool
+	}{
+		"hot":     {"hot", true},
+		"HOT":     {"HOT", true},
+		"Hot":     {"Hot", true},
+		"cool":    {"cool", true},
+		"cold":    {"cold", true},
+		"archive": {"archive", true},
+		"empty":   {"", false},
+		"unknown": {"unknown", false},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			got := validateAccessTier(test.accessTier)
+			assert.Equal(t, test.want, got)
+		})
+	}
+}

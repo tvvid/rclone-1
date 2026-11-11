@@ -13,7 +13,7 @@ const (
 	timeFormat = `"` + time.RFC1123Z + `"`
 )
 
-// Time represents represents date and time information for the
+// Time represents date and time information for the
 // pcloud API, by using RFC1123Z
 type Time time.Time
 
@@ -41,7 +41,7 @@ type Error struct {
 	ErrorString string `json:"error"`
 }
 
-// Error returns a string for the error and statistifes the error interface
+// Error returns a string for the error and satisfies the error interface
 func (e *Error) Error() string {
 	return fmt.Sprintf("pcloud error: %s (%d)", e.ErrorString, e.Result)
 }
@@ -58,7 +58,7 @@ func (e *Error) Update(err error) error {
 	return e
 }
 
-// Check Error statisfies the error interface
+// Check Error satisfies the error interface
 var _ error = (*Error)(nil)
 
 // Item describes a folder or a file as returned by Get Folder Items and others
@@ -96,7 +96,7 @@ func (i *Item) ModTime() (t time.Time) {
 	return t
 }
 
-// ItemResult is returned from the /listfolder, /createfolder, /deletefolder, /deletefile etc methods
+// ItemResult is returned from the /listfolder, /createfolder, /deletefolder, /deletefile, etc. methods
 type ItemResult struct {
 	Error
 	Metadata Item `json:"metadata"`
@@ -104,8 +104,40 @@ type ItemResult struct {
 
 // Hashes contains the supported hashes
 type Hashes struct {
-	SHA1 string `json:"sha1"`
-	MD5  string `json:"md5"`
+	SHA1   string `json:"sha1"`
+	MD5    string `json:"md5"`
+	SHA256 string `json:"sha256"`
+}
+
+// FileTruncateResponse is the response from /file_truncate
+type FileTruncateResponse struct {
+	Error
+}
+
+// FileCloseResponse is the response from /file_close
+type FileCloseResponse struct {
+	Error
+}
+
+// FileOpenResponse is the response from /file_open
+type FileOpenResponse struct {
+	Error
+	Fileid         int64 `json:"fileid"`
+	FileDescriptor int64 `json:"fd"`
+}
+
+// FileChecksumResponse is the response from /file_checksum
+type FileChecksumResponse struct {
+	Error
+	MD5    string `json:"md5"`
+	SHA1   string `json:"sha1"`
+	SHA256 string `json:"sha256"`
+}
+
+// FilePWriteResponse is the response from /file_pwrite
+type FilePWriteResponse struct {
+	Error
+	Bytes int64 `json:"bytes"`
 }
 
 // UploadFileResponse is the response from /uploadfile
@@ -135,7 +167,7 @@ func (g *GetFileLinkResult) IsValid() bool {
 	if len(g.Hosts) == 0 {
 		return false
 	}
-	return time.Time(g.Expires).Sub(time.Now()) > 30*time.Second
+	return time.Until(time.Time(g.Expires)) > 30*time.Second
 }
 
 // URL returns a URL from the Path and Hosts.  Check with IsValid
@@ -152,6 +184,14 @@ type ChecksumFileResult struct {
 	Metadata Item `json:"metadata"`
 }
 
+// PubLinkResult is returned from /getfilepublink and /getfolderpublink
+type PubLinkResult struct {
+	Error
+	LinkID   int    `json:"linkid"`
+	Link     string `json:"link"`
+	LinkCode string `json:"code"`
+}
+
 // UserInfo is returned from /userinfo
 type UserInfo struct {
 	Error
@@ -161,7 +201,6 @@ type UserInfo struct {
 	PublicLinkQuota       int64  `json:"publiclinkquota"`
 	Email                 string `json:"email"`
 	UserID                int    `json:"userid"`
-	Result                int    `json:"result"`
 	Quota                 int64  `json:"quota"`
 	TrashRevretentionDays int    `json:"trashrevretentiondays"`
 	Premium               bool   `json:"premium"`
@@ -182,4 +221,12 @@ type UserInfo struct {
 			DownloadDrive bool `json:"downloaddrive"`
 		} `json:"steps"`
 	} `json:"journey"`
+}
+
+// DiffResult is the response from /diff
+type DiffResult struct {
+	Result  int              `json:"result"`
+	DiffID  int64            `json:"diffid"`
+	Entries []map[string]any `json:"entries"`
+	Error   string           `json:"error"`
 }

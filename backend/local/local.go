@@ -2,31 +2,67 @@
 package local
 
 import (
+	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
+	iofs "io/fs"
 	"os"
 	"path"
 	"path/filepath"
-	"regexp"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
-	"github.com/ncw/rclone/fs"
-	"github.com/ncw/rclone/fs/accounting"
-	"github.com/ncw/rclone/fs/config/configmap"
-	"github.com/ncw/rclone/fs/config/configstruct"
-	"github.com/ncw/rclone/fs/fserrors"
-	"github.com/ncw/rclone/fs/hash"
-	"github.com/ncw/rclone/lib/readers"
-	"github.com/pkg/errors"
+	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/accounting"
+	"github.com/rclone/rclone/fs/config"
+	"github.com/rclone/rclone/fs/config/configmap"
+	"github.com/rclone/rclone/fs/config/configstruct"
+	"github.com/rclone/rclone/fs/filter"
+	"github.com/rclone/rclone/fs/fserrors"
+	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/lib/encoder"
+	"github.com/rclone/rclone/lib/file"
+	"github.com/rclone/rclone/lib/readers"
+	"golang.org/x/text/unicode/norm"
 )
 
 // Constants
-const devUnset = 0xdeadbeefcafebabe // a device id meaning it is unset
+const (
+	devUnset   = 0xdeadbeefcafebabe                                     // a device id meaning it is unset
+	useReadDir = (runtime.GOOS == "windows" || runtime.GOOS == "plan9") // these OSes read FileInfos directly
+	// maxLinkTargetSize is the largest symlink target accepted when
+	// translating a .rclonelink object, comfortably above any OS path
+	// limit (Windows allows 32767 UTF-16 units).
+	maxLinkTargetSize = 128 * 1024
+)
+
+// timeType allows the user to choose what exactly ModTime() returns
+type timeType = fs.Enum[timeTypeChoices]
+
+const (
+	mTime timeType = iota
+	aTime
+	bTime
+	cTime
+)
+
+type timeTypeChoices struct{}
+
+func (timeTypeChoices) Choices() []string {
+	return []string{
+		mTime: "mtime",
+		aTime: "atime",
+		bTime: "btime",
+		cTime: "ctime",
+	}
+}
 
 // Register with Fs
 func init() {
@@ -34,130 +70,443 @@ func init() {
 		Name:        "local",
 		Description: "Local Disk",
 		NewFs:       NewFs,
-		Options: []fs.Option{{
-			Name: "nounc",
-			Help: "Disable UNC (long path names) conversion on Windows",
-			Examples: []fs.OptionExample{{
-				Value: "true",
-				Help:  "Disables long file names",
-			}},
-		}, {
-			Name:     "copy_links",
-			Help:     "Follow symlinks and copy the pointed to item.",
-			Default:  false,
-			NoPrefix: true,
-			ShortOpt: "L",
-			Advanced: true,
-		}, {
-			Name: "skip_links",
-			Help: `Don't warn about skipped symlinks.
+		CommandHelp: commandHelp,
+		MetadataInfo: &fs.MetadataInfo{
+			System: systemMetadataInfo,
+			Help: `Depending on which OS is in use the local backend may return only some
+of the system metadata. Setting system metadata is supported on all
+OSes but setting user metadata is only supported on linux, freebsd,
+netbsd, macOS and Solaris. It is **not** supported on Windows yet
+([see pkg/attrs#47](https://github.com/pkg/xattr/issues/47)).
+
+User metadata is stored as extended attributes (which may not be
+supported by all file systems) under the "user.*" prefix.
+
+Metadata is supported on files and directories.
+
+When restoring metadata with ` + "`--metadata`" + ` rclone applies the
+"mode", "uid" and "gid" from the source. These come from the source
+remote which may not be trusted, so restoring metadata as root from an
+untrusted source can change file ownership and is not recommended. A
+user other than root keeps its own uid and sets the gid only to a group
+it is a member of, as rsync does. The setuid, setgid and sticky bits are
+not restored by default - see the
+` + "`--local-metadata-restore-special-bits`" + ` flag.
+`,
+		},
+		Options: []fs.Option{
+			{
+				Name:     "nounc",
+				Help:     "Disable UNC (long path names) conversion on Windows.",
+				Default:  false,
+				Advanced: runtime.GOOS != "windows",
+				Examples: []fs.OptionExample{{
+					Value: "true",
+					Help:  "Disables long file names.",
+				}},
+			},
+			{
+				Name:     "copy_links",
+				Help:     "Follow symlinks and copy the pointed to item.",
+				Default:  false,
+				NoPrefix: true,
+				ShortOpt: "L",
+				Advanced: true,
+			},
+			{
+				Name:     "links",
+				Help:     "Translate symlinks to/from regular files with a '" + fs.LinkSuffix + "' extension for the local backend.",
+				Default:  false,
+				Advanced: true,
+			},
+			{
+				Name: "skip_links",
+				Help: `Don't warn about skipped symlinks.
+
 This flag disables warning messages on skipped symlinks or junction
 points, as you explicitly acknowledge that they should be skipped.`,
-			Default:  false,
-			NoPrefix: true,
-			Advanced: true,
-		}, {
-			Name: "no_unicode_normalization",
-			Help: `Don't apply unicode normalization to paths and filenames (Deprecated)
+				Default:  false,
+				NoPrefix: true,
+				Advanced: true,
+			},
+			{
+				Name: "skip_specials",
+				Help: `Don't warn about skipped pipes, sockets and device objects.
 
-This flag is deprecated now.  Rclone no longer normalizes unicode file
-names, but it compares them with unicode normalization in the sync
-routine instead.`,
-			Default:  false,
-			Advanced: true,
-		}, {
-			Name: "no_check_updated",
-			Help: `Don't check to see if the files change during upload
+This flag disables warning messages on skipped pipes, sockets and
+device objects, as you explicitly acknowledge that they should be
+skipped.`,
+				Default:  false,
+				NoPrefix: true,
+				Advanced: true,
+			},
+			{
+				Name: "zero_size_links",
+				Help: `Assume the Stat size of links is zero (and read them instead) (deprecated).
+
+Rclone used to use the Stat size of links as the link size, but this fails in quite a few places:
+
+- Windows
+- On some virtual filesystems (such ash LucidLink)
+- Android
+
+So rclone now always reads the link.
+`,
+				Default:  false,
+				Advanced: true,
+			},
+			{
+				Name: "unicode_normalization",
+				Help: `Apply unicode NFC normalization to paths and filenames.
+
+This flag can be used to normalize file names into unicode NFC form
+that are read from the local filesystem.
+
+Rclone does not normally touch the encoding of file names it reads from
+the file system.
+
+This can be useful when using macOS as it normally provides decomposed (NFD)
+unicode which in some language (eg Korean) doesn't display properly on
+some OSes.
+
+Note that rclone compares filenames with unicode normalization in the sync
+routine so this flag shouldn't normally be used.`,
+				Default:  false,
+				Advanced: true,
+			},
+			{
+				Name: "no_check_updated",
+				Help: `Don't check to see if the files change during upload.
 
 Normally rclone checks the size and modification time of files as they
-are being uploaded and aborts with a message which starts "can't copy
-- source file is being updated" if the file changes during upload.
+are being uploaded and aborts with a message which starts "can't copy -
+source file is being updated" if the file changes during upload.
 
-However on some file systems this modification time check may fail (eg
-[Glusterfs #2206](https://github.com/ncw/rclone/issues/2206)) so this
-check can be disabled with this flag.`,
-			Default:  false,
-			Advanced: true,
-		}, {
-			Name:     "one_file_system",
-			Help:     "Don't cross filesystem boundaries (unix/macOS only).",
-			Default:  false,
-			NoPrefix: true,
-			ShortOpt: "x",
-			Advanced: true,
-		}},
+However on some file systems this modification time check may fail (e.g.
+[Glusterfs #2206](https://github.com/rclone/rclone/issues/2206)) so this
+check can be disabled with this flag.
+
+If this flag is set, rclone will use its best efforts to transfer a
+file which is being updated. If the file is only having things
+appended to it (e.g. a log) then rclone will transfer the log file with
+the size it had the first time rclone saw it.
+
+If the file is being modified throughout (not just appended to) then
+the transfer may fail with a hash check failure.
+
+In detail, once the file has had stat() called on it for the first
+time we:
+
+- Only transfer the size that stat gave
+- Only checksum the size that stat gave
+- Don't update the stat info for the file
+
+**NB** do not use this flag on a Windows Volume Shadow (VSS). For some
+unknown reason, files in a VSS sometimes show different sizes from the
+directory listing (where the initial stat value comes from on Windows)
+and when stat is called on them directly. Other copy tools always use
+the direct stat value and setting this flag will disable that.
+`,
+				Default:  false,
+				Advanced: true,
+			},
+			{
+				Name:     "one_file_system",
+				Help:     "Don't cross filesystem boundaries (unix/macOS only).",
+				Default:  false,
+				NoPrefix: true,
+				ShortOpt: "x",
+				Advanced: true,
+			},
+			{
+				Name: "case_sensitive",
+				Help: `Force the filesystem to report itself as case sensitive.
+
+Normally the local backend declares itself as case insensitive on
+Windows/macOS and case sensitive for everything else.  Use this flag
+to override the default choice.`,
+				Default:  false,
+				Advanced: true,
+			},
+			{
+				Name: "case_insensitive",
+				Help: `Force the filesystem to report itself as case insensitive.
+
+Normally the local backend declares itself as case insensitive on
+Windows/macOS and case sensitive for everything else.  Use this flag
+to override the default choice.`,
+				Default:  false,
+				Advanced: true,
+			},
+			{
+				Name: "no_clone",
+				Help: `Disable reflink cloning for server-side copies.
+
+Normally, for local-to-local transfers, rclone will "clone" the file when
+possible, and fall back to "copying" only when cloning is not supported.
+
+Cloning creates a shallow copy (or "reflink") which initially shares blocks with
+the original file. Unlike a "hardlink", the two files are independent and
+neither will affect the other if subsequently modified.
+
+Cloning is usually preferable to copying, as it is much faster and is
+deduplicated by default (i.e. having two identical files does not consume more
+storage than having just one.)  However, for use cases where data redundancy is
+preferable, --local-no-clone can be used to disable cloning and force "deep" copies.
+
+Cloning also preserves macOS-specific metadata such as extended attributes,
+which a normal copy does not, so this metadata is lost when cloning is disabled.
+
+If the destination file already exists, cloning replaces it with a new file,
+even with --inplace, so hard links to it are broken. Use --local-no-clone to
+update existing files in place.
+
+Currently, cloning is only supported when using APFS on macOS (support for other
+platforms may be added in the future.)`,
+				Default:  false,
+				Advanced: true,
+			},
+			{
+				Name: "no_preallocate",
+				Help: `Disable preallocation of disk space for transferred files.
+
+Preallocation of disk space helps prevent filesystem fragmentation.
+However, some virtual filesystem layers (such as Google Drive File
+Stream) may incorrectly set the actual file size equal to the
+preallocated space, causing checksum and file size checks to fail.
+Use this flag to disable preallocation.`,
+				Default:  false,
+				Advanced: true,
+			},
+			{
+				Name: "no_sparse",
+				Help: `Disable sparse files for multi-thread downloads.
+
+On Windows platforms rclone will make sparse files when doing
+multi-thread downloads. This avoids long pauses on large files where
+the OS zeros the file. However sparse files may be undesirable as they
+cause disk fragmentation and can be slow to work with.`,
+				Default:  false,
+				Advanced: true,
+			},
+			{
+				Name: "no_set_modtime",
+				Help: `Disable setting modtime.
+
+Normally rclone updates modification time of files after they are done
+uploading. This can cause permissions issues on Linux platforms when 
+the user rclone is running as does not own the file uploaded, such as
+when copying to a CIFS mount owned by another user. If this option is 
+enabled, rclone will no longer update the modtime after copying a file.`,
+				Default:  false,
+				Advanced: true,
+			},
+			{
+				Name: "metadata_restore_special_bits",
+				Help: `Restore the setuid, setgid and sticky bits from metadata.
+
+When restoring metadata with --metadata rclone applies the "mode" from
+the source. By default rclone applies only the permission bits and
+strips the setuid, setgid and sticky bits.
+
+The "mode" comes from the source remote which may not be trusted.
+Restoring a setuid or setgid bit onto freshly written,
+source-controlled content can plant a setuid binary, which is dangerous
+in particular when restoring from an untrusted source while running as
+root. For this reason these bits are not restored by default.
+
+If you trust the source and want the setuid, setgid and sticky bits
+restored - for example when restoring a system backup made by rclone -
+set this flag.`,
+				Default:  false,
+				Advanced: true,
+			},
+			{
+				Name: "fatal_if_no_space",
+				Help: `Make out-of-space errors fatal during transfers.
+
+When enabled, an out of space error while writing, creating a directory,
+or creating a file returns a fatal error so that rclone aborts rather
+than retrying the operation. Useful for backup scripts that should halt
+loudly on a full disk rather than spin retrying.`,
+				Default:  false,
+				Advanced: true,
+			},
+			{
+				Name: "time_type",
+				Help: `Set what kind of time is returned.
+
+Normally rclone does all operations on the mtime or Modification time.
+
+If you set this flag then rclone will return the Modified time as whatever
+you set here. So if you use "rclone lsl --local-time-type ctime" then
+you will see ctimes in the listing.
+
+If the OS doesn't support returning the time_type specified then rclone
+will silently replace it with the modification time which all OSes support.
+
+- mtime is supported by all OSes
+- atime is supported on all OSes except: plan9, js
+- btime is only supported on: Windows, macOS, freebsd, netbsd
+- ctime is supported on all Oses except: Windows, plan9, js
+
+Note that setting the time will still set the modified time so this is
+only useful for reading.
+`,
+				Default:  mTime,
+				Advanced: true,
+				Examples: []fs.OptionExample{{
+					Value: mTime.String(),
+					Help:  "The last modification time.",
+				}, {
+					Value: aTime.String(),
+					Help:  "The last access time.",
+				}, {
+					Value: bTime.String(),
+					Help:  "The creation time.",
+				}, {
+					Value: cTime.String(),
+					Help:  "The last status change time.",
+				}},
+			},
+			{
+				Name:     "hashes",
+				Help:     `Comma separated list of supported checksum types.`,
+				Default:  fs.CommaSepList{},
+				Advanced: true,
+			},
+			{
+				Name:     config.ConfigEncoding,
+				Help:     config.ConfigEncodingHelp,
+				Advanced: true,
+				Default:  encoder.OS,
+			},
+		},
 	}
 	fs.Register(fsi)
 }
 
 // Options defines the configuration for this backend
 type Options struct {
-	FollowSymlinks bool `config:"copy_links"`
-	SkipSymlinks   bool `config:"skip_links"`
-	NoUTFNorm      bool `config:"no_unicode_normalization"`
-	NoCheckUpdated bool `config:"no_check_updated"`
-	NoUNC          bool `config:"nounc"`
-	OneFileSystem  bool `config:"one_file_system"`
+	FollowSymlinks         bool                 `config:"copy_links"`
+	TranslateSymlinks      bool                 `config:"links"`
+	SkipSymlinks           bool                 `config:"skip_links"`
+	SkipSpecials           bool                 `config:"skip_specials"`
+	UTFNorm                bool                 `config:"unicode_normalization"`
+	NoCheckUpdated         bool                 `config:"no_check_updated"`
+	NoUNC                  bool                 `config:"nounc"`
+	OneFileSystem          bool                 `config:"one_file_system"`
+	CaseSensitive          bool                 `config:"case_sensitive"`
+	CaseInsensitive        bool                 `config:"case_insensitive"`
+	NoPreAllocate          bool                 `config:"no_preallocate"`
+	NoSparse               bool                 `config:"no_sparse"`
+	NoSetModTime           bool                 `config:"no_set_modtime"`
+	FatalIfNoSpace         bool                 `config:"fatal_if_no_space"`
+	TimeType               timeType             `config:"time_type"`
+	Hashes                 fs.CommaSepList      `config:"hashes"`
+	Enc                    encoder.MultiEncoder `config:"encoding"`
+	NoClone                bool                 `config:"no_clone"`
+	MetadataRestoreSpecial bool                 `config:"metadata_restore_special_bits"`
 }
 
 // Fs represents a local filesystem rooted at root
 type Fs struct {
-	name        string              // the name of the remote
-	root        string              // The root directory (OS path)
-	opt         Options             // parsed config options
-	features    *fs.Features        // optional features
-	dev         uint64              // device number of root node
-	precisionOk sync.Once           // Whether we need to read the precision
-	precision   time.Duration       // precision of local filesystem
-	wmu         sync.Mutex          // used for locking access to 'warned'.
-	warned      map[string]struct{} // whether we have warned about this string
+	name           string              // the name of the remote
+	root           string              // The root directory (OS path)
+	opt            Options             // parsed config options
+	features       *fs.Features        // optional features
+	dev            uint64              // device number of root node
+	precisionOk    sync.Once           // Whether we need to read the precision
+	precision      time.Duration       // precision of local filesystem
+	warnedMu       sync.Mutex          // used for locking access to 'warned'.
+	warned         map[string]struct{} // whether we have warned about this string
+	xattrSupported atomic.Int32        // whether xattrs are supported
+
 	// do os.Lstat or os.Stat
-	lstat          func(name string) (os.FileInfo, error)
-	dirNames       *mapper    // directory name mapping
-	objectHashesMu sync.Mutex // global lock for Object.hashes
+	lstat        func(name string) (os.FileInfo, error)
+	objectMetaMu sync.RWMutex // global lock for Object metadata
 }
 
 // Object represents a local filesystem object
 type Object struct {
-	fs      *Fs    // The Fs this object is part of
-	remote  string // The remote path - properly UTF-8 encoded - for rclone
-	path    string // The local path - may not be properly UTF-8 encoded - for OS
-	size    int64  // file metadata - always present
+	fs     *Fs    // The Fs this object is part of
+	remote string // The remote path (encoded path)
+	path   string // The local path (OS path)
+	// When using these items the fs.objectMetaMu must be held
+	size    int64 // file metadata - always present
 	mode    os.FileMode
 	modTime time.Time
 	hashes  map[hash.Type]string // Hashes
+	// these are read only and don't need the mutex held
+	translatedLink bool // Is this object a translated link
+}
+
+// Directory represents a local filesystem directory
+type Directory struct {
+	Object
 }
 
 // ------------------------------------------------------------
 
+var (
+	errLinksAndCopyLinks = errors.New("can't use -l/--links with -L/--copy-links")
+	errLinksNeedsSuffix  = errors.New("need \"" + fs.LinkSuffix + "\" suffix to refer to symlink when using -l/--links")
+	errPathEscapes       = errors.New("file name is not a path within the local root - check the encoding")
+	errSymlinkLoop       = errors.New("loop detected: points to a parent directory")
+	errLinkTargetTooLong = errors.New("symlink target is too long to be a path")
+	errLinkNameInvalid   = errors.New("translated link needs a file name before the \"" + fs.LinkSuffix + "\" suffix")
+)
+
 // NewFs constructs an Fs from the path
-func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
+func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
+	ci := fs.GetConfig(ctx)
 	// Parse config into Options struct
 	opt := new(Options)
 	err := configstruct.Set(m, opt)
 	if err != nil {
 		return nil, err
 	}
-
-	if opt.NoUTFNorm {
-		fs.Errorf(nil, "The --local-no-unicode-normalization flag is deprecated and will be removed")
+	// Override --local-links with --links if set
+	if ci.Links {
+		opt.TranslateSymlinks = true
+	}
+	if opt.TranslateSymlinks && opt.FollowSymlinks {
+		return nil, errLinksAndCopyLinks
 	}
 
 	f := &Fs{
-		name:     name,
-		opt:      *opt,
-		warned:   make(map[string]struct{}),
-		dev:      devUnset,
-		lstat:    os.Lstat,
-		dirNames: newMapper(),
+		name:   name,
+		opt:    *opt,
+		warned: make(map[string]struct{}),
+		dev:    devUnset,
+		lstat:  os.Lstat,
 	}
-	f.root = f.cleanPath(root)
+	if xattrSupported {
+		f.xattrSupported.Store(1)
+	}
+	f.root = cleanRootPath(root, f.opt.NoUNC, f.opt.Enc)
 	f.features = (&fs.Features{
-		CaseInsensitive:         f.caseInsensitive(),
-		CanHaveEmptyDirectories: true,
-	}).Fill(f)
+		CaseInsensitive:          f.caseInsensitive(),
+		CanHaveEmptyDirectories:  true,
+		IsLocal:                  true,
+		SlowHash:                 true,
+		ReadMetadata:             true,
+		WriteMetadata:            true,
+		ReadDirMetadata:          true,
+		WriteDirMetadata:         true,
+		WriteDirSetModTime:       true,
+		UserDirMetadata:          xattrSupported, // can only R/W general purpose metadata if xattrs are supported
+		DirModTimeUpdatesOnWrite: true,
+		UserMetadata:             xattrSupported, // can only R/W general purpose metadata if xattrs are supported
+		FilterAware:              true,
+		PartialUploads:           true,
+	}).Fill(ctx, f)
 	if opt.FollowSymlinks {
 		f.lstat = os.Stat
+	}
+	if opt.NoClone {
+		// Disable server-side copy when --local-no-clone is set
+		f.features.Copy = nil
 	}
 
 	// Check to see if this points to a file
@@ -165,13 +514,36 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 	if err == nil {
 		f.dev = readDevice(fi, f.opt.OneFileSystem)
 	}
-	if err == nil && fi.Mode().IsRegular() {
+	// Check to see if this is a .rclonelink if not found
+	hasLinkSuffix := strings.HasSuffix(f.root, fs.LinkSuffix)
+	if hasLinkSuffix && opt.TranslateSymlinks && os.IsNotExist(err) {
+		fi, err = f.lstat(strings.TrimSuffix(f.root, fs.LinkSuffix))
+	}
+	if err == nil && f.isRegular(fi.Mode()) {
+		// Handle the odd case, that a symlink was specified by name without the link suffix
+		if !hasLinkSuffix && opt.TranslateSymlinks && fi.Mode()&os.ModeSymlink != 0 {
+			return nil, errLinksNeedsSuffix
+		}
 		// It is a file, so use the parent as the root
 		f.root = filepath.Dir(f.root)
 		// return an error with an fs which points to the parent
 		return f, fs.ErrorIsFile
 	}
 	return f, nil
+}
+
+// Determine whether a file is a 'regular' file,
+// Symlinks are regular files, only if the TranslateSymlink
+// option is in-effect
+func (f *Fs) isRegular(mode os.FileMode) bool {
+	if !f.opt.TranslateSymlinks {
+		return mode.IsRegular()
+	}
+
+	// fi.Mode().IsRegular() tests that all mode bits are zero
+	// Since symlinks are accepted, test that all other bits are zero,
+	// except the symlink bit
+	return mode&os.ModeType&^os.ModeSymlink == 0
 }
 
 // Name of the remote (as passed into NewFs)
@@ -181,12 +553,12 @@ func (f *Fs) Name() string {
 
 // Root of the remote (as passed into NewFs)
 func (f *Fs) Root() string {
-	return f.root
+	return f.opt.Enc.ToStandardPath(filepath.ToSlash(f.root))
 }
 
 // String converts this Fs to a string
 func (f *Fs) String() string {
-	return fmt.Sprintf("Local file system at %s", f.root)
+	return fmt.Sprintf("Local file system at %s", f.Root())
 }
 
 // Features returns the optional features of this Fs
@@ -194,10 +566,16 @@ func (f *Fs) Features() *fs.Features {
 	return f.features
 }
 
-// caseInsenstive returns whether the remote is case insensitive or not
+// caseInsensitive returns whether the remote is case insensitive or not
 func (f *Fs) caseInsensitive() bool {
+	if f.opt.CaseSensitive {
+		return false
+	}
+	if f.opt.CaseInsensitive {
+		return true
+	}
 	// FIXME not entirely accurate since you can have case
-	// sensitive Fses on darwin and case insenstive Fses on linux.
+	// sensitive Fses on darwin and case insensitive Fses on linux.
 	// Should probably check but that would involve creating a
 	// file in the remote to be most accurate which probably isn't
 	// desirable.
@@ -205,25 +583,41 @@ func (f *Fs) caseInsensitive() bool {
 }
 
 // newObject makes a half completed Object
-//
-// if dstPath is empty then it is made from remote
-func (f *Fs) newObject(remote, dstPath string) *Object {
-	if dstPath == "" {
-		dstPath = f.cleanPath(filepath.Join(f.root, remote))
+func (f *Fs) newObject(remote string) (*Object, error) {
+	name, translatedLink := remote, false
+	if f.opt.TranslateSymlinks {
+		name, translatedLink = strings.CutSuffix(remote, fs.LinkSuffix)
 	}
-	remote = f.cleanRemote(remote)
+	if translatedLink {
+		// Check this makes a valid native file name
+		native := f.nativePath(name)
+		switch native[strings.LastIndex(native, string(filepath.Separator))+1:] {
+		case "", ".", "..":
+			return nil, fserrors.NoRetryError(fmt.Errorf("%q: %w", remote, errLinkNameInvalid))
+		}
+	}
+	// Check the name after any suffix removal
+	localPath, err := f.localPath(name)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Object{
-		fs:     f,
-		remote: remote,
-		path:   dstPath,
-	}
+		fs:             f,
+		remote:         remote,
+		path:           localPath,
+		translatedLink: translatedLink,
+	}, nil
 }
 
 // Return an Object from a path
 //
 // May return nil if an error occurred
-func (f *Fs) newObjectWithInfo(remote, dstPath string, info os.FileInfo) (fs.Object, error) {
-	o := f.newObject(remote, dstPath)
+func (f *Fs) newObjectWithInfo(remote string, info os.FileInfo) (fs.Object, error) {
+	o, err := f.newObject(remote)
+	if err != nil {
+		return nil, err
+	}
 	if info != nil {
 		o.setMetadata(info)
 	} else {
@@ -237,17 +631,42 @@ func (f *Fs) newObjectWithInfo(remote, dstPath string, info os.FileInfo) (fs.Obj
 			}
 			return nil, err
 		}
+		// Handle the odd case, that a symlink was specified by name without the link suffix
+		if o.fs.opt.TranslateSymlinks && o.mode&os.ModeSymlink != 0 && !o.translatedLink {
+			return nil, fs.ErrorObjectNotFound
+		}
+
 	}
 	if o.mode.IsDir() {
-		return nil, errors.Wrapf(fs.ErrorNotAFile, "%q", remote)
+		return nil, fs.ErrorIsDir
 	}
 	return o, nil
 }
 
 // NewObject finds the Object at remote.  If it can't be found
 // it returns the error ErrorObjectNotFound.
-func (f *Fs) NewObject(remote string) (fs.Object, error) {
-	return f.newObjectWithInfo(remote, "", nil)
+func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
+	return f.newObjectWithInfo(remote, nil)
+}
+
+// Create new directory object from the info passed in
+//
+// Directories are never translated links, so the name is used as is
+// whatever suffix it has.
+func (f *Fs) newDirectory(dir string, fi os.FileInfo) (*Directory, error) {
+	localPath, err := f.localPath(dir)
+	if err != nil {
+		return nil, err
+	}
+	d := &Directory{
+		Object: Object{
+			fs:     f,
+			remote: dir,
+			path:   localPath,
+		},
+	}
+	d.setMetadata(fi)
+	return d, nil
 }
 
 // List the objects and directories in dir into entries.  The
@@ -259,48 +678,124 @@ func (f *Fs) NewObject(remote string) (fs.Object, error) {
 //
 // This should return ErrDirNotFound if the directory isn't
 // found.
-func (f *Fs) List(dir string) (entries fs.DirEntries, err error) {
-	dir = f.dirNames.Load(dir)
-	fsDirPath := f.cleanPath(filepath.Join(f.root, dir))
-	remote := f.cleanRemote(dir)
+func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
+	filter, useFilter := filter.GetConfig(ctx), filter.GetUseFilter(ctx)
+
+	fsDirPath, err := f.localPath(dir)
+	if err != nil {
+		return nil, err
+	}
 	_, err = os.Stat(fsDirPath)
 	if err != nil {
 		return nil, fs.ErrorDirNotFound
 	}
+	var parents []os.FileInfo // fsDirPath and its parents, read on first use
 
 	fd, err := os.Open(fsDirPath)
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed to open directory %q", dir)
+		isPerm := os.IsPermission(err)
+		err = fmt.Errorf("failed to open directory %q: %w", dir, err)
+		fs.Errorf(dir, "%v", err)
+		if isPerm {
+			_ = accounting.Stats(ctx).Error(fserrors.NoRetryError(err))
+			err = nil // ignore error but fail sync
+		}
+		return nil, err
 	}
 	defer func() {
 		cerr := fd.Close()
 		if cerr != nil && err == nil {
-			err = errors.Wrapf(cerr, "failed to close directory %q:", dir)
+			err = fmt.Errorf("failed to close directory %q:: %w", dir, cerr)
 		}
 	}()
 
 	for {
-		fis, err := fd.Readdir(1024)
-		if err == io.EOF && len(fis) == 0 {
-			break
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		var fis []os.FileInfo
+		if useReadDir {
+			// Windows and Plan9 read the directory entries with the stat information in which
+			// shouldn't fail because of unreadable entries.
+			fis, err = fd.Readdir(1024)
+			if err == io.EOF && len(fis) == 0 {
+				break
+			}
+		} else {
+			// For other OSes we read the names only (which shouldn't fail) then stat the
+			// individual ourselves so we can log errors but not fail the directory read.
+			var names []string
+			names, err = fd.Readdirnames(1024)
+			if err == io.EOF && len(names) == 0 {
+				break
+			}
+			if err == nil {
+				for _, name := range names {
+					namepath := filepath.Join(fsDirPath, name)
+					fi, fierr := os.Lstat(namepath)
+					if os.IsNotExist(fierr) {
+						// skip entry removed by a concurrent goroutine
+						continue
+					}
+					if fierr != nil {
+						// Don't report errors on any file names that are excluded
+						if useFilter {
+							newRemote := f.cleanRemote(dir, name)
+							if !filter.IncludeRemote(newRemote) {
+								continue
+							}
+						}
+						fierr = fmt.Errorf("failed to get info about directory entry %q: %w", namepath, fierr)
+						fs.Errorf(dir, "%v", fierr)
+						_ = accounting.Stats(ctx).Error(fserrors.NoRetryError(fierr)) // fail the sync
+						continue
+					}
+					fis = append(fis, fi)
+				}
+			}
 		}
 		if err != nil {
-			return nil, errors.Wrapf(err, "failed to read directory %q", dir)
+			return nil, fmt.Errorf("failed to read directory entry: %w", err)
 		}
 
 		for _, fi := range fis {
 			name := fi.Name()
 			mode := fi.Mode()
-			newRemote := path.Join(remote, name)
-			newPath := filepath.Join(fsDirPath, name)
+			newRemote := f.cleanRemote(dir, name)
+			symlinkFlag := os.ModeSymlink
+			if runtime.GOOS == "windows" {
+				symlinkFlag |= os.ModeIrregular
+			}
 			// Follow symlinks if required
-			if f.opt.FollowSymlinks && (mode&os.ModeSymlink) != 0 {
-				fi, err = os.Stat(newPath)
-				if os.IsNotExist(err) {
-					// Skip bad symlinks
-					err = fserrors.NoRetryError(errors.Wrap(err, "symlink"))
+			if f.opt.FollowSymlinks && (mode&symlinkFlag) != 0 {
+				localPath := filepath.Join(fsDirPath, name)
+				fi, err = os.Stat(localPath)
+				// A directory symlink pointing to a parent would be followed
+				// until the OS returns ELOOP, which can take a very long time
+				if err == nil && fi.IsDir() {
+					if parents == nil {
+						parents = statParents(fsDirPath)
+					}
+					if slices.ContainsFunc(parents, func(parent os.FileInfo) bool { return os.SameFile(fi, parent) }) {
+						// Quietly skip loops the directory filters exclude as
+						// the layer above wouldn't recurse into them
+						if useFilter {
+							if include, dirErr := filter.IncludeDirectory(ctx, f)(newRemote); dirErr == nil && !include {
+								continue
+							}
+						}
+						err = errSymlinkLoop
+					}
+				}
+				// Quietly skip errors on excluded files and directories
+				if err != nil && useFilter && !filter.IncludeRemote(newRemote) {
+					continue
+				}
+				if os.IsNotExist(err) || isCircularSymlinkError(err) || errors.Is(err, errSymlinkLoop) {
+					// Skip bad symlinks and circular symlinks
+					err = fserrors.NoRetryError(fmt.Errorf("symlink: %w", err))
 					fs.Errorf(newRemote, "Listing error: %v", err)
-					accounting.Stats.Error(err)
+					err = accounting.Stats(ctx).Error(err)
 					continue
 				}
 				if err != nil {
@@ -311,12 +806,30 @@ func (f *Fs) List(dir string) (entries fs.DirEntries, err error) {
 			if fi.IsDir() {
 				// Ignore directories which are symlinks.  These are junction points under windows which
 				// are kind of a souped up symlink. Unix doesn't have directories which are symlinks.
-				if (mode&os.ModeSymlink) == 0 && f.dev == readDevice(fi, f.opt.OneFileSystem) {
-					d := fs.NewDir(f.dirNames.Save(newRemote, f.cleanRemote(newRemote)), fi.ModTime())
+				if (mode&symlinkFlag) == 0 && f.dev == readDevice(fi, f.opt.OneFileSystem) {
+					d, err := f.newDirectory(newRemote, fi)
+					if err != nil {
+						return nil, err
+					}
 					entries = append(entries, d)
 				}
 			} else {
-				fso, err := f.newObjectWithInfo(newRemote, newPath, fi)
+				// Check whether this link should be translated
+				if f.opt.TranslateSymlinks && fi.Mode()&symlinkFlag != 0 {
+					newRemote += fs.LinkSuffix
+				}
+				// Don't include non directory if not included
+				// we leave directory filtering to the layer above
+				if useFilter && !filter.IncludeRemote(newRemote) {
+					continue
+				}
+				fso, err := f.newObjectWithInfo(newRemote, fi)
+				if errors.Is(err, errLinkNameInvalid) {
+					// Skip a badly named ".rclonelink" file
+					fs.Errorf(newRemote, "Listing error: %v", err)
+					_ = accounting.Stats(ctx).Error(err)
+					continue
+				}
 				if err != nil {
 					return nil, err
 				}
@@ -329,68 +842,66 @@ func (f *Fs) List(dir string) (entries fs.DirEntries, err error) {
 	return entries, nil
 }
 
-// cleanRemote makes string a valid UTF-8 string for remote strings.
-//
-// Any invalid UTF-8 characters will be replaced with utf8.RuneError
-// It also normalises the UTF-8 and converts the slashes if necessary.
-func (f *Fs) cleanRemote(name string) string {
-	if !utf8.ValidString(name) {
-		f.wmu.Lock()
-		if _, ok := f.warned[name]; !ok {
-			fs.Logf(f, "Replacing invalid UTF-8 characters in %q", name)
-			f.warned[name] = struct{}{}
+// statParents returns the info for dirPath and each of its parents up
+// to the root of the file system, skipping any which can't be read.
+func statParents(dirPath string) (parents []os.FileInfo) {
+	for {
+		if fi, err := os.Stat(dirPath); err == nil {
+			parents = append(parents, fi)
 		}
-		f.wmu.Unlock()
-		name = string([]rune(name))
-	}
-	name = filepath.ToSlash(name)
-	return name
-}
-
-// mapper maps raw to cleaned directory names
-type mapper struct {
-	mu sync.RWMutex      // mutex to protect the below
-	m  map[string]string // map of un-normalised directory names
-}
-
-func newMapper() *mapper {
-	return &mapper{
-		m: make(map[string]string),
+		parent := filepath.Dir(dirPath)
+		if parent == dirPath {
+			return parents
+		}
+		dirPath = parent
 	}
 }
 
-// Lookup a directory name to make a local name (reverses
-// cleanDirName)
+func (f *Fs) cleanRemote(dir, filename string) (remote string) {
+	if f.opt.UTFNorm {
+		filename = norm.NFC.String(filename)
+	}
+	remote = path.Join(dir, f.opt.Enc.ToStandardName(filename))
+
+	if !utf8.ValidString(filename) {
+		f.warnedMu.Lock()
+		if _, ok := f.warned[remote]; !ok {
+			fs.Logf(f, "Replacing invalid UTF-8 characters in %q", remote)
+			f.warned[remote] = struct{}{}
+		}
+		f.warnedMu.Unlock()
+	}
+	return
+}
+
+// nativePath returns name in the OS encoding with OS path separators,
+// relative to f.root, without cleaning it.
+func (f *Fs) nativePath(name string) string {
+	return filepath.FromSlash(f.opt.Enc.FromStandardPath(name))
+}
+
+// localPath returns the OS path for the object called name, which is
+// always underneath f.root.
 //
-// FIXME this is temporary before we make a proper Directory object
-func (m *mapper) Load(in string) string {
-	m.mu.RLock()
-	out, ok := m.m[in]
-	m.mu.RUnlock()
-	if ok {
-		return out
+// It returns errPathEscapes if name resolves outside f.root which can
+// happen depending on the encoding.
+func (f *Fs) localPath(name string) (string, error) {
+	localPath := filepath.Join(f.root, f.nativePath(name))
+	rel, err := filepath.Rel(f.root, localPath)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fserrors.NoRetryError(fmt.Errorf("%q: %w", name, errPathEscapes))
 	}
-	return in
-}
-
-// Cleans a directory name recording if it needed to be altered
-//
-// FIXME this is temporary before we make a proper Directory object
-func (m *mapper) Save(in, out string) string {
-	if in != out {
-		m.mu.Lock()
-		m.m[out] = in
-		m.mu.Unlock()
-	}
-	return out
+	return localPath, nil
 }
 
 // Put the Object to the local filesystem
-func (f *Fs) Put(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	remote := src.Remote()
+func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
 	// Temporary Object under construction - info filled in by Update()
-	o := f.newObject(remote, "")
-	err := o.Update(in, src, options...)
+	o, err := f.newObject(src.Remote())
+	if err != nil {
+		return nil, err
+	}
+	err = o.Update(ctx, in, src, options...)
 	if err != nil {
 		return nil, err
 	}
@@ -398,20 +909,22 @@ func (f *Fs) Put(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.
 }
 
 // PutStream uploads to the remote path with the modTime given of indeterminate size
-func (f *Fs) PutStream(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	return f.Put(in, src, options...)
+func (f *Fs) PutStream(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	return f.Put(ctx, in, src, options...)
 }
 
 // Mkdir creates the directory if it doesn't exist
-func (f *Fs) Mkdir(dir string) error {
-	// FIXME: https://github.com/syncthing/syncthing/blob/master/lib/osutil/mkdirall_windows.go
-	root := f.cleanPath(filepath.Join(f.root, dir))
-	err := os.MkdirAll(root, 0777)
+func (f *Fs) Mkdir(ctx context.Context, dir string) error {
+	localPath, err := f.localPath(dir)
+	if err != nil {
+		return err
+	}
+	err = f.mkdirAll(localPath)
 	if err != nil {
 		return err
 	}
 	if dir == "" {
-		fi, err := f.lstat(root)
+		fi, err := f.lstat(localPath)
 		if err != nil {
 			return err
 		}
@@ -420,16 +933,110 @@ func (f *Fs) Mkdir(dir string) error {
 	return nil
 }
 
+// DirSetModTime sets the directory modtime for dir
+func (f *Fs) DirSetModTime(ctx context.Context, dir string, modTime time.Time) error {
+	localPath, err := f.localPath(dir)
+	if err != nil {
+		return err
+	}
+	o := Object{
+		fs:     f,
+		remote: dir,
+		path:   localPath,
+	}
+	return o.SetModTime(ctx, modTime)
+}
+
+// MkdirMetadata makes the directory passed in as dir.
+//
+// It shouldn't return an error if it already exists.
+//
+// If the metadata is not nil it is set.
+//
+// It returns the directory that was created.
+func (f *Fs) MkdirMetadata(ctx context.Context, dir string, metadata fs.Metadata) (fs.Directory, error) {
+	// Find and or create the directory
+	localPath, err := f.localPath(dir)
+	if err != nil {
+		return nil, err
+	}
+	fi, err := f.lstatRoot(localPath)
+	if errors.Is(err, os.ErrNotExist) {
+		err := f.Mkdir(ctx, dir)
+		if err != nil {
+			return nil, fmt.Errorf("mkdir metadata: failed make directory: %w", err)
+		}
+		fi, err = f.lstatRoot(localPath)
+		if err != nil {
+			return nil, fmt.Errorf("mkdir metadata: failed to read info: %w", err)
+		}
+	} else if err != nil {
+		return nil, err
+	}
+
+	// Create directory object
+	d, err := f.newDirectory(dir, fi)
+	if err != nil {
+		return nil, err
+	}
+
+	// Set metadata on the directory object if provided
+	if metadata != nil {
+		err = d.writeMetadata(metadata)
+		if err != nil {
+			return nil, fmt.Errorf("failed to set metadata on directory: %w", err)
+		}
+		// Re-read info now we have finished setting stuff
+		err = d.lstat()
+		if err != nil {
+			return nil, fmt.Errorf("mkdir metadata: failed to re-read info: %w", err)
+		}
+	}
+	return d, nil
+}
+
 // Rmdir removes the directory
 //
 // If it isn't empty it will return an error
-func (f *Fs) Rmdir(dir string) error {
-	root := f.cleanPath(filepath.Join(f.root, dir))
-	return os.Remove(root)
+func (f *Fs) Rmdir(ctx context.Context, dir string) (err error) {
+	localPath, err := f.localPath(dir)
+	if err != nil {
+		return err
+	}
+	// When translating symlinks go through os.Root so a symlink planted at
+	// any parent can't redirect the removal out of the destination, and
+	// don't follow the leaf as a symlink is a file in this mode. The root
+	// itself is the trusted destination and is removed directly.
+	stat, removeFn, chmod := os.Stat, os.Remove, os.Chmod
+	if f.opt.TranslateSymlinks && localPath != f.root {
+		var root *os.Root
+		root, localPath, err = f.osRoot(localPath)
+		if err != nil {
+			return err
+		}
+		defer fs.CheckClose(root, &err)
+		stat, removeFn, chmod = root.Lstat, root.Remove, root.Chmod
+	}
+	if fi, err := stat(localPath); err != nil {
+		return err
+	} else if !fi.IsDir() {
+		return fs.ErrorIsFile
+	}
+	err = removeFn(localPath)
+	if runtime.GOOS == "windows" && errors.Is(err, iofs.ErrPermission) { // https://github.com/golang/go/issues/26295
+		if chmod(localPath, 0o600) == nil {
+			err = removeFn(localPath)
+		}
+	}
+	return err
 }
 
 // Precision of the file system
 func (f *Fs) Precision() (precision time.Duration) {
+	if f.opt.NoSetModTime {
+		return fs.ModTimeNotSupported
+	}
+
 	f.precisionOk.Do(func() {
 		f.precision = f.readPrecision()
 	})
@@ -442,7 +1049,7 @@ func (f *Fs) readPrecision() (precision time.Duration) {
 	precision = time.Second
 
 	// Create temporary file and test it
-	fd, err := ioutil.TempFile("", "rclone")
+	fd, err := os.CreateTemp("", "rclone")
 	if err != nil {
 		// If failed return 1s
 		// fmt.Println("Failed to create temp file", err)
@@ -479,7 +1086,7 @@ func (f *Fs) readPrecision() (precision time.Duration) {
 		}
 
 		// If it matches - have found the precision
-		// fmt.Println("compare", fi.ModTime(), t)
+		// fmt.Println("compare", fi.ModTime(ctx), t)
 		if fi.ModTime().Equal(t) {
 			// fmt.Println("Precision detected as", duration)
 			return duration
@@ -488,32 +1095,16 @@ func (f *Fs) readPrecision() (precision time.Duration) {
 	return
 }
 
-// Purge deletes all the files and directories
+// Move src to this remote using server-side move operations.
 //
-// Optional interface: Only implement this if you have a way of
-// deleting all the files quicker than just running Remove() on the
-// result of List()
-func (f *Fs) Purge() error {
-	fi, err := f.lstat(f.root)
-	if err != nil {
-		return err
-	}
-	if !fi.Mode().IsDir() {
-		return errors.Errorf("can't purge non directory: %q", f.root)
-	}
-	return os.RemoveAll(f.root)
-}
-
-// Move src to this remote using server side move operations.
+// This is stored with the remote path given.
 //
-// This is stored with the remote path given
-//
-// It returns the destination Object and a possible error
+// It returns the destination Object and a possible error.
 //
 // Will only be called if src.Fs().Name() == f.Name()
 //
 // If it isn't possible then return fs.ErrorCantMove
-func (f *Fs) Move(src fs.Object, remote string) (fs.Object, error) {
+func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
 	srcObj, ok := src.(*Object)
 	if !ok {
 		fs.Debugf(src, "Can't move - not same remote type")
@@ -521,15 +1112,21 @@ func (f *Fs) Move(src fs.Object, remote string) (fs.Object, error) {
 	}
 
 	// Temporary Object under construction
-	dstObj := f.newObject(remote, "")
+	dstObj, err := f.newObject(remote)
+	if err != nil {
+		return nil, err
+	}
+	dstObj.fs.objectMetaMu.RLock()
+	dstObjMode := dstObj.mode
+	dstObj.fs.objectMetaMu.RUnlock()
 
 	// Check it is a file if it exists
-	err := dstObj.lstat()
+	err = dstObj.lstat()
 	if os.IsNotExist(err) {
 		// OK
 	} else if err != nil {
 		return nil, err
-	} else if !dstObj.mode.IsRegular() {
+	} else if !dstObj.fs.isRegular(dstObjMode) {
 		// It isn't a file
 		return nil, errors.New("can't move file onto non-file")
 	}
@@ -538,6 +1135,12 @@ func (f *Fs) Move(src fs.Object, remote string) (fs.Object, error) {
 	err = dstObj.mkdirAll()
 	if err != nil {
 		return nil, err
+	}
+
+	// Fetch metadata if --metadata is in use
+	meta, err := fs.GetMetadataOptions(ctx, f, src, fs.MetadataAsOpenOptions(ctx))
+	if err != nil {
+		return nil, fmt.Errorf("move: failed to read metadata: %w", err)
 	}
 
 	// Do the move
@@ -555,6 +1158,12 @@ func (f *Fs) Move(src fs.Object, remote string) (fs.Object, error) {
 		return nil, fs.ErrorCantMove
 	}
 
+	// Set metadata if --metadata is in use
+	err = dstObj.writeMetadata(meta)
+	if err != nil {
+		return nil, fmt.Errorf("move: failed to set metadata: %w", err)
+	}
+
 	// Update the info
 	err = dstObj.lstat()
 	if err != nil {
@@ -565,31 +1174,42 @@ func (f *Fs) Move(src fs.Object, remote string) (fs.Object, error) {
 }
 
 // DirMove moves src, srcRemote to this remote at dstRemote
-// using server side move operations.
+// using server-side move operations.
 //
 // Will only be called if src.Fs().Name() == f.Name()
 //
 // If it isn't possible then return fs.ErrorCantDirMove
 //
 // If destination exists then return fs.ErrorDirExists
-func (f *Fs) DirMove(src fs.Fs, srcRemote, dstRemote string) error {
+func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string) error {
 	srcFs, ok := src.(*Fs)
 	if !ok {
 		fs.Debugf(srcFs, "Can't move directory - not same remote type")
 		return fs.ErrorCantDirMove
 	}
-	srcPath := f.cleanPath(filepath.Join(srcFs.root, srcRemote))
-	dstPath := f.cleanPath(filepath.Join(f.root, dstRemote))
+	srcPath, err := srcFs.localPath(srcRemote)
+	if err != nil {
+		return err
+	}
+	dstPath, err := f.localPath(dstRemote)
+	if err != nil {
+		return err
+	}
 
 	// Check if destination exists
-	_, err := os.Lstat(dstPath)
+	_, err = os.Lstat(dstPath)
 	if !os.IsNotExist(err) {
 		return fs.ErrorDirExists
 	}
 
-	// Create parent of destination
+	// Create parent of destination. The root itself is the trusted
+	// destination so its parent, which lies outside it, is created directly.
 	dstParentPath := filepath.Dir(dstPath)
-	err = os.MkdirAll(dstParentPath, 0777)
+	if dstPath == f.root {
+		err = file.MkdirAll(dstParentPath, 0777)
+	} else {
+		err = f.mkdirAll(dstParentPath)
+	}
 	if err != nil {
 		return err
 	}
@@ -613,7 +1233,63 @@ func (f *Fs) DirMove(src fs.Fs, srcRemote, dstRemote string) error {
 
 // Hashes returns the supported hash sets.
 func (f *Fs) Hashes() hash.Set {
-	return hash.Supported
+	if len(f.opt.Hashes) > 0 {
+		// Return only configured hashes.
+		// Note: Could have used hash.SupportOnly to limit supported hashes for all hash related features.
+		var supported hash.Set
+		for _, hashName := range f.opt.Hashes {
+			var ht hash.Type
+			if err := ht.Set(hashName); err != nil {
+				fs.Infof(nil, "Invalid token %q in hash string %q", hashName, f.opt.Hashes.String())
+			}
+			supported.Add(ht)
+		}
+		return supported
+	}
+	return hash.Supported()
+}
+
+var commandHelp = []fs.CommandHelp{
+	{
+		Name:  "noop",
+		Short: "A null operation for testing backend commands.",
+		Long:  `This is a test command which has some options you can try to change the output.`,
+		Opts: map[string]string{
+			"echo":  "Echo the input arguments.",
+			"error": "Return an error based on option value.",
+		},
+	},
+}
+
+// Command the backend to run a named command
+//
+// The command run is name
+// args may be used to read arguments from
+// opts may be used to read optional arguments from
+//
+// The result should be capable of being JSON encoded
+// If it is a string or a []string it will be shown to the user
+// otherwise it will be JSON encoded and shown to the user like that
+func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[string]string) (any, error) {
+	switch name {
+	case "noop":
+		if txt, ok := opt["error"]; ok {
+			if txt == "" {
+				txt = "unspecified error"
+			}
+			return nil, errors.New(txt)
+		}
+		if _, ok := opt["echo"]; ok {
+			out := map[string]any{}
+			out["name"] = name
+			out["arg"] = arg
+			out["opt"] = opt
+			return out, nil
+		}
+		return nil, nil
+	default:
+		return nil, fs.ErrorCommandNotFound
+	}
 }
 
 // ------------------------------------------------------------
@@ -637,52 +1313,106 @@ func (o *Object) Remote() string {
 }
 
 // Hash returns the requested hash of a file as a lowercase hex string
-func (o *Object) Hash(r hash.Type) (string, error) {
+func (o *Object) Hash(ctx context.Context, r hash.Type) (string, error) {
+	if r == hash.None {
+		return "", nil
+	}
+
 	// Check that the underlying file hasn't changed
+	o.fs.objectMetaMu.RLock()
 	oldtime := o.modTime
 	oldsize := o.size
+	o.fs.objectMetaMu.RUnlock()
 	err := o.lstat()
+	var changed bool
 	if err != nil {
-		return "", errors.Wrap(err, "hash: failed to stat")
+		if errors.Is(err, os.ErrNotExist) {
+			// If file not found then we assume any accumulated
+			// hashes are OK - this will error on Open
+			changed = true
+		} else {
+			return "", fmt.Errorf("hash: failed to stat: %w", err)
+		}
+	} else {
+		o.fs.objectMetaMu.RLock()
+		changed = !o.modTime.Equal(oldtime) || oldsize != o.size
+		o.fs.objectMetaMu.RUnlock()
 	}
 
-	o.fs.objectHashesMu.Lock()
-	hashes := o.hashes
-	o.fs.objectHashesMu.Unlock()
+	o.fs.objectMetaMu.RLock()
+	hashValue, hashFound := o.hashes[r]
+	o.fs.objectMetaMu.RUnlock()
 
-	if !o.modTime.Equal(oldtime) || oldsize != o.size || hashes == nil {
-		in, err := os.Open(o.path)
-		if err != nil {
-			return "", errors.Wrap(err, "hash: failed to open")
+	if changed || !hashFound {
+		var in io.ReadCloser
+
+		if !o.translatedLink {
+			var fd *os.File
+			fd, err = file.Open(o.path)
+			if fd != nil {
+				in = fd
+			}
+		} else {
+			in, err = o.openTranslatedLink(0, -1)
 		}
-		hashes, err = hash.Stream(in)
+		// If not checking for updates, only read size given
+		if o.fs.opt.NoCheckUpdated {
+			in = readers.NewLimitedReadCloser(in, o.size)
+		}
+		if err != nil {
+			return "", fmt.Errorf("hash: failed to open: %w", err)
+		}
+		var hashes map[hash.Type]string
+		hashes, err = hash.StreamTypes(readers.NewContextReader(ctx, in), hash.NewHashSet(r))
 		closeErr := in.Close()
 		if err != nil {
-			return "", errors.Wrap(err, "hash: failed to read")
+			return "", fmt.Errorf("hash: failed to read: %w", err)
 		}
 		if closeErr != nil {
-			return "", errors.Wrap(closeErr, "hash: failed to close")
+			return "", fmt.Errorf("hash: failed to close: %w", closeErr)
 		}
-		o.fs.objectHashesMu.Lock()
-		o.hashes = hashes
-		o.fs.objectHashesMu.Unlock()
+		hashValue = hashes[r]
+		o.fs.objectMetaMu.Lock()
+		if o.hashes == nil {
+			o.hashes = hashes
+		} else {
+			o.hashes[r] = hashValue
+		}
+		o.fs.objectMetaMu.Unlock()
 	}
-	return hashes[r], nil
+	return hashValue, nil
 }
 
 // Size returns the size of an object in bytes
 func (o *Object) Size() int64 {
+	o.fs.objectMetaMu.RLock()
+	defer o.fs.objectMetaMu.RUnlock()
 	return o.size
 }
 
 // ModTime returns the modification time of the object
-func (o *Object) ModTime() time.Time {
+func (o *Object) ModTime(ctx context.Context) time.Time {
+	o.fs.objectMetaMu.RLock()
+	defer o.fs.objectMetaMu.RUnlock()
 	return o.modTime
 }
 
+// Set the atime and ltime of the object
+func (o *Object) setTimes(atime, mtime time.Time) (err error) {
+	if o.translatedLink {
+		err = lChtimes(o.path, atime, mtime)
+	} else {
+		err = o.fs.chtimes(o.path, atime, mtime)
+	}
+	return err
+}
+
 // SetModTime sets the modification time of the local fs object
-func (o *Object) SetModTime(modTime time.Time) error {
-	err := os.Chtimes(o.path, modTime, modTime)
+func (o *Object) SetModTime(ctx context.Context, modTime time.Time) error {
+	if o.fs.opt.NoSetModTime {
+		return nil
+	}
+	err := o.setTimes(modTime, modTime)
 	if err != nil {
 		return err
 	}
@@ -692,21 +1422,26 @@ func (o *Object) SetModTime(modTime time.Time) error {
 
 // Storable returns a boolean showing if this object is storable
 func (o *Object) Storable() bool {
-	// Check for control characters in the remote name and show non storable
-	for _, c := range o.Remote() {
-		if c >= 0x00 && c < 0x20 || c == 0x7F {
-			fs.Logf(o.fs, "Can't store file with control characters: %q", o.Remote())
-			return false
-		}
-	}
+	o.fs.objectMetaMu.RLock()
 	mode := o.mode
-	if mode&os.ModeSymlink != 0 {
+	o.fs.objectMetaMu.RUnlock()
+
+	// On Windows items with os.ModeIrregular are likely Junction
+	// points so we treat them as symlinks for the purpose of ignoring them.
+	// https://github.com/golang/go/issues/73827
+	symlinkFlag := os.ModeSymlink
+	if runtime.GOOS == "windows" {
+		symlinkFlag |= os.ModeIrregular
+	}
+	if mode&symlinkFlag != 0 && !o.fs.opt.TranslateSymlinks {
 		if !o.fs.opt.SkipSymlinks {
 			fs.Logf(o, "Can't follow symlink without -L/--copy-links")
 		}
 		return false
 	} else if mode&(os.ModeNamedPipe|os.ModeSocket|os.ModeDevice) != 0 {
-		fs.Logf(o, "Can't transfer non file/directory")
+		if !o.fs.opt.SkipSpecials {
+			fs.Logf(o, "Can't transfer non file/directory")
+		}
 		return false
 	} else if mode&os.ModeDir != 0 {
 		// fs.Debugf(o, "Skipping directory")
@@ -730,13 +1465,17 @@ func (file *localOpenFile) Read(p []byte) (n int, err error) {
 		// Check if file has the same size and modTime
 		fi, err := file.fd.Stat()
 		if err != nil {
-			return 0, errors.Wrap(err, "can't read status of source file while transferring")
+			return 0, fmt.Errorf("can't read status of source file while transferring: %w", err)
 		}
-		if file.o.size != fi.Size() {
-			return 0, errors.Errorf("can't copy - source file is being updated (size changed from %d to %d)", file.o.size, fi.Size())
+		file.o.fs.objectMetaMu.RLock()
+		oldtime := file.o.modTime
+		oldsize := file.o.size
+		file.o.fs.objectMetaMu.RUnlock()
+		if oldsize != fi.Size() {
+			return 0, fserrors.NoLowLevelRetryError(fmt.Errorf("can't copy - source file is being updated (size changed from %d to %d)", oldsize, fi.Size()))
 		}
-		if !file.o.modTime.Equal(fi.ModTime()) {
-			return 0, errors.Errorf("can't copy - source file is being updated (mod time changed from %v to %v)", file.o.modTime, fi.ModTime())
+		if !oldtime.Equal(readTime(file.o.fs.opt.TimeType, fi)) {
+			return 0, fserrors.NoLowLevelRetryError(fmt.Errorf("can't copy - source file is being updated (mod time changed from %v to %v)", oldtime, fi.ModTime()))
 		}
 	}
 
@@ -753,26 +1492,48 @@ func (file *localOpenFile) Close() (err error) {
 	err = file.in.Close()
 	if err == nil {
 		if file.hash.Size() == file.o.Size() {
-			file.o.fs.objectHashesMu.Lock()
+			file.o.fs.objectMetaMu.Lock()
 			file.o.hashes = file.hash.Sums()
-			file.o.fs.objectHashesMu.Unlock()
+			file.o.fs.objectMetaMu.Unlock()
 		}
 	}
 	return err
 }
 
+// Returns a ReadCloser() object that contains the contents of a symbolic link
+func (o *Object) openTranslatedLink(offset, limit int64) (lrc io.ReadCloser, err error) {
+	// Read the link and return the destination  it as the contents of the object
+	linkdst, err := os.Readlink(o.path)
+	if err != nil {
+		return nil, err
+	}
+	// Clamp offset into range to avoid panic
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > int64(len(linkdst)) {
+		offset = int64(len(linkdst))
+	}
+	return readers.NewLimitedReadCloser(io.NopCloser(strings.NewReader(linkdst[offset:])), limit), nil
+}
+
 // Open an object for read
-func (o *Object) Open(options ...fs.OpenOption) (in io.ReadCloser, err error) {
+func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.ReadCloser, err error) {
 	var offset, limit int64 = 0, -1
-	hashes := hash.Supported
+	var hasher *hash.MultiHasher
 	for _, option := range options {
 		switch x := option.(type) {
 		case *fs.SeekOption:
 			offset = x.Offset
 		case *fs.RangeOption:
-			offset, limit = x.Decode(o.size)
+			offset, limit = x.Decode(o.Size())
 		case *fs.HashesOption:
-			hashes = x.Hashes
+			if x.Hashes.Count() > 0 {
+				hasher, err = hash.NewMultiHasherTypes(x.Hashes)
+				if err != nil {
+					return nil, err
+				}
+			}
 		default:
 			if option.Mandatory() {
 				fs.Logf(o, "Unsupported mandatory option: %v", option)
@@ -780,7 +1541,25 @@ func (o *Object) Open(options ...fs.OpenOption) (in io.ReadCloser, err error) {
 		}
 	}
 
-	fd, err := os.Open(o.path)
+	// Update the file info before we start reading
+	err = o.lstat()
+	if err != nil {
+		return nil, err
+	}
+
+	// If not checking updated then limit to current size.  This means if
+	// file is being extended, readers will read a o.Size() bytes rather
+	// than the new size making for a consistent upload.
+	if limit < 0 && o.fs.opt.NoCheckUpdated {
+		limit = o.size
+	}
+
+	// Handle a translated link
+	if o.translatedLink {
+		return o.openTranslatedLink(offset, limit)
+	}
+
+	fd, err := file.Open(o.path)
 	if err != nil {
 		return
 	}
@@ -791,103 +1570,426 @@ func (o *Object) Open(options ...fs.OpenOption) (in io.ReadCloser, err error) {
 		// don't attempt to make checksums
 		return wrappedFd, err
 	}
-	hash, err := hash.NewMultiHasherTypes(hashes)
-	if err != nil {
-		return nil, err
+	if hasher == nil {
+		// no need to wrap since we don't need checksums
+		return wrappedFd, nil
 	}
-	// Update the md5sum as we go along
+	// Update the hashes as we go along
 	in = &localOpenFile{
 		o:    o,
 		in:   wrappedFd,
-		hash: hash,
+		hash: hasher,
 		fd:   fd,
 	}
 	return in, nil
 }
 
+// osRoot opens an *os.Root anchored at f.root, together with localPath
+// expressed relative to it. The caller must Close the returned root.
+//
+// When translating symlinks (-l/--links) all writes go through an os.Root so a
+// symlink planted by a malicious source can never be traversed to escape the
+// destination (CWE-59, GHSA-cf44-9pgv-m4xc).
+//
+// f.root is the trusted destination the user chose, so it is created (and
+// followed if it is itself a symlink) before being opened.
+func (f *Fs) osRoot(localPath string) (root *os.Root, rel string, err error) {
+	rel, err = filepath.Rel(f.root, localPath)
+	if err != nil {
+		return nil, "", err
+	}
+	if err = file.MkdirAll(f.root, 0777); err != nil {
+		return nil, "", err
+	}
+	root, err = os.OpenRoot(f.root)
+	if err != nil {
+		return nil, "", err
+	}
+	return root, rel, nil
+}
+
+// mkdirAll makes localPath and any missing parents. When translating
+// symlinks it does so through os.Root so directory creation can't be
+// redirected through a planted symlink out of the destination.
+func (f *Fs) mkdirAll(localPath string) (err error) {
+	if !f.opt.TranslateSymlinks {
+		return file.MkdirAll(localPath, 0777)
+	}
+	root, rel, err := f.osRoot(localPath)
+	if err != nil {
+		return err
+	}
+	defer fs.CheckClose(root, &err)
+	if rel == "." {
+		return nil // the root itself, already created by linkRoot
+	}
+	return root.MkdirAll(rel, 0777)
+}
+
+// lstatRoot returns the info for localPath without following a symlink at
+// the leaf. When translating symlinks it goes through os.Root so a symlink
+// planted at any parent can't make a path outside the destination look like
+// it exists, which would let its metadata be written there.
+func (f *Fs) lstatRoot(localPath string) (fi os.FileInfo, err error) {
+	if !f.opt.TranslateSymlinks {
+		return f.lstat(localPath)
+	}
+	root, rel, err := f.osRoot(localPath)
+	if err != nil {
+		return nil, err
+	}
+	defer fs.CheckClose(root, &err)
+	return root.Lstat(rel)
+}
+
+// openFile opens localPath with the given flags and perm. When translating
+// symlinks it goes through os.Root so a symlink planted at the path, or at any
+// parent, is never followed out of the destination. The returned file is
+// independent of the root, which is closed before returning.
+func (f *Fs) openFile(localPath string, flags int, perm os.FileMode) (fi *os.File, err error) {
+	if !f.opt.TranslateSymlinks {
+		return file.OpenFile(localPath, flags, perm)
+	}
+	root, rel, err := f.osRoot(localPath)
+	if err != nil {
+		return nil, err
+	}
+	defer fs.CheckClose(root, &err)
+	return root.OpenFile(rel, flags, perm)
+}
+
+// symlink creates a symlink with the given target at localPath, removing
+// any existing file or symlink there first. It goes through os.Root, which
+// creates the link verbatim (the target may point anywhere, preserving a
+// faithful backup) but refuses to create it through a planted symlink, and
+// won't remove a directory in the way.
+func (f *Fs) symlink(target, localPath string) (err error) {
+	root, rel, err := f.osRoot(localPath)
+	if err != nil {
+		return err
+	}
+	defer fs.CheckClose(root, &err)
+	if err := root.Remove(rel); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return root.Symlink(target, rel)
+}
+
+// chmod changes the mode of localPath.
+func (f *Fs) chmod(localPath string, mode os.FileMode) (err error) {
+	if !f.opt.TranslateSymlinks {
+		return os.Chmod(localPath, mode)
+	}
+	root, rel, err := f.osRoot(localPath)
+	if err != nil {
+		return err
+	}
+	defer fs.CheckClose(root, &err)
+	return root.Chmod(rel, mode)
+}
+
+// chown changes the ownership of localPath.
+func (f *Fs) chown(localPath string, uid, gid int) (err error) {
+	if !f.opt.TranslateSymlinks {
+		return os.Chown(localPath, uid, gid)
+	}
+	root, rel, err := f.osRoot(localPath)
+	if err != nil {
+		return err
+	}
+	defer fs.CheckClose(root, &err)
+	return root.Chown(rel, uid, gid)
+}
+
+// chtimes changes the atime and mtime of localPath.
+func (f *Fs) chtimes(localPath string, atime, mtime time.Time) (err error) {
+	if !f.opt.TranslateSymlinks {
+		return os.Chtimes(localPath, atime, mtime)
+	}
+	root, rel, err := f.osRoot(localPath)
+	if err != nil {
+		return err
+	}
+	defer fs.CheckClose(root, &err)
+	return root.Chtimes(rel, atime, mtime)
+}
+
+// remove removes the file, symlink or empty directory at localPath. When
+// translating symlinks it goes through os.Root so a symlink planted at any
+// parent can't redirect the removal out of the destination.
+func (f *Fs) remove(localPath string) (err error) {
+	if !f.opt.TranslateSymlinks {
+		return remove(localPath, os.Remove)
+	}
+	root, rel, err := f.osRoot(localPath)
+	if err != nil {
+		return err
+	}
+	defer fs.CheckClose(root, &err)
+	return remove(rel, root.Remove)
+}
+
 // mkdirAll makes all the directories needed to store the object
 func (o *Object) mkdirAll() error {
-	dir := filepath.Dir(o.path)
-	return os.MkdirAll(dir, 0777)
+	return o.fs.mkdirAll(filepath.Dir(o.path))
+}
+
+type nopWriterCloser struct {
+	*bytes.Buffer
+}
+
+func (nwc nopWriterCloser) Close() error {
+	// noop
+	return nil
+}
+
+// isDiskFullError returns true if err indicates the underlying filesystem
+// has run out of space.
+func isDiskFullError(err error) bool {
+	return errors.Is(err, file.ErrDiskFull) || fserrors.IsErrNoSpace(err)
+}
+
+func wrapFatalIfNoSpace(err error, enabled bool) error {
+	if err != nil && enabled && isDiskFullError(err) {
+		return fserrors.FatalError(err)
+	}
+	return err
 }
 
 // Update the object from in with modTime and size
-func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
-	hashes := hash.Supported
+func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (err error) {
+	defer func() {
+		err = wrapFatalIfNoSpace(err, o.fs.opt.FatalIfNoSpace)
+	}()
+	var out io.WriteCloser
+	var hasher *hash.MultiHasher
+
 	for _, option := range options {
 		switch x := option.(type) {
 		case *fs.HashesOption:
-			hashes = x.Hashes
+			if x.Hashes.Count() > 0 {
+				hasher, err = hash.NewMultiHasherTypes(x.Hashes)
+				if err != nil {
+					return err
+				}
+			}
 		}
 	}
 
-	err := o.mkdirAll()
+	err = o.mkdirAll()
 	if err != nil {
 		return err
 	}
 
-	out, err := os.OpenFile(o.path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
-	if err != nil {
-		return err
+	// Wipe hashes before update
+	o.clearHashCache()
+
+	var symlinkData bytes.Buffer
+	// If the object is a regular file, create it.
+	// If it is a translated link, just read in the contents, and
+	// then create a symlink
+	if !o.translatedLink {
+		f, err := o.fs.openFile(o.path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
+		if err != nil {
+			if runtime.GOOS == "windows" && os.IsPermission(err) {
+				// If permission denied on Windows might be trying to update a
+				// hidden file, in which case try opening without CREATE
+				// See: https://stackoverflow.com/questions/13215716/ioerror-errno-13-permission-denied-when-trying-to-open-hidden-file-in-w-mod
+				f, err = o.fs.openFile(o.path, os.O_WRONLY|os.O_TRUNC, 0666)
+				if err != nil {
+					return err
+				}
+			} else {
+				return err
+			}
+		}
+		if !o.fs.opt.NoPreAllocate {
+			// Pre-allocate the file for performance reasons
+			err = file.PreAllocate(src.Size(), f)
+			if err != nil {
+				fs.Debugf(o, "Failed to pre-allocate: %v", err)
+				if err == file.ErrDiskFull {
+					_ = f.Close()
+					return err
+				}
+			}
+		}
+		out = f
+	} else {
+		// The target is buffered in memory, so stop reading just past
+		// the longest acceptable one rather than trust the source
+		in = io.LimitReader(in, maxLinkTargetSize+1)
+		out = nopWriterCloser{&symlinkData}
 	}
 
-	// Pre-allocate the file for performance reasons
-	err = preAllocate(src.Size(), out)
-	if err != nil {
-		fs.Debugf(o, "Failed to pre-allocate: %v", err)
+	// Calculate the hash of the object as we write it
+	var w io.Writer = out
+	if hasher != nil {
+		w = io.MultiWriter(w, hasher)
 	}
 
-	// Calculate the hash of the object we are reading as we go along
-	hash, err := hash.NewMultiHasherTypes(hashes)
-	if err != nil {
-		return err
-	}
-	in = io.TeeReader(in, hash)
-
-	_, err = io.Copy(out, in)
+	_, err = io.Copy(w, in)
 	closeErr := out.Close()
 	if err == nil {
 		err = closeErr
 	}
+
+	if o.translatedLink {
+		if err == nil && symlinkData.Len() > maxLinkTargetSize {
+			err = fserrors.NoRetryError(errLinkTargetTooLong)
+		}
+		if err == nil {
+			// Use the contents of the copied object to create a symlink,
+			// without following or creating it through a planted symlink
+			// (CWE-59). Any existing file or symlink at the path is replaced.
+			err = o.fs.symlink(symlinkData.String(), o.path)
+		}
+
+		// only continue if symlink creation succeeded
+		if err != nil {
+			return err
+		}
+	}
+
 	if err != nil {
 		fs.Logf(o, "Removing partially written file on error: %v", err)
-		if removeErr := os.Remove(o.path); removeErr != nil {
+		if removeErr := o.fs.remove(o.path); removeErr != nil {
 			fs.Errorf(o, "Failed to remove partially written file: %v", removeErr)
 		}
 		return err
 	}
 
 	// All successful so update the hashes
-	o.fs.objectHashesMu.Lock()
-	o.hashes = hash.Sums()
-	o.fs.objectHashesMu.Unlock()
+	if hasher != nil {
+		o.fs.objectMetaMu.Lock()
+		o.hashes = hasher.Sums()
+		o.fs.objectMetaMu.Unlock()
+	}
 
 	// Set the mtime
-	err = o.SetModTime(src.ModTime())
+	err = o.SetModTime(ctx, src.ModTime(ctx))
 	if err != nil {
 		return err
+	}
+
+	// Fetch and set metadata if --metadata is in use
+	meta, err := fs.GetMetadataOptions(ctx, o.fs, src, options)
+	if err != nil {
+		return fmt.Errorf("failed to read metadata from source object: %w", err)
+	}
+	err = o.writeMetadata(meta)
+	if err != nil {
+		return fmt.Errorf("failed to set metadata: %w", err)
 	}
 
 	// ReRead info now that we have finished
 	return o.lstat()
 }
 
+var sparseWarning sync.Once
+
+type fatalIfNoSpaceWriterAt struct {
+	fs.WriterAtCloser
+	enabled bool
+}
+
+func (w *fatalIfNoSpaceWriterAt) WriteAt(p []byte, off int64) (n int, err error) {
+	n, err = w.WriterAtCloser.WriteAt(p, off)
+	return n, wrapFatalIfNoSpace(err, w.enabled)
+}
+
+func (w *fatalIfNoSpaceWriterAt) Close() error {
+	return wrapFatalIfNoSpace(w.WriterAtCloser.Close(), w.enabled)
+}
+
+// OpenWriterAt opens with a handle for random access writes
+//
+// Pass in the remote desired and the size if known.
+//
+// It truncates any existing object
+func (f *Fs) OpenWriterAt(ctx context.Context, remote string, size int64) (writer fs.WriterAtCloser, err error) {
+	defer func() {
+		err = wrapFatalIfNoSpace(err, f.opt.FatalIfNoSpace)
+	}()
+
+	// Temporary Object under construction
+	o, err := f.newObject(remote)
+	if err != nil {
+		return nil, err
+	}
+
+	err = o.mkdirAll()
+	if err != nil {
+		return nil, err
+	}
+
+	if o.translatedLink {
+		return nil, errors.New("can't open a symlink for random writing")
+	}
+
+	out, err := f.openFile(o.path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
+	if err != nil {
+		return nil, err
+	}
+	// Pre-allocate the file for performance reasons
+	if !f.opt.NoPreAllocate {
+		err = file.PreAllocate(size, out)
+		if err != nil {
+			fs.Debugf(o, "Failed to pre-allocate: %v", err)
+		}
+	}
+	if !f.opt.NoSparse && file.SetSparseImplemented {
+		sparseWarning.Do(func() {
+			fs.Infof(nil, "Writing sparse files: use --local-no-sparse or --multi-thread-streams 0 to disable")
+		})
+		// Set the file to be a sparse file (important on Windows)
+		err = file.SetSparse(out)
+		if err != nil {
+			fs.Errorf(o, "Failed to set sparse: %v", err)
+		}
+	}
+
+	return &fatalIfNoSpaceWriterAt{
+		WriterAtCloser: out,
+		enabled:        f.opt.FatalIfNoSpace,
+	}, nil
+}
+
 // setMetadata sets the file info from the os.FileInfo passed in
 func (o *Object) setMetadata(info os.FileInfo) {
-	// Don't overwrite the info if we don't need to
-	// this avoids upsetting the race detector
-	if o.size != info.Size() {
-		o.size = info.Size()
+	// if not checking updated then don't update the stat
+	if o.fs.opt.NoCheckUpdated && !o.modTime.IsZero() {
+		return
 	}
-	if !o.modTime.Equal(info.ModTime()) {
-		o.modTime = info.ModTime()
-	}
-	if o.mode != info.Mode() {
-		o.mode = info.Mode()
+	o.fs.objectMetaMu.Lock()
+	o.size = info.Size()
+	o.modTime = readTime(o.fs.opt.TimeType, info)
+	o.mode = info.Mode()
+	o.fs.objectMetaMu.Unlock()
+	// Read the size of the link.
+	//
+	// The value in info.Size() is not always correct
+	// - Windows links read as 0 size
+	// - Some virtual filesystems (such ash LucidLink) links read as 0 size
+	// - Android - some versions the links are larger than readlink suggests
+	if o.translatedLink {
+		linkdst, err := os.Readlink(o.path)
+		if err != nil {
+			fs.Errorf(o, "Failed to read link size: %v", err)
+		} else {
+			o.size = int64(len(linkdst))
+		}
 	}
 }
 
-// Stat a Object into info
+// clearHashCache wipes any cached hashes for the object
+func (o *Object) clearHashCache() {
+	o.fs.objectMetaMu.Lock()
+	o.hashes = nil
+	o.fs.objectMetaMu.Unlock()
+}
+
+// Stat an Object into info
 func (o *Object) lstat() error {
 	info, err := o.fs.lstat(o.path)
 	if err == nil {
@@ -897,126 +1999,151 @@ func (o *Object) lstat() error {
 }
 
 // Remove an object
-func (o *Object) Remove() error {
-	return remove(o.path)
+func (o *Object) Remove(ctx context.Context) error {
+	o.clearHashCache()
+	return o.fs.remove(o.path)
 }
 
-// cleanPathFragment cleans an OS path fragment which is part of a
-// bigger path and not necessarily absolute
-func cleanPathFragment(s string) string {
-	if s == "" {
-		return s
+// Metadata returns metadata for an object
+//
+// It should return nil if there is no Metadata
+func (o *Object) Metadata(ctx context.Context) (metadata fs.Metadata, err error) {
+	metadata, err = o.getXattr()
+	if err != nil {
+		return nil, err
 	}
-	s = filepath.Clean(s)
-	if runtime.GOOS == "windows" {
-		s = strings.Replace(s, `/`, `\`, -1)
+	err = o.readMetadataFromFile(&metadata)
+	if err != nil {
+		return nil, err
 	}
-	return s
+	return metadata, nil
 }
 
-// cleanPath cleans and makes absolute the path passed in and returns
-// an OS path.
+// Write the metadata on the object
+func (o *Object) writeMetadata(metadata fs.Metadata) (err error) {
+	err = o.setXattr(metadata)
+	if err != nil {
+		return err
+	}
+	err = o.writeMetadataToFile(metadata)
+	if err != nil {
+		return err
+	}
+	return err
+}
+
+// SetMetadata sets metadata for an Object
 //
-// The input might be in OS form or rclone form or a mixture, but the
-// output is in OS form.
-//
-// On windows it makes the path UNC also and replaces any characters
-// Windows can't deal with with their replacements.
-func (f *Fs) cleanPath(s string) string {
-	s = cleanPathFragment(s)
+// It should return fs.ErrorNotImplemented if it can't set metadata
+func (o *Object) SetMetadata(ctx context.Context, metadata fs.Metadata) error {
+	err := o.writeMetadata(metadata)
+	if err != nil {
+		return fmt.Errorf("SetMetadata failed on Object: %w", err)
+	}
+	// Re-read info now we have finished setting stuff
+	return o.lstat()
+}
+
+func cleanRootPath(s string, noUNC bool, enc encoder.MultiEncoder) string {
+	var vol string
 	if runtime.GOOS == "windows" {
-		if !filepath.IsAbs(s) && !strings.HasPrefix(s, "\\") {
-			s2, err := filepath.Abs(s)
-			if err == nil {
-				s = s2
+		vol = filepath.VolumeName(s)
+		if vol == `\\?` && len(s) >= 6 {
+			// `\\?\C:`
+			vol = s[:6]
+		}
+		s = s[len(vol):]
+	}
+	// Don't use FromStandardPath. Make sure Dot (`.`, `..`) as name will not be reencoded
+	// Take care of the case Standard: ./．/‛． (the first dot means current directory)
+	if enc != encoder.Standard {
+		s = filepath.ToSlash(s)
+		parts := strings.Split(s, "/")
+		encoded := make([]string, len(parts))
+		changed := false
+		for i, p := range parts {
+			if (p == ".") || (p == "..") {
+				encoded[i] = p
+				continue
 			}
+			part := enc.FromStandardName(p)
+			changed = changed || part != p
+			encoded[i] = part
 		}
-		if !f.opt.NoUNC {
-			// Convert to UNC
-			s = uncPath(s)
+		if changed {
+			s = strings.Join(encoded, "/")
 		}
-		s = cleanWindowsName(f, s)
+		s = filepath.FromSlash(s)
+	}
+	if runtime.GOOS == "windows" {
+		s = vol + s
+	}
+	// UNC paths on Windows must be absolute, so make the path absolute
+	// there. On other platforms filepath.Abs would prepend the current
+	// directory, but the resulting absolute string is not guaranteed to
+	// refer to the same directory as the original relative path - for
+	// example when the current directory is shadowed by a mount or has been
+	// removed - so just clean it lexically instead.
+	if runtime.GOOS == "windows" {
+		if s2, err := filepath.Abs(s); err == nil {
+			s = s2
+		}
 	} else {
-		if !filepath.IsAbs(s) {
-			s2, err := filepath.Abs(s)
-			if err == nil {
-				s = s2
-			}
-		}
+		s = filepath.Clean(s)
+	}
+	if !noUNC {
+		// Convert to UNC. It does nothing on non windows platforms.
+		s = file.UNCPath(s)
 	}
 	return s
 }
 
-// Pattern to match a windows absolute path: "c:\" and similar
-var isAbsWinDrive = regexp.MustCompile(`^[a-zA-Z]\:\\`)
-
-// uncPath converts an absolute Windows path
-// to a UNC long path.
-func uncPath(s string) string {
-	// UNC can NOT use "/", so convert all to "\"
-	s = strings.Replace(s, `/`, `\`, -1)
-
-	// If prefix is "\\", we already have a UNC path or server.
-	if strings.HasPrefix(s, `\\`) {
-		// If already long path, just keep it
-		if strings.HasPrefix(s, `\\?\`) {
-			return s
-		}
-
-		// Trim "\\" from path and add UNC prefix.
-		return `\\?\UNC\` + strings.TrimPrefix(s, `\\`)
-	}
-	if isAbsWinDrive.MatchString(s) {
-		return `\\?\` + s
-	}
-	return s
+// Items returns the count of items in this directory or this
+// directory and subdirectories if known, -1 for unknown
+func (d *Directory) Items() int64 {
+	return -1
 }
 
-// cleanWindowsName will clean invalid Windows characters replacing them with _
-func cleanWindowsName(f *Fs, name string) string {
-	original := name
-	var name2 string
-	if strings.HasPrefix(name, `\\?\`) {
-		name2 = `\\?\`
-		name = strings.TrimPrefix(name, `\\?\`)
-	}
-	if strings.HasPrefix(name, `//?/`) {
-		name2 = `//?/`
-		name = strings.TrimPrefix(name, `//?/`)
-	}
-	// Colon is allowed as part of a drive name X:\
-	colonAt := strings.Index(name, ":")
-	if colonAt > 0 && colonAt < 3 && len(name) > colonAt+1 {
-		// Copy to name2, which is unfiltered
-		name2 += name[0 : colonAt+1]
-		name = name[colonAt+1:]
-	}
+// ID returns the internal ID of this directory if known, or
+// "" otherwise
+func (d *Directory) ID() string {
+	return ""
+}
 
-	name2 += strings.Map(func(r rune) rune {
-		switch r {
-		case '<', '>', '"', '|', '?', '*', ':':
-			return '_'
-		}
-		return r
-	}, name)
-
-	if name2 != original && f != nil {
-		f.wmu.Lock()
-		if _, ok := f.warned[name]; !ok {
-			fs.Logf(f, "Replacing invalid characters in %q to %q", name, name2)
-			f.warned[name] = struct{}{}
-		}
-		f.wmu.Unlock()
+// SetMetadata sets metadata for a Directory
+//
+// It should return fs.ErrorNotImplemented if it can't set metadata
+func (d *Directory) SetMetadata(ctx context.Context, metadata fs.Metadata) error {
+	err := d.writeMetadata(metadata)
+	if err != nil {
+		return fmt.Errorf("SetMetadata failed on Directory: %w", err)
 	}
-	return name2
+	// Re-read info now we have finished setting stuff
+	return d.lstat()
+}
+
+// Hash does nothing on a directory
+//
+// This method is implemented with the incorrect type signature to
+// stop the Directory type asserting to fs.Object or fs.ObjectInfo
+func (d *Directory) Hash() {
+	// Does nothing
 }
 
 // Check the interfaces are satisfied
 var (
-	_ fs.Fs          = &Fs{}
-	_ fs.Purger      = &Fs{}
-	_ fs.PutStreamer = &Fs{}
-	_ fs.Mover       = &Fs{}
-	_ fs.DirMover    = &Fs{}
-	_ fs.Object      = &Object{}
+	_ fs.Fs              = &Fs{}
+	_ fs.PutStreamer     = &Fs{}
+	_ fs.Mover           = &Fs{}
+	_ fs.DirMover        = &Fs{}
+	_ fs.Commander       = &Fs{}
+	_ fs.OpenWriterAter  = &Fs{}
+	_ fs.DirSetModTimer  = &Fs{}
+	_ fs.MkdirMetadataer = &Fs{}
+	_ fs.Object          = &Object{}
+	_ fs.Metadataer      = &Object{}
+	_ fs.SetMetadataer   = &Object{}
+	_ fs.Directory       = &Directory{}
+	_ fs.SetModTimer     = &Directory{}
+	_ fs.SetMetadataer   = &Directory{}
 )

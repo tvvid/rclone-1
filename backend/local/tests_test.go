@@ -1,67 +1,29 @@
 package local
 
 import (
+	"runtime"
 	"testing"
+
+	"github.com/rclone/rclone/lib/encoder"
 )
 
-var uncTestPaths = []string{
-	"C:\\Ba*d\\P|a?t<h>\\Windows\\Folder",
-	"C:/Ba*d/P|a?t<h>/Windows\\Folder",
-	"C:\\Windows\\Folder",
-	"\\\\?\\C:\\Windows\\Folder",
-	"//?/C:/Windows/Folder",
-	"\\\\?\\UNC\\server\\share\\Desktop",
-	"\\\\?\\unC\\server\\share\\Desktop\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path",
-	"\\\\server\\share\\Desktop\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path",
-	"C:\\Desktop\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path",
-	"C:\\AbsoluteToRoot\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path\\Very Long path",
-	"\\\\server\\share\\Desktop",
-	"\\\\?\\UNC\\\\share\\folder\\Desktop",
-	"\\\\server\\share",
+// Test Windows character replacements
+var testsWindows = [][2]string{
+	{`c:\temp`, `c:\temp`},
+	{`\\?\UNC\theserver\dir\file.txt`, `\\?\UNC\theserver\dir\file.txt`},
+	{`//?/UNC/theserver/dir\file.txt`, `\\?\UNC\theserver\dir\file.txt`},
+	{`c:/temp`, `c:\temp`},
+	{`C:/temp/file.txt`, `C:\temp\file.txt`},
+	{`c:\!\"#¤%&/()=;:*^?+-`, `c:\!\＂#¤%&\()=;：＊^？+-`},
+	{`c:\<>"|?*:&\<>"|?*:&\<>"|?*:&`, `c:\＜＞＂｜？＊：&\＜＞＂｜？＊：&\＜＞＂｜？＊：&`},
 }
 
-var uncTestPathsResults = []string{
-	`\\?\C:\Ba*d\P|a?t<h>\Windows\Folder`,
-	`\\?\C:\Ba*d\P|a?t<h>\Windows\Folder`,
-	`\\?\C:\Windows\Folder`,
-	`\\?\C:\Windows\Folder`,
-	`\\?\C:\Windows\Folder`,
-	`\\?\UNC\server\share\Desktop`,
-	`\\?\unC\server\share\Desktop\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path`,
-	`\\?\UNC\server\share\Desktop\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path`,
-	`\\?\C:\Desktop\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path`,
-	`\\?\C:\AbsoluteToRoot\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path\Very Long path`,
-	`\\?\UNC\server\share\Desktop`,
-	`\\?\UNC\\share\folder\Desktop`,
-	`\\?\UNC\server\share`,
-}
-
-// Test that UNC paths are converted.
-func TestUncPaths(t *testing.T) {
-	for i, p := range uncTestPaths {
-		unc := uncPath(p)
-		if unc != uncTestPathsResults[i] {
-			t.Fatalf("UNC test path\nInput:%s\nOutput:%s\nExpected:%s", p, unc, uncTestPathsResults[i])
-		}
-		// Test we don't add more.
-		unc = uncPath(unc)
-		if unc != uncTestPathsResults[i] {
-			t.Fatalf("UNC test path\nInput:%s\nOutput:%s\nExpected:%s", p, unc, uncTestPathsResults[i])
-		}
+func TestCleanWindows(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skipf("windows only")
 	}
-}
-
-var utf8Tests = [][2]string{
-	{"ABC", "ABC"},
-	{string([]byte{0x80}), "�"},
-	{string([]byte{'a', 0x80, 'b'}), "a�b"},
-}
-
-func TestCleanRemote(t *testing.T) {
-	f := &Fs{}
-	f.warned = make(map[string]struct{})
-	for _, test := range utf8Tests {
-		got := f.cleanRemote(test[0])
+	for _, test := range testsWindows {
+		got := cleanRootPath(test[0], true, encoder.OS)
 		expect := test[1]
 		if got != expect {
 			t.Fatalf("got %q, expected %q", got, expect)
@@ -69,20 +31,25 @@ func TestCleanRemote(t *testing.T) {
 	}
 }
 
-// Test Windows character replacements
-var testsWindows = [][2]string{
-	{`c:\temp`, `c:\temp`},
-	{`\\?\UNC\theserver\dir\file.txt`, `\\?\UNC\theserver\dir\file.txt`},
-	{`//?/UNC/theserver/dir\file.txt`, `//?/UNC/theserver/dir\file.txt`},
-	{"c:/temp", "c:/temp"},
-	{"/temp/file.txt", "/temp/file.txt"},
-	{`!\"#¤%&/()=;:*^?+-`, "!\\_#¤%&/()=;__^_+-"},
-	{`<>"|?*:&\<>"|?*:&\<>"|?*:&`, "_______&\\_______&\\_______&"},
+// Relative roots must stay relative so the OS resolves them against the
+// live working directory rather than a canonicalised string that may no
+// longer refer to the same directory (#9510).
+var testsRelative = [][2]string{
+	{".", "."},
+	{"./", "."},
+	{"sub/dir", "sub/dir"},
+	{"sub/dir/", "sub/dir"},
+	{"./sub/dir", "sub/dir"},
+	{"sub/../dir", "dir"},
+	{"..", ".."},
 }
 
-func TestCleanWindows(t *testing.T) {
-	for _, test := range testsWindows {
-		got := cleanWindowsName(nil, test[0])
+func TestCleanRootPathRelative(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skipf("non-windows only")
+	}
+	for _, test := range testsRelative {
+		got := cleanRootPath(test[0], true, encoder.OS)
 		expect := test[1]
 		if got != expect {
 			t.Fatalf("got %q, expected %q", got, expect)
